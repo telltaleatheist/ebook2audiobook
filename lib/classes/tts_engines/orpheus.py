@@ -3,7 +3,23 @@ from lib.classes.tts_engines.common.preset_loader import load_engine_presets
 from lib.classes.tts_engines.common.audio import trim_audio
 import platform
 import sys
+import os
 import re
+
+# Required for vLLM on Windows
+# See: https://github.com/SystemPanic/vllm-windows
+if platform.system() == 'Windows':
+    os.environ['USE_LIBUV'] = '0'
+    # vLLM needs the path to cudart DLL - find it in torch installation
+    if 'VLLM_CUDART_SO_PATH' not in os.environ:
+        try:
+            import torch
+            torch_lib = os.path.dirname(torch.__file__)
+            cudart_path = os.path.join(torch_lib, 'lib', 'cudart64_12.dll')
+            if os.path.exists(cudart_path):
+                os.environ['VLLM_CUDART_SO_PATH'] = cudart_path
+        except Exception:
+            pass  # Let vLLM handle the error if cudart not found
 
 class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
     """
@@ -169,11 +185,14 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
         from vllm import LLM
 
         print(f"Loading Orpheus model with vLLM: {self.TRANSFORMERS_MODEL}")
+        # enforce_eager=True disables CUDA graphs which don't work on Windows
+        # On Linux, CUDA graphs work fine so we leave them enabled for better performance
         engine = LLM(
             model=self.TRANSFORMERS_MODEL,
             dtype="float16",
             max_model_len=4096,
-            gpu_memory_utilization=0.8
+            gpu_memory_utilization=0.8,
+            enforce_eager=(platform.system() == 'Windows')
         )
         self._device = 'cuda'
         return engine
