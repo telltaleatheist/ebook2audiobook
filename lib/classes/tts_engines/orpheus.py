@@ -438,10 +438,10 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
                     audio_tensor = torch.from_numpy(audio_np).float()
 
                     # Trim trailing silence (Orpheus tends to add long pauses at end)
-                    # Use higher threshold (0.01) to be more aggressive with silence removal
-                    # Keep small buffer (0.02s) to avoid cutting speech
+                    # Use moderate threshold to catch obvious silence
+                    # Keep 150ms buffer for natural inter-sentence pauses
                     if audio_tensor.dim() == 1:
-                        audio_tensor = trim_audio(audio_tensor, self.SAMPLE_RATE, silence_threshold=0.01, buffer_sec=0.02)
+                        audio_tensor = trim_audio(audio_tensor, self.SAMPLE_RATE, silence_threshold=0.01, buffer_sec=0.15)
                         if len(audio_tensor) == 0:
                             # If trimming removed everything, use minimal silence
                             audio_tensor = torch.zeros(int(self.SAMPLE_RATE * 0.1))
