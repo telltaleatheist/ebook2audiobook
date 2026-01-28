@@ -280,10 +280,13 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
             traceback.print_exc()
             raise ValueError(error)
 
-    def _generate_mlx(self, text: str) -> np.ndarray:
-        """Generate audio using MLX backend."""
+    def _generate_mlx(self, text: str, max_tokens: int = 2048) -> np.ndarray:
+        """Generate audio using MLX backend.
+
+        Note: 125 tokens ≈ 10 seconds of audio, so 2048 tokens ≈ 163 seconds max.
+        """
         audio_data = None
-        for result in self.mlx_model.generate(text, voice=self.voice, temperature=0.6):
+        for result in self.mlx_model.generate(text, voice=self.voice, temperature=0.6, max_tokens=max_tokens):
             audio_data = result.audio
 
         if audio_data is None:
