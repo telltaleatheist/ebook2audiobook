@@ -286,7 +286,16 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
         Note: 125 tokens ≈ 10 seconds of audio, so 2048 tokens ≈ 163 seconds max.
         """
         audio_data = None
-        for result in self.mlx_model.generate(text, voice=self.voice, temperature=0.6, max_tokens=max_tokens):
+        # Match vLLM/transformers sampling params - repetition_penalty prevents
+        # repeated audio patterns that can sound like echo/reverb
+        for result in self.mlx_model.generate(
+            text,
+            voice=self.voice,
+            temperature=0.6,
+            top_p=0.9,
+            repetition_penalty=1.1,
+            max_tokens=max_tokens
+        ):
             audio_data = result.audio
 
         if audio_data is None:
