@@ -1,5 +1,6 @@
 from lib.classes.tts_engines.common.headers import *
 from lib.classes.tts_engines.common.preset_loader import load_engine_presets
+from lib.classes.tts_engines.common.audio import trim_audio
 import platform
 import sys
 
@@ -435,6 +436,15 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
                 if audio_np is not None and len(audio_np) > 0:
                     # Convert to tensor format for saving
                     audio_tensor = torch.from_numpy(audio_np).float()
+
+                    # Trim trailing silence (Orpheus tends to add long pauses at end)
+                    # Use higher threshold (0.01) to be more aggressive with silence removal
+                    # Keep small buffer (0.02s) to avoid cutting speech
+                    if audio_tensor.dim() == 1:
+                        audio_tensor = trim_audio(audio_tensor, self.SAMPLE_RATE, silence_threshold=0.01, buffer_sec=0.02)
+                        if len(audio_tensor) == 0:
+                            # If trimming removed everything, use minimal silence
+                            audio_tensor = torch.zeros(int(self.SAMPLE_RATE * 0.1))
 
                     # Ensure proper shape (1, samples) for torchaudio
                     if audio_tensor.dim() == 1:
