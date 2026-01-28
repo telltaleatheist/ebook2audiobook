@@ -3,6 +3,7 @@ from lib.classes.tts_engines.common.preset_loader import load_engine_presets
 from lib.classes.tts_engines.common.audio import trim_audio
 import platform
 import sys
+import re
 
 class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
     """
@@ -406,6 +407,12 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
 
             # Clean up the sentence for TTS
             sentence = sentence.strip()
+
+            # Strip SML tags that Orpheus doesn't understand (it has its own emotion tags)
+            # E2a uses [break], [pause], [music], [sfx], [silence] etc.
+            sentence = re.sub(r'\[(?:break|pause|music|sfx|silence)(?::[^\]]+)?\]', '', sentence, flags=re.IGNORECASE)
+            sentence = sentence.strip()
+
             if not sentence:
                 # Create a tiny silent audio file for empty sentences
                 silence = torch.zeros(1, int(self.params['samplerate'] * 0.1))
@@ -439,9 +446,9 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
 
                     # Trim trailing silence (Orpheus tends to add long pauses at end)
                     # Use moderate threshold to catch obvious silence
-                    # Keep 150ms buffer for natural inter-sentence pauses
+                    # Keep 200ms buffer for natural inter-sentence pauses
                     if audio_tensor.dim() == 1:
-                        audio_tensor = trim_audio(audio_tensor, self.SAMPLE_RATE, silence_threshold=0.01, buffer_sec=0.15)
+                        audio_tensor = trim_audio(audio_tensor, self.SAMPLE_RATE, silence_threshold=0.01, buffer_sec=0.20)
                         if len(audio_tensor) == 0:
                             # If trimming removed everything, use minimal silence
                             audio_tensor = torch.zeros(int(self.SAMPLE_RATE * 0.1))
