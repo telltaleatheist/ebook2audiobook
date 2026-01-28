@@ -961,9 +961,9 @@ def filter_chapter(idx:int, doc:EpubHtml, session_id:str, stanza_nlp:Pipeline, i
                 prev_typ = typ
             msg = f'Flattening as raw text…'
             print(msg)
-            # Orpheus (Llama-3b based) handles much longer sequences - use higher limit
+            # Orpheus (Llama-3b based) handles up to ~1000 chars per segment
             if tts_engine == 'orpheus':
-                max_chars = int(language_mapping[lang]['max_chars'] * 2)  # ~500 chars for English
+                max_chars = int(language_mapping[lang]['max_chars'] * 4)  # ~1000 chars for English
             else:
                 max_chars = int(language_mapping[lang]['max_chars'] / 1.5)
             clean_list = []
@@ -1182,9 +1182,9 @@ def get_sentences(text:str, session_id:str)->list|None:
         if not session:
             return None
         lang, tts_engine = session['language'], session['tts_engine']
-        # Orpheus (Llama-3b based) handles much longer sequences - use higher limit
+        # Orpheus (Llama-3b based) handles up to ~1000 chars per segment
         if tts_engine == 'orpheus':
-            max_chars = language_mapping[lang]['max_chars']  # Full limit (~250 chars for English)
+            max_chars = int(language_mapping[lang]['max_chars'] * 3)  # ~750 chars for English
         else:
             max_chars = int(language_mapping[lang]['max_chars'] / 2)
 
