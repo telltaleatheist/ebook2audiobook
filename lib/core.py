@@ -1893,64 +1893,63 @@ def convert_chapters2audio(session_id:str)->bool:
             print(msg)
             if session['is_gui_process']:
                 progress_bar = gr.Progress(track_tqdm=False)
-            if session['ebook']:
-                ebook_name = Path(session['ebook']).name
-                final_sentences = []
-                with tqdm(total=total_iterations, desc='0.00%', bar_format='{desc}: {n_fmt}/{total_fmt} ', unit='step', initial=0) as t:
-                    idx_target = 0
-                    for c in range(0, total_chapters):
-                        chapter_idx = c
-                        chapter_audio_file = f'{chapter_idx}.{default_audio_proc_format}'
-                        sentences = session['chapters'][c]
-                        start = idx_target
-                        if c in missing_chapters:
-                            msg = f'********* Recovering missing block {c} *********'
-                            print(msg)
-                        elif resume_chapter == c and c > 0:
-                            msg = f'********* Resuming from block {resume_chapter} *********'
-                            print(msg)
-                        msg = f'Block {chapter_idx} containing {len(sentences)} sentences…'
+            final_sentences = []
+            ebook_name = Path(session['ebook']).name if session.get('ebook') else 'audio'
+            with tqdm(total=total_iterations, desc='0.00%', bar_format='{desc}: {n_fmt}/{total_fmt} ', unit='step', initial=0) as t:
+                idx_target = 0
+                for c in range(0, total_chapters):
+                    chapter_idx = c
+                    chapter_audio_file = f'{chapter_idx}.{default_audio_proc_format}'
+                    sentences = session['chapters'][c]
+                    start = idx_target
+                    if c in missing_chapters:
+                        msg = f'********* Recovering missing block {c} *********'
                         print(msg)
-                        for idx, sentence in enumerate(sentences):
-                            if session['cancellation_requested']:
-                                msg = 'Cancel requested'
-                                print(msg)
-                                return False
-                            sentence = sentence.strip()
-                            if any(c.isalnum() for c in sentence):
-                                is_sml = bool(SML_TAG_PATTERN.fullmatch(sentence))
-                                if (not is_sml) or (idx == len(sentences) - 1):
-                                    final_sentences.append(sentence)
-                                if idx_target in missing_sentences or idx_target >= resume_sentence:
-                                    if idx_target in missing_sentences:
-                                        msg = f'********* Recovering missing sentence {idx_target} *********'
-                                        print(msg)
-                                    elif resume_sentence == idx_target and resume_sentence > 0:
-                                        msg = f'********* Resuming from sentence {resume_sentence} ********'
-                                        print(msg)
-                                    success = tts_manager.convert_sentence2audio(idx_target, sentence) if sentence else True
-                                    if not success:
-                                        return False
-                                idx_target += 1
-                            total_progress = (t.n + 1) / total_iterations
-                            if session['is_gui_process']:
-                                progress_bar(progress=total_progress, desc=f'{ebook_name} - {sentence}')
-                            percent = total_progress * 100
-                            t.set_description(f"{percent:.2f}%")
-                            msg = f' : {sentence}'
-                            print(msg)
-                            t.update(1)
-                        end = idx_target - 1
-                        msg = f'End of Block {chapter_idx}'
+                    elif resume_chapter == c and c > 0:
+                        msg = f'********* Resuming from block {resume_chapter} *********'
                         print(msg)
-                        if chapter_idx in missing_chapters or idx_target >= resume_sentence:
-                            if combine_audio_sentences(session_id, chapter_audio_file, int(start), int(end)):
-                                msg = f'Combining block {chapter_idx} to audio, sentence {start} to {end}'
-                                print(msg)
-                            else:
-                                msg = 'combine_audio_sentences() failed!'
-                                print(msg)
-                                return False
+                    msg = f'Block {chapter_idx} containing {len(sentences)} sentences…'
+                    print(msg)
+                    for idx, sentence in enumerate(sentences):
+                        if session['cancellation_requested']:
+                            msg = 'Cancel requested'
+                            print(msg)
+                            return False
+                        sentence = sentence.strip()
+                        if any(c.isalnum() for c in sentence):
+                            is_sml = bool(SML_TAG_PATTERN.fullmatch(sentence))
+                            if (not is_sml) or (idx == len(sentences) - 1):
+                                final_sentences.append(sentence)
+                            if idx_target in missing_sentences or idx_target >= resume_sentence:
+                                if idx_target in missing_sentences:
+                                    msg = f'********* Recovering missing sentence {idx_target} *********'
+                                    print(msg)
+                                elif resume_sentence == idx_target and resume_sentence > 0:
+                                    msg = f'********* Resuming from sentence {resume_sentence} ********'
+                                    print(msg)
+                                success = tts_manager.convert_sentence2audio(idx_target, sentence) if sentence else True
+                                if not success:
+                                    return False
+                            idx_target += 1
+                        total_progress = (t.n + 1) / total_iterations
+                        if session['is_gui_process']:
+                            progress_bar(progress=total_progress, desc=f'{ebook_name} - {sentence}')
+                        percent = total_progress * 100
+                        t.set_description(f"{percent:.2f}%")
+                        msg = f' : {sentence}'
+                        print(msg)
+                        t.update(1)
+                    end = idx_target - 1
+                    msg = f'End of Block {chapter_idx}'
+                    print(msg)
+                    if chapter_idx in missing_chapters or idx_target >= resume_sentence:
+                        if combine_audio_sentences(session_id, chapter_audio_file, int(start), int(end)):
+                            msg = f'Combining block {chapter_idx} to audio, sentence {start} to {end}'
+                            print(msg)
+                        else:
+                            msg = 'combine_audio_sentences() failed!'
+                            print(msg)
+                            return False
             return tts_manager.create_sentences2vtt(final_sentences)
         except Exception as e:
             DependencyError(e)
