@@ -6,15 +6,19 @@ import os, tempfile, sys
 min_python_version = (3,10)
 max_python_version = (3,12)
 
-tmp_dir = os.path.abspath('tmp')
+# All paths relative to e2a root - works on any OS (Mac, Windows, Linux)
+# This ensures consistent paths regardless of where python is invoked from
+_e2a_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+tmp_dir = os.path.join(_e2a_root, 'tmp')
 tempfile.tempdir = tmp_dir
 tmp_expire = 7 # days
 
-models_dir = os.path.abspath('models')
-ebooks_dir = os.path.abspath('ebooks')
-voices_dir = os.path.abspath('voices')
+models_dir = os.path.join(_e2a_root, 'models')
+ebooks_dir = os.path.join(_e2a_root, 'ebooks')
+voices_dir = os.path.join(_e2a_root, 'voices')
 tts_dir = os.path.join(models_dir, 'tts')
-components_dir = os.path.abspath('components')
+components_dir = os.path.join(_e2a_root, 'components')
 
 # ---------------------------------------------------------------------
 # Environment setup
@@ -132,8 +136,8 @@ jetson_version_range = {"min": (6,0), "max": (6,1)}
 # Python environment references
 # ---------------------------------------------------------------------
 
-python_env_dir = os.path.abspath(os.path.join('.','python_env'))
-requirements_file = os.path.abspath(os.path.join('.','requirements.txt'))
+python_env_dir = os.path.join(_e2a_root, 'python_env')
+requirements_file = os.path.join(_e2a_root, 'requirements.txt')
 
 # ---------------------------------------------------------------------
 # Interface configuration
@@ -155,9 +159,9 @@ interface_component_options = {
 # UI directories
 # ---------------------------------------------------------------------
 
-audiobooks_gradio_dir = os.path.abspath(os.path.join('audiobooks','gui','gradio'))
-audiobooks_host_dir = os.path.abspath(os.path.join('audiobooks','gui','host'))
-audiobooks_cli_dir = os.path.abspath(os.path.join('audiobooks','cli'))
+audiobooks_gradio_dir = os.path.join(_e2a_root, 'audiobooks', 'gui', 'gradio')
+audiobooks_host_dir = os.path.join(_e2a_root, 'audiobooks', 'gui', 'host')
+audiobooks_cli_dir = os.path.join(_e2a_root, 'audiobooks', 'cli')
 
 # ---------------------------------------------------------------------
 # files and audio supported formats

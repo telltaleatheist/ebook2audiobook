@@ -23,6 +23,9 @@ class TTSUtils:
             torch.cuda.empty_cache()
             torch.cuda.ipc_collect()
             torch.cuda.synchronize()
+        elif hasattr(torch, 'mps') and hasattr(torch.mps, 'empty_cache'):
+            # MPS (Apple Silicon) memory cleanup
+            torch.mps.empty_cache()
 
     def _loaded_tts_size_gb(self, loaded_tts:Dict[str, Module])->float:
         total_bytes = 0
