@@ -5,12 +5,13 @@ loaded_tts = {}
 xtts_builtin_speakers_list = {}
 
 TTS_ENGINES = {
-    "XTTSv2": "xtts", 
-    "BARK": "bark", 
-    "VITS": "vits", 
-    "FAIRSEQ": "fairseq", 
-    "TACOTRON2": "tacotron", 
-    "YOURTTS": "yourtts"
+    "XTTSv2": "xtts",
+    "BARK": "bark",
+    "VITS": "vits",
+    "FAIRSEQ": "fairseq",
+    "TACOTRON2": "tacotron",
+    "YOURTTS": "yourtts",
+    "ORPHEUS": "orpheus"
 }
 
 TTS_VOICE_CONVERSION = {
@@ -175,5 +176,22 @@ default_engine_settings = {
         "files": ['config.json', 'model_file.pth'],
         "voices": {"Machinella-5": "female-en-5", "ElectroMale-2": "male-en-2", 'Machinella-4': 'female-pt-4\n', 'ElectroMale-3': 'male-pt-3\n'},
         "rating": {"VRAM": 1, "CPU": 5, "RAM": 1, "Realism": 2}
+    },
+    TTS_ENGINES['ORPHEUS']: {
+        "languages": {"eng": "en"},  # Orpheus is English-focused
+        "samplerate": 24000,
+        "files": [],  # Model downloaded automatically via orpheus-speech package
+        "voices": {
+            "tara": "Tara (Female)",
+            "leah": "Leah (Female)",
+            "jess": "Jess (Female)",
+            "mia": "Mia (Female)",
+            "zoe": "Zoe (Female)",
+            "leo": "Leo (Male)",
+            "dan": "Dan (Male)",
+            "zac": "Zac (Male)"
+        },
+        "emotion_tags": ["<laugh>", "<chuckle>", "<sigh>", "<cough>", "<sniffle>", "<groan>", "<yawn>", "<gasp>"],
+        "rating": {"VRAM": 8, "CPU": 2, "RAM": 8, "Realism": 6}  # Higher realism than XTTS
     }
 }
