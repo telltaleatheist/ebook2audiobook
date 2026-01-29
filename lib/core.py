@@ -1904,21 +1904,39 @@ def convert_chapters2audio(session_id:str)->bool:
                 progress_bar = gr.Progress(track_tqdm=False)
             final_sentences = []
             ebook_name = Path(session['ebook']).name if session.get('ebook') else 'audio'
-            with tqdm(total=total_iterations, desc='0.00%', bar_format='{desc}: {n_fmt}/{total_fmt} ', unit='step', initial=0) as t:
+
+            # Worker mode: get range limits
+            worker_mode = session.get('worker_mode', False)
+            worker_start = session.get('sentence_start', 0) if worker_mode else 0
+            worker_end = session.get('sentence_end', float('inf')) if worker_mode else float('inf')
+
+            # For worker mode, tqdm shows progress within the worker's assigned range only
+            if worker_mode:
+                worker_range_size = worker_end - worker_start + 1
+                tqdm_total = worker_range_size
+            else:
+                tqdm_total = total_iterations
+
+            with tqdm(total=tqdm_total, desc='0.00%', bar_format='{desc}: {n_fmt}/{total_fmt} ', unit='step', initial=0) as t:
                 idx_target = 0
                 for c in range(0, total_chapters):
                     chapter_idx = c
                     chapter_audio_file = f'{chapter_idx}.{default_audio_proc_format}'
                     sentences = session['chapters'][c]
                     start = idx_target
-                    if c in missing_chapters:
-                        msg = f'********* Recovering missing block {c} *********'
+                    # Worker mode: check if this chapter overlaps with our range
+                    chapter_end_idx = start + len(sentences) - 1
+                    chapter_in_worker_range = not worker_mode or (chapter_end_idx >= worker_start and start <= worker_end)
+
+                    if chapter_in_worker_range:
+                        if c in missing_chapters:
+                            msg = f'********* Recovering missing block {c} *********'
+                            print(msg)
+                        elif resume_chapter == c and c > 0:
+                            msg = f'********* Resuming from block {resume_chapter} *********'
+                            print(msg)
+                        msg = f'Block {chapter_idx} containing {len(sentences)} sentences…'
                         print(msg)
-                    elif resume_chapter == c and c > 0:
-                        msg = f'********* Resuming from block {resume_chapter} *********'
-                        print(msg)
-                    msg = f'Block {chapter_idx} containing {len(sentences)} sentences…'
-                    print(msg)
                     for idx, sentence in enumerate(sentences):
                         if session['cancellation_requested']:
                             msg = 'Cancel requested'
@@ -1929,7 +1947,21 @@ def convert_chapters2audio(session_id:str)->bool:
                             is_sml = bool(SML_TAG_PATTERN.fullmatch(sentence))
                             if (not is_sml) or (idx == len(sentences) - 1):
                                 final_sentences.append(sentence)
-                            if idx_target in missing_sentences or idx_target >= resume_sentence:
+
+                            # Worker mode: efficiently skip sentences outside assigned range
+                            in_worker_range = worker_start <= idx_target <= worker_end
+
+                            # Worker mode: fast-forward through sentences before our range
+                            if worker_mode and idx_target < worker_start:
+                                idx_target += 1
+                                # Don't update tqdm - it's sized for our range only
+                                continue  # Skip processing, printing, etc.
+
+                            # Worker mode: stop after our range ends
+                            if worker_mode and idx_target > worker_end:
+                                return True  # Done with our range
+
+                            if in_worker_range and (idx_target in missing_sentences or idx_target >= resume_sentence):
                                 if idx_target in missing_sentences:
                                     msg = f'********* Recovering missing sentence {idx_target} *********'
                                     print(msg)
@@ -1940,7 +1972,7 @@ def convert_chapters2audio(session_id:str)->bool:
                                 if not success:
                                     return False
                             idx_target += 1
-                        total_progress = (t.n + 1) / total_iterations
+                        total_progress = (t.n + 1) / tqdm_total
                         if session['is_gui_process']:
                             progress_bar(progress=total_progress, desc=f'{ebook_name} - {sentence}')
                         percent = total_progress * 100
@@ -1949,16 +1981,22 @@ def convert_chapters2audio(session_id:str)->bool:
                         print(msg)
                         t.update(1)
                     end = idx_target - 1
-                    msg = f'End of Block {chapter_idx}'
-                    print(msg)
-                    if chapter_idx in missing_chapters or idx_target >= resume_sentence:
-                        if combine_audio_sentences(session_id, chapter_audio_file, int(start), int(end)):
-                            msg = f'Combining block {chapter_idx} to audio, sentence {start} to {end}'
-                            print(msg)
-                        else:
-                            msg = 'combine_audio_sentences() failed!'
-                            print(msg)
-                            return False
+                    if chapter_in_worker_range:
+                        msg = f'End of Block {chapter_idx}'
+                        print(msg)
+                    # Worker mode: skip chapter combining - assembly phase handles this
+                    if not worker_mode:
+                        if chapter_idx in missing_chapters or idx_target >= resume_sentence:
+                            if combine_audio_sentences(session_id, chapter_audio_file, int(start), int(end)):
+                                msg = f'Combining block {chapter_idx} to audio, sentence {start} to {end}'
+                                print(msg)
+                            else:
+                                msg = 'combine_audio_sentences() failed!'
+                                print(msg)
+                                return False
+            # Worker mode: skip VTT creation - assembly phase handles this
+            if session.get('worker_mode', False):
+                return True
             return tts_manager.create_sentences2vtt(final_sentences)
         except Exception as e:
             DependencyError(e)
@@ -3538,6 +3576,8 @@ def worker_only(args: dict) -> dict:
         session['script_mode'] = NATIVE
         session['is_gui_process'] = False
         session['model_cache'] = f"{session['tts_engine']}-{session['fine_tuned']}"
+        session['custom_model_dir'] = state.get('custom_model_dir') or os.path.join(models_dir, '__sessions', f"model-{session_id}")
+        session['custom_model'] = state.get('custom_model')
 
         # Device setup
         session['device'] = args.get('device') or state.get('device', default_device)
