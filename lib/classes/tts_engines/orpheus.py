@@ -40,9 +40,9 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
     Emotion tags: <laugh>, <chuckle>, <sigh>, <cough>, <sniffle>, <groan>, <yawn>, <gasp>
     """
 
-    # Valid Orpheus voices (in order of conversational realism per docs)
+    # Valid Orpheus voices (leah has best quality, tara has echo artifacts)
     VALID_VOICES = {'tara', 'leah', 'jess', 'leo', 'dan', 'mia', 'zac', 'zoe'}
-    DEFAULT_VOICE = 'tara'
+    DEFAULT_VOICE = 'leah'
 
     # Model configuration
     # MLX model (for Mac): mlx-community/orpheus-3b-0.1-ft-bf16
