@@ -79,17 +79,22 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
 
             # Get voice from session or preset
             voice = self.session.get('fine_tuned', self.DEFAULT_VOICE)
+            print(f"[ORPHEUS] Session fine_tuned value: '{voice}'")
 
             # Handle preset lookups
             if voice in self.models:
                 voice = self.models[voice].get('voice', voice)
 
-            # Validate voice
-            if voice not in self.VALID_VOICES:
-                print(f"Warning: Unknown Orpheus voice '{voice}', defaulting to '{self.DEFAULT_VOICE}'")
-                voice = self.DEFAULT_VOICE
+            # Normalize to lowercase for comparison
+            voice_lower = voice.lower() if voice else self.DEFAULT_VOICE
 
-            self.voice = voice
+            # Validate voice
+            if voice_lower not in self.VALID_VOICES:
+                print(f"Warning: Unknown Orpheus voice '{voice}', defaulting to '{self.DEFAULT_VOICE}'")
+                voice_lower = self.DEFAULT_VOICE
+
+            self.voice = voice_lower
+            print(f"[ORPHEUS] Using voice: '{self.voice}'")
             self.engine = None
             self.engine = self.load_engine()
 
