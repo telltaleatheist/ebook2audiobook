@@ -187,6 +187,13 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
 
     def _load_vllm_engine(self):
         """Load model using vLLM backend."""
+        import os
+
+        # On Windows, disable vLLM v1 engine which has ZMQ port binding issues
+        # The v0 engine is more stable on Windows
+        if platform.system() == 'Windows':
+            os.environ['VLLM_USE_V1'] = '0'
+
         from vllm import LLM
         from transformers import AutoTokenizer
 
