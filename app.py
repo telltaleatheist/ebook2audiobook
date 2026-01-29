@@ -265,8 +265,14 @@ SML tags available:
 
         print(f"v{prog_version} {args['script_mode']} mode")
 
-        # Skip dependency checks for lightweight operations or when explicitly requested
-        skip_deps = args.get('skip_deps') or args.get('list_sessions') or args.get('assemble_only')
+        # Skip dependency checks for parallel worker operations or when explicitly requested
+        # These operations assume deps are already installed (one-time setup)
+        skip_deps = (args.get('skip_deps') or
+                     args.get('list_sessions') or
+                     args.get('prep_only') or
+                     args.get('worker_mode') or
+                     args.get('assemble_only') or
+                     args.get('resume_session'))
 
         if not skip_deps:
             from lib.classes.device_installer import DeviceInstaller
