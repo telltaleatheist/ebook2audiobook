@@ -494,42 +494,53 @@ class DeviceInstaller():
             elif has_working_cuda() and (has_nvidia_gpu_pci() or is_wsl2()):
                 version = ''
                 msg = ''
-                # 1) CUDA RUNTIME detection
+                # 0) PyTorch CUDA detection (most reliable on Windows without CUDA Toolkit)
                 try:
-                    import ctypes
-                    libcudart = None
-                    if os.name == "nt":
-                        min_major, min_minor = cuda_version_range["min"]
-                        max_major, max_minor = cuda_version_range["max"]
-                        for major in range(min_major, max_major + 1):
-                            start_minor = min_minor if major == min_major else 0
-                            end_minor = max_minor if major == max_major else 9
-                            for minor in range(start_minor, end_minor + 1):
-                                dll = f"cudart64_{major}{minor}.dll"
-                                try:
-                                    libcudart = ctypes.CDLL(dll)
-                                    break
-                                except OSError:
-                                    pass
-                            if libcudart:
-                                break
-                    else:
-                        # Linux + WSL2
-                        libcudart = ctypes.CDLL("libcudart.so")
-                    if libcudart:
-                        v_int = ctypes.c_int()
-                        if libcudart.cudaRuntimeGetVersion(ctypes.byref(v_int)) == 0:
-                            device_count = ctypes.c_int()
-                            if libcudart.cudaGetDeviceCount(ctypes.byref(device_count)) == 0:
-                                v = v_int.value
-                                major = v // 1000
-                                minor = (v % 1000) // 10
-                                if device_count.value > 0:
-                                    version = f'{major}.{minor}'
-                                else:
-                                    msg = f'Runtime present ({major}.{minor}) but no devices.'
-                except (OSError, AttributeError):
+                    import torch
+                    if torch.cuda.is_available() and torch.cuda.device_count() > 0:
+                        # Get CUDA version from PyTorch
+                        cuda_ver = torch.version.cuda
+                        if cuda_ver:
+                            version = cuda_ver
+                except (ImportError, Exception):
                     pass
+                # 1) CUDA RUNTIME detection (fallback)
+                if not version:
+                    try:
+                        import ctypes
+                        libcudart = None
+                        if os.name == "nt":
+                            min_major, min_minor = cuda_version_range["min"]
+                            max_major, max_minor = cuda_version_range["max"]
+                            for major in range(min_major, max_major + 1):
+                                start_minor = min_minor if major == min_major else 0
+                                end_minor = max_minor if major == max_major else 9
+                                for minor in range(start_minor, end_minor + 1):
+                                    dll = f"cudart64_{major}{minor}.dll"
+                                    try:
+                                        libcudart = ctypes.CDLL(dll)
+                                        break
+                                    except OSError:
+                                        pass
+                                if libcudart:
+                                    break
+                        else:
+                            # Linux + WSL2
+                            libcudart = ctypes.CDLL("libcudart.so")
+                        if libcudart:
+                            v_int = ctypes.c_int()
+                            if libcudart.cudaRuntimeGetVersion(ctypes.byref(v_int)) == 0:
+                                device_count = ctypes.c_int()
+                                if libcudart.cudaGetDeviceCount(ctypes.byref(device_count)) == 0:
+                                    v = v_int.value
+                                    major = v // 1000
+                                    minor = (v % 1000) // 10
+                                    if device_count.value > 0:
+                                        version = f'{major}.{minor}'
+                                    else:
+                                        msg = f'Runtime present ({major}.{minor}) but no devices.'
+                    except (OSError, AttributeError):
+                        pass
                 # CUDA TOOLKIT detection (fallback only)
                 if not version:
                     if os.name == 'posix':

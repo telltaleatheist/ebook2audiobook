@@ -126,7 +126,7 @@ torch_matrix = {
     "jetson61": {"url": default_jetson_url, "base": "2.5.0"},
 }
 
-cuda_version_range = {"min": (11,8), "max": (12,8)}
+cuda_version_range = {"min": (11,8), "max": (12,9)}
 rocm_version_range = {"min": (5,7), "max": (6,3)}
 mps_version_range = {"min": (0,0), "max": (0,0)}
 xpu_version_range = {"min": (0,0), "max": (0,0)}
