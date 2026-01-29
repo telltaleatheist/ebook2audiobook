@@ -293,6 +293,7 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
         audio_data = None
         # Match vLLM/transformers sampling params - repetition_penalty prevents
         # repeated audio patterns that can sound like echo/reverb
+        print(f"[ORPHEUS] Generating with voice='{self.voice}' for: {text[:50]}...")
         for result in self.mlx_model.generate(
             text,
             voice=self.voice,
