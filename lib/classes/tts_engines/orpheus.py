@@ -188,11 +188,15 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
     def _load_vllm_engine(self):
         """Load model using vLLM backend."""
         import os
+        import random
 
-        # On Windows, disable vLLM v1 engine which has ZMQ port binding issues
-        # The v0 engine is more stable on Windows
+        # On Windows, use random port to avoid ZMQ port conflicts between workers
         if platform.system() == 'Windows':
-            os.environ['VLLM_USE_V1'] = '0'
+            # Use random port in high range to avoid conflicts
+            random_port = random.randint(40000, 50000)
+            os.environ['VLLM_RPC_PORT'] = str(random_port)
+            # Also try to use v1 engine for better performance, but with unique ports
+            os.environ.pop('VLLM_USE_V1', None)  # Don't force v0
 
         from vllm import LLM
         from transformers import AutoTokenizer
@@ -202,14 +206,13 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
         # Load tokenizer (needed for prompt formatting with special tokens)
         self.tokenizer = AutoTokenizer.from_pretrained(self.TRANSFORMERS_MODEL)
 
-        # enforce_eager=True disables CUDA graphs which don't work on Windows
-        # On Linux, CUDA graphs work fine so we leave them enabled for better performance
+        # Try without enforce_eager first for better performance
+        # RTX 3090 Ti should support CUDA graphs
         engine = LLM(
             model=self.TRANSFORMERS_MODEL,
             dtype="float16",
             max_model_len=4096,
-            gpu_memory_utilization=0.8,
-            enforce_eager=(platform.system() == 'Windows')
+            gpu_memory_utilization=0.85,
         )
         self._device = 'cuda'
         return engine
