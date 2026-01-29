@@ -188,8 +188,13 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
     def _load_vllm_engine(self):
         """Load model using vLLM backend."""
         from vllm import LLM
+        from transformers import AutoTokenizer
 
         print(f"Loading Orpheus model with vLLM: {self.TRANSFORMERS_MODEL}")
+
+        # Load tokenizer (needed for prompt formatting with special tokens)
+        self.tokenizer = AutoTokenizer.from_pretrained(self.TRANSFORMERS_MODEL)
+
         # enforce_eager=True disables CUDA graphs which don't work on Windows
         # On Linux, CUDA graphs work fine so we leave them enabled for better performance
         engine = LLM(
@@ -317,19 +322,44 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
 
         return audio_np
 
+    def _format_prompt_with_special_tokens(self, text: str) -> str:
+        """Format prompt with Orpheus special tokens for audio generation.
+
+        Orpheus requires specific tokens to trigger audio generation:
+        - Start token: 128259 (<custom_token_3>)
+        - End tokens: [128009, 128260, 128261, 128257]
+        """
+        import torch
+
+        # Format: "voice: text"
+        adapted_prompt = f"{self.voice}: {text}"
+        prompt_tokens = self.tokenizer(adapted_prompt, return_tensors="pt")
+
+        # Add special tokens
+        start_token = torch.tensor([[128259]], dtype=torch.int64)
+        end_tokens = torch.tensor([[128009, 128260, 128261, 128257]], dtype=torch.int64)
+        all_input_ids = torch.cat([start_token, prompt_tokens.input_ids, end_tokens], dim=1)
+
+        # Decode back to string for vLLM
+        prompt_string = self.tokenizer.decode(all_input_ids[0])
+        return prompt_string
+
     def _generate_tokens_vllm(self, prompt: str, max_tokens: int = 2048) -> list:
         """Generate audio tokens using vLLM backend."""
         from vllm import SamplingParams
 
+        # Format prompt with special tokens
+        formatted_prompt = self._format_prompt_with_special_tokens(prompt)
+
         sampling_params = SamplingParams(
             temperature=0.6,
-            top_p=0.9,
+            top_p=0.8,
             repetition_penalty=1.1,
             max_tokens=max_tokens,
             stop_token_ids=[self.END_OF_AUDIO_TOKEN]
         )
 
-        outputs = self.engine.generate([prompt], sampling_params)
+        outputs = self.engine.generate([formatted_prompt], sampling_params)
         tokens = list(outputs[0].outputs[0].token_ids)
 
         # Truncate at end-of-audio token if present
@@ -468,11 +498,12 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
                     audio_np = self._generate_mlx(sentence)
                 else:
                     # vLLM and transformers use token generation + SNAC decoding
-                    prompt = f"{self.voice}: {sentence}"
-
                     if self.backend == 'vllm':
-                        tokens = self._generate_tokens_vllm(prompt)
+                        # vLLM needs special token formatting
+                        tokens = self._generate_tokens_vllm(sentence)
                     else:
+                        # Transformers uses simple prompt format
+                        prompt = f"{self.voice}: {sentence}"
                         tokens = self._generate_tokens_transformers(prompt)
 
                     audio_np = self._tokens_to_audio(tokens)
