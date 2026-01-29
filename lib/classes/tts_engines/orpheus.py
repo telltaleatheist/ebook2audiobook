@@ -5,6 +5,11 @@ import platform
 import sys
 import os
 import re
+import atexit
+import weakref
+
+# Track active Orpheus instances for cleanup on exit
+_active_instances = weakref.WeakSet()
 
 # Required for vLLM on Windows
 # See: https://github.com/SystemPanic/vllm-windows
@@ -20,6 +25,28 @@ if platform.system() == 'Windows':
                 os.environ['VLLM_CUDART_SO_PATH'] = cudart_path
         except Exception:
             pass  # Let vLLM handle the error if cudart not found
+
+
+def _cleanup_on_exit():
+    """Called on process exit to ensure all Orpheus instances are cleaned up"""
+    import gc
+    for instance in list(_active_instances):
+        try:
+            instance.cleanup()
+        except Exception:
+            pass
+    # Final CUDA cleanup
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+        gc.collect()
+    except Exception:
+        pass
+
+atexit.register(_cleanup_on_exit)
+
 
 class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
     """
@@ -98,9 +125,43 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
             self.engine = None
             self.engine = self.load_engine()
 
+            # Register this instance for cleanup on exit
+            _active_instances.add(self)
+
         except Exception as e:
             error = f'Orpheus.__init__() error: {e}'
             raise ValueError(error)
+
+    def cleanup(self):
+        """Explicitly release all resources (CUDA, vLLM, etc.)"""
+        try:
+            # Delete vLLM engine first (releases GPU memory)
+            if hasattr(self, 'engine') and self.engine is not None:
+                del self.engine
+                self.engine = None
+
+            # Delete SNAC decoder
+            if hasattr(self, 'snac_model') and self.snac_model is not None:
+                del self.snac_model
+                self.snac_model = None
+
+            # Delete tokenizer
+            if hasattr(self, 'tokenizer') and self.tokenizer is not None:
+                del self.tokenizer
+                self.tokenizer = None
+
+            # Clear CUDA cache
+            self._cleanup_memory()
+            print("[ORPHEUS] Cleanup complete - resources released")
+        except Exception as e:
+            print(f"[ORPHEUS] Cleanup warning: {e}")
+
+    def __del__(self):
+        """Destructor - ensure cleanup when object is garbage collected"""
+        try:
+            self.cleanup()
+        except Exception:
+            pass  # Ignore errors during destruction
 
     def _detect_backend(self) -> str:
         """Detect best available backend for this platform.
@@ -112,6 +173,16 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
         """
         is_mac = platform.system() == 'Darwin'
         has_cuda = torch.cuda.is_available()
+
+        # Check for backend override via environment variable
+        # ORPHEUS_BACKEND can be: mlx, vllm, transformers
+        forced_backend = os.environ.get('ORPHEUS_BACKEND', '').lower()
+        if forced_backend:
+            print(f"Orpheus: Backend override via ORPHEUS_BACKEND={forced_backend}")
+            if forced_backend in ('mlx', 'vllm', 'transformers'):
+                return forced_backend
+            else:
+                print(f"Warning: Unknown backend '{forced_backend}', using auto-detect")
 
         # Try MLX first on Mac (19x faster than transformers!)
         if is_mac:
@@ -189,14 +260,21 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
         """Load model using vLLM backend."""
         import os
         import random
+        import gc
+
+        is_windows = platform.system() == 'Windows'
+
+        # Clear any leftover CUDA state from previous failed attempts
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            gc.collect()
 
         # On Windows, use random port to avoid ZMQ port conflicts between workers
-        if platform.system() == 'Windows':
+        if is_windows:
             # Use random port in high range to avoid conflicts
             random_port = random.randint(40000, 50000)
             os.environ['VLLM_RPC_PORT'] = str(random_port)
-            # Also try to use v1 engine for better performance, but with unique ports
-            os.environ.pop('VLLM_USE_V1', None)  # Don't force v0
 
         from vllm import LLM
         from transformers import AutoTokenizer
@@ -206,13 +284,27 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
         # Load tokenizer (needed for prompt formatting with special tokens)
         self.tokenizer = AutoTokenizer.from_pretrained(self.TRANSFORMERS_MODEL)
 
-        # Try without enforce_eager first for better performance
-        # RTX 3090 Ti should support CUDA graphs
+        # On Windows, CUDA graph capture can fail. Check env var to override behavior.
+        # Set ORPHEUS_DISABLE_EAGER=1 to try CUDA graphs (faster if it works)
+        # Set ORPHEUS_FORCE_EAGER=1 to always use eager mode (slower but stable)
+        force_eager = os.environ.get('ORPHEUS_FORCE_EAGER', '0') == '1'
+        disable_eager = os.environ.get('ORPHEUS_DISABLE_EAGER', '0') == '1'
+
+        if disable_eager:
+            use_eager = False
+            print("Orpheus: CUDA graphs ENABLED (ORPHEUS_DISABLE_EAGER=1)")
+        elif force_eager or is_windows:
+            use_eager = True
+            print("Orpheus: Using eager mode (no CUDA graphs) for Windows compatibility")
+        else:
+            use_eager = False
+
         engine = LLM(
             model=self.TRANSFORMERS_MODEL,
             dtype="float16",
             max_model_len=4096,
             gpu_memory_utilization=0.85,
+            enforce_eager=use_eager,
         )
         self._device = 'cuda'
         return engine
