@@ -235,6 +235,8 @@ SML tags available:
         help='''List all resumable sessions with incomplete TTS conversion.''')
     parallel_group.add_argument('--no_split', action='store_true',
         help='''(assemble_only) Disable splitting output into parts.''')
+    parallel_group.add_argument('--skip_deps', action='store_true',
+        help='''Skip dependency/device package checks. Use when deps are already installed.''')
 
     for arg in sys.argv:
         if arg.startswith('--') and arg not in options:
@@ -262,14 +264,21 @@ SML tags available:
         args['ebook_list'] = None
 
         print(f"v{prog_version} {args['script_mode']} mode")
-        from lib.classes.device_installer import DeviceInstaller
-        manager = DeviceInstaller()
-        if manager.install_python_packages():
-            device_info_str = manager.check_device_info(args['script_mode'])
-            if manager.install_device_packages(device_info_str) == 1:
-                error = f'Error: Could not installed device packages!'
-                print(error)
-                sys.exit(1)
+
+        # Skip dependency checks for lightweight operations or when explicitly requested
+        skip_deps = args.get('skip_deps') or args.get('list_sessions') or args.get('assemble_only')
+
+        if not skip_deps:
+            from lib.classes.device_installer import DeviceInstaller
+            manager = DeviceInstaller()
+            if manager.install_python_packages():
+                device_info_str = manager.check_device_info(args['script_mode'])
+                if manager.install_device_packages(device_info_str) == 1:
+                    error = f'Error: Could not installed device packages!'
+                    print(error)
+                    sys.exit(1)
+        else:
+            print("Skipping dependency checks (--skip_deps or lightweight operation)")
         import lib.core as c
         c.context = c.SessionContext() if c.context is None else c.context
         c.context_tracker = c.SessionTracker() if c.context_tracker is None else c.context_tracker
