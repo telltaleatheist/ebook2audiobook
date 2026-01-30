@@ -3465,7 +3465,49 @@ def assemble_audiobook(args: dict) -> dict:
         if not session['metadata'].get('title'):
             session['metadata']['title'] = session.get('filename_noext', 'audiobook').replace('_', ' ')
 
-        session['final_name'] = get_sanitized(session['metadata']['title'] + '.' + session['output_format'])
+        # Apply any command-line metadata overrides
+        if args.get('title'):
+            session['metadata']['title'] = args['title']
+        if args.get('author'):
+            session['metadata']['creator'] = args['author']
+
+        # Check for bookforge_metadata in session state (has author, year, etc.)
+        if state.get('bookforge_metadata'):
+            bf_meta = state['bookforge_metadata']
+            if bf_meta.get('title') and not args.get('title'):
+                session['metadata']['title'] = bf_meta['title']
+            if bf_meta.get('author') and not args.get('author'):
+                session['metadata']['creator'] = bf_meta['author']
+            if bf_meta.get('year'):
+                session['metadata']['year'] = bf_meta['year']
+
+        # Extract year from 'published' field if not already set (format: "YYYY-MM-DD...")
+        if not session['metadata'].get('year') and session['metadata'].get('published'):
+            published = session['metadata']['published']
+            if isinstance(published, str) and len(published) >= 4:
+                session['metadata']['year'] = published[:4]
+
+        # Set final_name: use --output_filename if provided, otherwise format with author/year
+        if args.get('output_filename'):
+            # Use explicit filename (without extension, we'll add it)
+            base_name = args['output_filename']
+            if base_name.lower().endswith('.' + session['output_format']):
+                base_name = base_name[:-len(session['output_format']) - 1]
+            session['final_name'] = get_sanitized(base_name + '.' + session['output_format'])
+        else:
+            # Build filename: "Title. Author. (Year).ext" or just "Title.ext"
+            title = session['metadata'].get('title', 'Untitled')
+            author = session['metadata'].get('creator', '')
+            year = session['metadata'].get('year', '')
+
+            if author and year:
+                filename_base = f"{title}. {author}. ({year})"
+            elif author:
+                filename_base = f"{title}. {author}"
+            else:
+                filename_base = title
+
+            session['final_name'] = get_sanitized(filename_base + '.' + session['output_format'])
 
         print(f"[ASSEMBLE] Assembling from {len(session['chapters'])} chapters...")
 
