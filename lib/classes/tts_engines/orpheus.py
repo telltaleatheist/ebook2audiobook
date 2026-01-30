@@ -11,9 +11,10 @@ import weakref
 # Track active Orpheus instances for cleanup on exit
 _active_instances = weakref.WeakSet()
 
-# Required for vLLM on Windows
-# See: https://github.com/SystemPanic/vllm-windows
+# Platform-specific vLLM configuration
 if platform.system() == 'Windows':
+    # Required for vLLM on Windows
+    # See: https://github.com/SystemPanic/vllm-windows
     os.environ['USE_LIBUV'] = '0'
     # vLLM needs the path to cudart DLL - find it in torch installation
     if 'VLLM_CUDART_SO_PATH' not in os.environ:
@@ -25,6 +26,11 @@ if platform.system() == 'Windows':
                 os.environ['VLLM_CUDART_SO_PATH'] = cudart_path
         except Exception:
             pass  # Let vLLM handle the error if cudart not found
+else:
+    # On Linux/WSL, enable CUDA graphs for vLLM performance
+    # Override conf.py settings that disable CUDA graphs globally
+    os.environ['TORCH_CUDA_ENABLE_CUDA_GRAPH'] = '1'
+    os.environ['CUDA_LAUNCH_BLOCKING'] = '0'
 
 
 def _cleanup_on_exit():
@@ -298,6 +304,17 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
             print("Orpheus: Using eager mode (no CUDA graphs) for Windows compatibility")
         else:
             use_eager = False
+
+        # Clean up CUDA state before vLLM initialization
+        # This helps prevent CUDA graph capture failures caused by prior CUDA operations
+        if torch.cuda.is_available():
+            import gc
+            gc.collect()
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            # Reset CUDA context to clean state
+            torch.cuda.reset_peak_memory_stats()
+            print("Orpheus: CUDA state cleaned before vLLM init")
 
         engine = LLM(
             model=self.TRANSFORMERS_MODEL,

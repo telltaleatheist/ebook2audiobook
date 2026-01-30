@@ -50,11 +50,20 @@ os.environ['MallocStackLogging'] = '0'
 os.environ['MallocStackLoggingNoCompact'] = '0'
 os.environ['TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD'] = '1'
 os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'
-os.environ['PYTORCH_NO_CUDA_MEMORY_CACHING'] = '1'
-os.environ['TORCH_CUDA_ENABLE_CUDA_GRAPH'] = '0'
-os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:128,garbage_collection_threshold:0.6,expandable_segments:True'
+# PYTORCH_NO_CUDA_MEMORY_CACHING breaks CUDA graph capture on Linux
+# Only disable caching on Windows where CUDA graphs are disabled anyway
+if sys.platform == 'win32':
+    os.environ['PYTORCH_NO_CUDA_MEMORY_CACHING'] = '1'
+    os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:128,garbage_collection_threshold:0.6,expandable_segments:True'
 os.environ['CUDA_DEVICE_ORDER'] = 'PCI_BUS_ID'
-os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+# CUDA graph settings - only disable on Windows where they cause issues
+# On Linux/WSL, keep CUDA graphs enabled for vLLM performance
+if sys.platform == 'win32':
+    os.environ['TORCH_CUDA_ENABLE_CUDA_GRAPH'] = '0'
+    os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+else:
+    os.environ['TORCH_CUDA_ENABLE_CUDA_GRAPH'] = '1'
+    os.environ['CUDA_LAUNCH_BLOCKING'] = '0'
 os.environ['CUDA_CACHE_MAXSIZE'] = '2147483648'
 os.environ['SUNO_OFFLOAD_CPU'] = 'False'
 os.environ['SUNO_USE_SMALL_MODELS'] = 'False'
