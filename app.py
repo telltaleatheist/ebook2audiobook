@@ -4,6 +4,13 @@ from lib.conf import *
 from lib.conf_lang import default_language_code
 from lib.conf_models import TTS_ENGINES, default_fine_tuned, default_engine_settings
 
+# Try to load BookForge extension for parallel processing
+try:
+    from bookforge_ext import hooks as bf_hooks, parallel as bf_parallel
+    BOOKFORGE_EXT = True
+except ImportError:
+    BOOKFORGE_EXT = False
+
 warnings.filterwarnings("ignore", category=SyntaxWarning)
 warnings.filterwarnings("ignore", category=UserWarning, module="jieba._compat")
 
@@ -156,11 +163,10 @@ SML tags available:
         '--top_k', '--top_p', '--speed', '--enable_text_splitting',
         '--text_temp', '--waveform_temp',
         '--output_dir', '--version', '--workflow', '--help',
-        # Parallel worker options
-        '--prep_only', '--worker_mode', '--assemble_only',
-        '--sentence_start', '--sentence_end', '--chapter_start', '--chapter_end',
-        '--resume_session', '--list_sessions', '--no_split', '--chapters', '--skip_deps'
     ]
+    # Add parallel worker options if extension is loaded
+    if BOOKFORGE_EXT:
+        options.extend(bf_parallel.PARALLEL_OPTIONS)
     tts_engine_list_keys = [k for k in TTS_ENGINES.keys()]
     tts_engine_list_values = [k for k in TTS_ENGINES.values()]
     all_group = parser.add_argument_group('**** The following options are for all modes', 'Optional')
@@ -213,32 +219,9 @@ SML tags available:
     headless_optional_group.add_argument(options[25], action='version', version=f'ebook2audiobook version {prog_version}', help='''Show the version of the script and exit''')
     headless_optional_group.add_argument(options[26], action='store_true', help=argparse.SUPPRESS)
 
-    # Parallel worker options (for BookForge integration)
-    parallel_group = parser.add_argument_group('**** Parallel worker options (for external coordination)')
-    parallel_group.add_argument('--prep_only', action='store_true',
-        help='''Phase 1: Parse EPUB and prepare session state for parallel workers. Returns JSON with session_id and sentence counts.''')
-    parallel_group.add_argument('--worker_mode', action='store_true',
-        help='''Phase 2: Run TTS for assigned sentence/chapter range only. Requires --session and range parameters.''')
-    parallel_group.add_argument('--assemble_only', action='store_true',
-        help='''Phase 3: Combine sentence audio files into final audiobook. Requires --session.''')
-    parallel_group.add_argument('--sentence_start', type=int, default=None,
-        help='''(worker_mode) First sentence index to process (0-indexed, inclusive)''')
-    parallel_group.add_argument('--sentence_end', type=int, default=None,
-        help='''(worker_mode) Last sentence index to process (0-indexed, inclusive)''')
-    parallel_group.add_argument('--chapter_start', type=int, default=None,
-        help='''(worker_mode) First chapter to process (1-indexed, inclusive)''')
-    parallel_group.add_argument('--chapter_end', type=int, default=None,
-        help='''(worker_mode) Last chapter to process (1-indexed, inclusive)''')
-    parallel_group.add_argument('--resume_session', type=str, default=None,
-        help='''Resume a partially completed session. Provide session ID or directory path.''')
-    parallel_group.add_argument('--list_sessions', action='store_true',
-        help='''List all resumable sessions with incomplete TTS conversion.''')
-    parallel_group.add_argument('--no_split', action='store_true',
-        help='''(assemble_only) Disable splitting output into parts.''')
-    parallel_group.add_argument('--chapters', type=str, default=None,
-        help='''(assemble_only) Specify which chapters to include. Formats: "1-5" (range), "1,3,5" (list), "auto" (detect completed chapters). Default: all chapters.''')
-    parallel_group.add_argument('--skip_deps', action='store_true',
-        help='''Skip dependency/device package checks. Use when deps are already installed.''')
+    # Add parallel worker options from BookForge extension
+    if BOOKFORGE_EXT:
+        bf_parallel.add_arguments(parser)
 
     for arg in sys.argv:
         if arg.startswith('--') and arg not in options:
@@ -269,12 +252,7 @@ SML tags available:
 
         # Skip dependency checks for parallel worker operations or when explicitly requested
         # These operations assume deps are already installed (one-time setup)
-        skip_deps = (args.get('skip_deps') or
-                     args.get('list_sessions') or
-                     args.get('prep_only') or
-                     args.get('worker_mode') or
-                     args.get('assemble_only') or
-                     args.get('resume_session'))
+        skip_deps = BOOKFORGE_EXT and bf_hooks.should_skip_deps(args)
 
         if not skip_deps:
             from lib.classes.device_installer import DeviceInstaller
@@ -292,66 +270,11 @@ SML tags available:
         c.context_tracker = c.SessionTracker() if c.context_tracker is None else c.context_tracker
         c.active_sessions = set() if c.active_sessions is None else c.active_sessions
 
-        # Handle parallel worker modes
-        if args.get('list_sessions'):
-            import json
-            sessions = c.list_resumable_sessions()
-            print(json.dumps(sessions, indent=2))
-            sys.exit(0)
-
-        if args.get('resume_session'):
-            import json
-            args['audiobooks_dir'] = os.path.abspath(args['output_dir']) if args.get('output_dir') else audiobooks_cli_dir
-            result = c.resume_session(args)
-            print(json.dumps(result, indent=2))
-            sys.exit(0 if result.get('success') else 1)
-
-        if args.get('prep_only'):
-            import json
-            if not args.get('ebook'):
-                print('Error: --prep_only requires --ebook')
-                sys.exit(1)
-            args['ebook'] = os.path.abspath(args['ebook'])
-            args['audiobooks_dir'] = os.path.abspath(args['output_dir']) if args.get('output_dir') else audiobooks_cli_dir
-            args['device'] = devices.get(args['device'].upper(), {}).get('proc') or devices['CPU']['proc']
-            args['tts_engine'] = TTS_ENGINES.get(args['tts_engine']) if args.get('tts_engine') in TTS_ENGINES else args.get('tts_engine')
-            result = c.prep_ebook_info(args)
-            if result:
-                print(json.dumps(result, indent=2, default=str))
-                sys.exit(0)
-            else:
-                print(json.dumps({'error': 'prep_ebook_info failed'}))
-                sys.exit(1)
-
-        if args.get('worker_mode'):
-            import json
-            if not args.get('session'):
-                print('Error: --worker_mode requires --session')
-                sys.exit(1)
-            sentence_mode = args.get('sentence_start') is not None and args.get('sentence_end') is not None
-            chapter_mode = args.get('chapter_start') is not None and args.get('chapter_end') is not None
-            if not sentence_mode and not chapter_mode:
-                print('Error: --worker_mode requires --sentence_start/--sentence_end or --chapter_start/--chapter_end')
-                sys.exit(1)
-            args['audiobooks_dir'] = os.path.abspath(args['output_dir']) if args.get('output_dir') else audiobooks_cli_dir
-            args['device'] = devices.get(args['device'].upper(), {}).get('proc') or devices['CPU']['proc']
-            args['tts_engine'] = TTS_ENGINES.get(args['tts_engine']) if args.get('tts_engine') in TTS_ENGINES else args.get('tts_engine')
-            result = c.worker_only(args)
-            print(json.dumps(result, indent=2))
-            sys.exit(0 if result.get('success') else 1)
-
-        if args.get('assemble_only'):
-            import json
-            if not args.get('session'):
-                print('Error: --assemble_only requires --session')
-                sys.exit(1)
-            args['audiobooks_dir'] = os.path.abspath(args['output_dir']) if args.get('output_dir') else audiobooks_cli_dir
-            args['output_split'] = not args.get('no_split', False)
-            args['output_split_hours'] = default_output_split_hours
-            args['output_channel'] = args.get('output_channel', default_output_channel)
-            result = c.assemble_audiobook(args)
-            print(json.dumps(result, indent=2))
-            sys.exit(0 if result.get('success') else 1)
+        # Handle parallel worker modes via BookForge extension
+        if BOOKFORGE_EXT:
+            result = bf_hooks.handle_parallel_mode(args, c)
+            if result is not None:
+                sys.exit(0 if result.get('success', True) else 1)
 
         if args['headless']:
             args['id'] = 'ba800d22-ee51-11ef-ac34-d4ae52cfd9ce' if args['workflow'] else args['session'] if args['session'] else None
