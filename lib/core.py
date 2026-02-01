@@ -1183,11 +1183,9 @@ def get_sentences(text:str, session_id:str)->list|None:
         if not session:
             return None
         lang, tts_engine = session['language'], session['tts_engine']
-        # Orpheus: use full max_chars (~250 for English) - splits at soft punctuation if needed
-        if tts_engine == 'orpheus':
-            max_chars = language_mapping[lang]['max_chars']  # ~250 chars for English
-        else:
-            max_chars = int(language_mapping[lang]['max_chars'] / 2)
+        # Use full max_chars (~250 for English) - splits at soft punctuation only if needed
+        # This produces better prosody by keeping full sentences together
+        max_chars = language_mapping[lang]['max_chars']
 
         assert not SML_TAG_PATTERN.search(text)
 
@@ -2231,6 +2229,13 @@ def combine_audio_chapters(session_id:str)->list[str]|None:
         if session and session.get('id', False):
             chapter_files = [f for f in os.listdir(session['chapters_dir']) if f.endswith(f'.{default_audio_proc_format}')]
             chapter_files = sorted(chapter_files, key=lambda x: int(re.search(r'\d+', x).group()))
+
+            # Filter by selected chapters if partial assembly
+            selected_chapters = session.get('selected_chapters')
+            if selected_chapters:
+                chapter_files = [f for f in chapter_files if int(re.search(r'\d+', f).group()) in selected_chapters]
+                print(f'[ASSEMBLE] Filtered to {len(chapter_files)} selected chapters')
+
             # Use TOC titles if available, otherwise fall back to first sentence of each chapter
             toc_titles = session.get('chapter_titles', [])
             chapters_data = session.get('chapters', [])
@@ -2241,6 +2246,11 @@ def combine_audio_chapters(session_id:str)->list[str]|None:
                 # Fall back to first sentence (old behavior)
                 chapter_titles = [c[0] if c else f'Chapter {i+1}' for i, c in enumerate(chapters_data)]
                 print(f'[ASSEMBLE] TOC titles not available ({len(toc_titles)} titles for {len(chapters_data)} chapters), using first sentence')
+
+            # Filter chapter_titles to match selected chapters
+            if selected_chapters:
+                # chapter_files are already filtered, map file numbers to titles
+                chapter_titles = [chapter_titles[ch-1] for ch in selected_chapters if ch-1 < len(chapter_titles)]
             is_gui_process = session['is_gui_process']
             if len(chapter_files) == 0:
                 print('No block files exists!')
@@ -3396,6 +3406,88 @@ def build_vtt_file(session_id: str, all_sentences: list) -> bool:
         return False
 
 
+def parse_chapters_arg(chapters_arg: str, total_chapters: int) -> list[int] | None:
+    """
+    Parse the --chapters argument into a list of chapter numbers (1-indexed).
+
+    Supported formats:
+    - "1-5" -> [1, 2, 3, 4, 5]
+    - "1,3,5" -> [1, 3, 5]
+    - "1-3,7,9-11" -> [1, 2, 3, 7, 9, 10, 11]
+    - "auto" -> None (signals auto-detection)
+
+    Returns None for "auto" mode, or a sorted list of chapter numbers.
+    """
+    if not chapters_arg:
+        return list(range(1, total_chapters + 1))  # All chapters
+
+    chapters_arg = chapters_arg.strip().lower()
+
+    if chapters_arg == 'auto':
+        return None  # Signal auto-detection
+
+    result = set()
+    parts = chapters_arg.split(',')
+
+    for part in parts:
+        part = part.strip()
+        if '-' in part:
+            # Range: "1-5"
+            try:
+                start, end = part.split('-', 1)
+                start = int(start.strip())
+                end = int(end.strip())
+                for ch in range(start, end + 1):
+                    if 1 <= ch <= total_chapters:
+                        result.add(ch)
+            except ValueError:
+                print(f"[ASSEMBLE] Warning: Invalid chapter range '{part}'")
+        else:
+            # Single chapter: "5"
+            try:
+                ch = int(part)
+                if 1 <= ch <= total_chapters:
+                    result.add(ch)
+            except ValueError:
+                print(f"[ASSEMBLE] Warning: Invalid chapter number '{part}'")
+
+    return sorted(result) if result else list(range(1, total_chapters + 1))
+
+
+def detect_completed_chapters(session: dict, state: dict) -> list[int]:
+    """
+    Auto-detect which chapters have all their sentence audio files completed.
+    Returns a list of completed chapter numbers (1-indexed).
+    """
+    sentences_dir = session.get('sentences_dir') or os.path.join(session['process_dir'], 'chapters', 'sentences')
+    chapter_sentences = state.get('chapter_sentences', [])
+
+    completed = []
+    sentence_offset = 0
+
+    for i, chapter in enumerate(chapter_sentences):
+        chapter_num = i + 1
+        chapter_complete = True
+
+        # Check if all sentence files for this chapter exist
+        for j in range(len(chapter)):
+            sentence_idx = sentence_offset + j
+            sentence_file = os.path.join(sentences_dir, f'{sentence_idx}.{default_audio_proc_format}')
+            if not os.path.exists(sentence_file):
+                chapter_complete = False
+                break
+
+        if chapter_complete:
+            completed.append(chapter_num)
+        else:
+            # Once we hit an incomplete chapter, stop (chapters are sequential)
+            break
+
+        sentence_offset += len(chapter)
+
+    return completed
+
+
 def assemble_audiobook(args: dict) -> dict:
     """
     Assemble sentence audio files into the final audiobook.
@@ -3509,12 +3601,45 @@ def assemble_audiobook(args: dict) -> dict:
 
             session['final_name'] = get_sanitized(filename_base + '.' + session['output_format'])
 
-        print(f"[ASSEMBLE] Assembling from {len(session['chapters'])} chapters...")
+        # Parse --chapters argument for partial assembly
+        total_chapters = len(session['chapters'])
+        chapters_arg = args.get('chapters')
+        selected_chapters = parse_chapters_arg(chapters_arg, total_chapters)
 
-        # Combine sentences into chapters
+        # Auto-detect completed chapters if requested
+        if selected_chapters is None:
+            print("[ASSEMBLE] Auto-detecting completed chapters...")
+            selected_chapters = detect_completed_chapters(session, state)
+            if not selected_chapters:
+                return {'success': False, 'error': 'No completed chapters found. TTS may still be in progress.'}
+            print(f"[ASSEMBLE] Found {len(selected_chapters)} completed chapters: {selected_chapters[0]}-{selected_chapters[-1]}")
+
+        # Check if this is a partial assembly
+        is_partial = len(selected_chapters) < total_chapters
+        if is_partial:
+            print(f"[ASSEMBLE] Partial assembly: chapters {selected_chapters[0]}-{selected_chapters[-1]} of {total_chapters}")
+            # Update filename to indicate partial
+            if not args.get('output_filename'):
+                base_name = session['final_name'].rsplit('.', 1)[0]
+                ext = session['output_format']
+                partial_suffix = f" (Partial Ch {selected_chapters[0]}-{selected_chapters[-1]})"
+                session['final_name'] = get_sanitized(base_name + partial_suffix + '.' + ext)
+        else:
+            print(f"[ASSEMBLE] Assembling all {total_chapters} chapters...")
+
+        # Store selected chapters for combine_audio_chapters
+        session['selected_chapters'] = selected_chapters
+
+        # Combine sentences into chapters (only for selected chapters)
         sentence_offset = 0
         for i, chapter in enumerate(session['chapters']):
             chapter_num = i + 1
+
+            # Skip chapters not in selection
+            if chapter_num not in selected_chapters:
+                sentence_offset += len(chapter)
+                continue
+
             chapter_filename = f'{chapter_num}.{default_audio_proc_format}'
             start_sentence = sentence_offset
             end_sentence = sentence_offset + len(chapter) - 1
@@ -3526,9 +3651,10 @@ def assemble_audiobook(args: dict) -> dict:
 
             sentence_offset += len(chapter)
 
-        # Build VTT subtitle file
+        # Build VTT subtitle file (only for selected chapters)
         print("[ASSEMBLE] Creating VTT subtitle file...")
-        if not build_vtt_file(session_id, session['chapters']):
+        selected_chapter_data = [session['chapters'][i-1] for i in selected_chapters]
+        if not build_vtt_file(session_id, selected_chapter_data):
             print("[ASSEMBLE] Warning: VTT file creation failed (continuing without subtitles)")
 
         # Combine chapters into final audiobook

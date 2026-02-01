@@ -159,7 +159,7 @@ SML tags available:
         # Parallel worker options
         '--prep_only', '--worker_mode', '--assemble_only',
         '--sentence_start', '--sentence_end', '--chapter_start', '--chapter_end',
-        '--resume_session', '--list_sessions', '--no_split', '--skip_deps'
+        '--resume_session', '--list_sessions', '--no_split', '--chapters', '--skip_deps'
     ]
     tts_engine_list_keys = [k for k in TTS_ENGINES.keys()]
     tts_engine_list_values = [k for k in TTS_ENGINES.values()]
@@ -235,6 +235,8 @@ SML tags available:
         help='''List all resumable sessions with incomplete TTS conversion.''')
     parallel_group.add_argument('--no_split', action='store_true',
         help='''(assemble_only) Disable splitting output into parts.''')
+    parallel_group.add_argument('--chapters', type=str, default=None,
+        help='''(assemble_only) Specify which chapters to include. Formats: "1-5" (range), "1,3,5" (list), "auto" (detect completed chapters). Default: all chapters.''')
     parallel_group.add_argument('--skip_deps', action='store_true',
         help='''Skip dependency/device package checks. Use when deps are already installed.''')
 
