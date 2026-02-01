@@ -7,6 +7,7 @@ import os
 import re
 import atexit
 import weakref
+import numpy as np
 
 # Track active Orpheus instances for cleanup on exit
 _active_instances = weakref.WeakSet()
