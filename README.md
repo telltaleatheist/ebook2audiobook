@@ -103,14 +103,16 @@ https://github.com/user-attachments/assets/81c4baad-117e-4db5-ac86-efc2b7fea921
 
 ## Features
 - 📚 **Convert multiple file formats**: `.epub`, `.mobi`, `.azw3`, `.fb2`, `.lrf`, `.rb`, `.snb`, `.tcr`, `.pdf`, `.txt`, `.rtf`, `.doc`, `.docx`, `.html`, `.odt`, `.azw`, `.tiff`, `.tif`, `.png`, `.jpg`, `.jpeg`, `.bmp`
-- 🔍 **OCR scanning** for e-books with pages scanned as images
+- 🔍 **OCR scanning** for files with text pages as images
 - 🔊 **High-quality text-to-speech** from near realtime to near real voice
 - 🗣️ **Optional voice cloning** using your own voice file
-- 🧩 **Optional custom model** using your own trained model (XTTSv2 only, other on request)
 - 🌐 **Supports 1158 languages** ([supported languages list](https://dl.fbaipublicfiles.com/mms/tts/all-tts-languages.html))
 - 💻 **Low-resource friendly** — runs on **2 GB RAM / 1 GB VRAM (minimum)**
 - 🎵 **Audiobook output formats**: mono or stereo `aac`, `flac`, `mp3`, `m4b`, `m4a`, `mp4`, `mov`, `ogg`, `wav`, `webm`
-- 🧠 **SML tags supported** — fine-grained control of breaks, pauses, voice switching and more ([see available SML tags below](#sml-tags-available))
+- 🧠 **SML tags supported** — fine-grained control of breaks, pauses, voice switching and more ([see below](#sml-tags-available))
+- 🧩 **Optional custom model** using your own trained model (XTTSv2 only, other on request)
+- 🎛️ **Fine-tuned preset models** trained by the E2A Team<br/>
+     <i>(Contact us if you need additional fine-tuned models, or if you’d like to share yours to the official preset list)</i>
 
 
 ##  Hardware Requirements
@@ -121,7 +123,7 @@ https://github.com/user-attachments/assets/81c4baad-117e-4db5-ac86-efc2b7fea921
 - CUDA, ROCm, JETSON
 - MPS (Apple Silicon CPU)
 
-*<i> Modern TTS engines are very slow on CPU. on CPU Always use low level TTS like YourTTS, Tacotron2 etc..</i>
+*<i> Modern TTS engines are very slow on CPU, so use lower quality TTS like YourTTS, Tacotron2 etc..</i>
 
 ## Supported Languages
 | **Arabic (ar)**    | **Chinese (zh)**    | **English (en)**   | **Spanish (es)**   |
@@ -171,7 +173,7 @@ So you should first remove manually any text you don't want to be converted in a
 
    - **Linux/MacOS**  
      ```bash
-     ./ebook2audiobook.sh  # Run launch script
+     ./ebook2audiobook.command  # Run launch script
      ```
      <i>Note for MacOS users: homebrew is installed to install missing programs.</i>
      
@@ -190,7 +192,7 @@ So you should first remove manually any text you don't want to be converted in a
    
 1. **Open the Web App**: Click the URL provided in the terminal to access the web app and convert eBooks. `http://localhost:7860/`
 2. **For Public Link**:
-   `./ebook2audiobook.sh --share` (Linux/MacOS)
+   `./ebook2audiobook.command --share` (Linux/MacOS)
    `ebook2audiobook.cmd --share` (Windows)
    `python app.py --share` (all OS)
 
@@ -201,7 +203,7 @@ to let the web page reconnect to the new connection socket.**
 ### Basic  Usage
    - **Linux/MacOS**:
      ```bash
-     ./ebook2audiobook.sh --headless --ebook <path_to_ebook_file> --voice [path_to_voice_file] --language [language_code]
+     ./ebook2audiobook.command --headless --ebook <path_to_ebook_file> --voice [path_to_voice_file] --language [language_code]
      ```
    - **Windows**
      ```bash
@@ -219,7 +221,7 @@ to let the web page reconnect to the new connection socket.**
   (must be a .zip file containing the mandatory model files. Example for XTTSv2: config.json, model.pth, vocab.json and ref.wav)
    - **Linux/MacOS**
      ```bash
-     ./ebook2audiobook.sh --headless --ebook <ebook_file_path> --language <language> --custom_model <custom_model_path>
+     ./ebook2audiobook.command --headless --ebook <ebook_file_path> --language <language> --custom_model <custom_model_path>
      ```
    - **Windows**
      ```bash
@@ -234,7 +236,7 @@ to let the web page reconnect to the new connection socket.**
 ### For Detailed Guide with list of all Parameters to use
    - **Linux/MacOS**
      ```bash
-     ./ebook2audiobook.sh --help
+     ./ebook2audiobook.command --help
      ```
    - **Windows**
      ```bash
@@ -338,15 +340,15 @@ Windows:
     ebook2audiobook.cmd --headless --ebook '/path/to/file' --language eng
 Linux/Mac:
     Gradio/GUI:
-    ./ebook2audiobook.sh
+    ./ebook2audiobook.command
     Headless mode:
-    ./ebook2audiobook.sh --headless --ebook '/path/to/file' --language eng
+    ./ebook2audiobook.command --headless --ebook '/path/to/file' --language eng
 
 Docker build image:
     Windows:
     ebook2audiobook.cmd --script_mode build_docker
     Linux/Mac
-    ./ebook2audiobook.sh --script_mode build_docker
+    ./ebook2audiobook.command --script_mode build_docker
 Docker run image:
     Gradio/GUI:
         CPU:
@@ -411,7 +413,7 @@ TIP: if it needs some more pause, add '[pause:3]' for 3 sec. etc.
    ebook2audiobook.cmd --script_mode build_docker
 
    # Linux/MacOS
-   ./ebook2audiobook.sh --script_mode build_docker 
+   ./ebook2audiobook.command --script_mode build_docker 
 ```
 4. **Run the Container:**
 ```bash

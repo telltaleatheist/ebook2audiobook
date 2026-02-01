@@ -1,5 +1,3 @@
-import lib.classes.tts_engines
-
 from typing import Any
 from lib.classes.tts_registry import TTSRegistry
 
@@ -19,7 +17,7 @@ class TTSManager:
             )
         self.engine = engine_cls(session)
 
-    def convert_sentence2audio(self, sentence_number: int, sentence: str) -> bool:
+    def convert_sentence2audio(self, sentence_number:int, sentence:str)->bool:
         return self.engine.convert(sentence_number, sentence)
         
     def create_sentences2vtt(self, all_sentences:list)->bool:

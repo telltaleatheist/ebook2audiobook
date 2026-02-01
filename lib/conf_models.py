@@ -7,6 +7,7 @@ xtts_builtin_speakers_list = {}
 TTS_ENGINES = {
     "XTTSv2": "xtts",
     "BARK": "bark",
+    "TORTOISE": "tortoise",
     "VITS": "vits",
     "FAIRSEQ": "fairseq",
     "TACOTRON2": "tacotron",
@@ -22,26 +23,26 @@ TTS_VOICE_CONVERSION = {
 }
 
 TTS_SML = {
-	"break": {"static": "[break]", "paired": False},
-	"pause": {"static": "[pause]", "paired": False},
-	"voice": {"paired": True},
+    "break": {"static": "[break]", "paired": False},
+    "pause": {"static": "[pause]", "paired": False},
+    "voice": {"paired": True},
 }
 
 sml_escape_tag = 0xE000
 sml_tag_keys = '|'.join(map(re.escape, TTS_SML.keys()))
 
 SML_TAG_PATTERN = re.compile(
-	rf'''
-	\[
-		\s*
-		(?P<close>/)?
-		\s*
-		(?P<tag>{sml_tag_keys})
-		(?:\s*:\s*(?P<value>.*?))?
-		\s*
-	\]
-	''',
-	re.VERBOSE | re.DOTALL
+    rf'''
+    \[
+        \s*
+        (?P<close>/)?
+        \s*
+        (?P<tag>{sml_tag_keys})
+        (?:\s*:\s*(?P<value>.*?))?
+        \s*
+    \]
+    ''',
+    re.VERBOSE | re.DOTALL
 )
 
 default_tts_engine = TTS_ENGINES['XTTSv2']
@@ -147,12 +148,19 @@ default_engine_settings = {
             "zh_speaker_6": "Speaker 6", "zh_speaker_7": "Speaker 7", "zh_speaker_8": "Speaker 8",
             "zh_speaker_9": "Speaker 9"
         },
-        "rating": {"VRAM": 6, "CPU": 1, "RAM": 6, "Realism": 5}
+        "rating": {"VRAM": 6, "CPU": 1, "RAM": 6, "Realism": 4}
+    },
+    TTS_ENGINES['TORTOISE']: {
+        "languages": {"eng": "en"},
+        "samplerate": 24000,
+        "files": ['config.json', 'best_model.pth', 'vocoder_config.json', 'vocoder_model.pth'],
+        "voices": {},
+        "rating": {"VRAM": 3, "CPU": 2, "RAM": 4, "Realism": 4}
     },
     TTS_ENGINES['VITS']: {
         "languages": {"ben": "bn", "bul": "bg", "cat": "ca", "ces": "cs", "dan": "da", "deu": "de", "ell": "el", "eng": "en", "est": "et", "ewe": "ewe", "fas": "fa", "fin": "fi", "fra": "fr", "gle": "ga", "hau": "hau", "hrv": "hr", "hun": "hu", "ita": "it", "lav": "lv", "lin": "lin", "lit": "lt", "mlt": "mt", "nld": "nl", "pol": "pl", "por": "pt", "rom": "ro", "slk": "sk", "sln": "sl", "spa": "es", "swe": "sv", "tw_akuapem": "tw_akuapem", "tw_asante": "tw_asante", "ukr": "uk", "yor": "yor"},
         "samplerate": 22050,
-        "files": ['config.json', 'model_file.pth', 'language_ids.json'],
+        "files": ['autoregressive.pth ', 'diffusion_decoder.pth', 'vocoder.pth', 'clvp2.pth'],
         "voices": {},
         "rating": {"VRAM": 2, "CPU": 4, "RAM": 4, "Realism": 4}
     },
