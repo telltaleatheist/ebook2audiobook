@@ -75,6 +75,8 @@ def save_session_state(session_id: str, args: dict, prep_result: dict, core_modu
             'cover': session.get('cover'),
             'final_name': session.get('final_name'),
             'chapter_titles': session.get('chapter_titles', []),
+            # BookForge metadata (title, author, year from BFP project)
+            'bookforge_metadata': args.get('bookforge_metadata', {}),
         }
 
         state_path = os.path.join(session['process_dir'], 'session-state.json')
