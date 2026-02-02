@@ -103,3 +103,47 @@ Simple format: `{voice}: {text}`
 Example: `tara: Hello, this is a test.`
 
 Do NOT use special tokens like `<|audio_start|>` - the model will speak them literally.
+
+## BookForge Extension
+
+All BookForge-specific code is isolated in `bookforge_ext/` for easy upstream merging.
+
+### Directory Structure
+
+```
+bookforge_ext/
+├── __init__.py          # Extension entry point
+├── hooks.py             # Hook registry for core.py integration
+├── parallel/
+│   ├── args.py          # CLI argument definitions
+│   ├── handlers.py      # Mode dispatching (prep_only, worker_mode, assemble_only)
+│   ├── session.py       # Session state management
+│   └── worker_core.py   # Lightweight TTS worker
+└── config/
+    └── __init__.py      # Reserved for config overrides
+```
+
+### Worker Memory Management
+
+Workers use `worker.py` (not `app.py`) to minimize memory:
+- `worker.py` → `bookforge_ext/parallel/worker_core.py` → ~2.5GB per worker
+- `app.py --headless --worker_mode` → ~25GB per worker (imports everything)
+
+**Critical files for low-memory workers:**
+1. `worker.py` must import from `bookforge_ext.parallel.worker_core`
+2. `worker_core.py` must have `register_tts_engine()` to load only needed engine
+3. `tts_manager.py` must have `import lib.classes.tts_engines` for TTSRegistry
+4. `tts_engines/__init__.py` must import all engines for auto-registration
+
+### Hook System
+
+Extension integrates with core.py via hooks:
+
+```python
+# In lib/core.py (at end of file)
+from bookforge_ext import hooks as bf_hooks
+bf_hooks.register('get_context', lambda: context)
+
+# In extension code
+context = hooks.call('get_context')
+```
