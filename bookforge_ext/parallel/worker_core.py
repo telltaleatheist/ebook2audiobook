@@ -36,11 +36,33 @@ from lib.conf_lang import default_language_code
 from lib.classes.tts_manager import TTSManager
 from lib.classes.vram_detector import VRAMDetector
 
-# Import tts_engines to trigger engine registration via __init__.py
-# This populates TTSRegistry.ENGINES so TTSManager can find engines
-# Note: This imports the engine classes but NOT their heavy dependencies
-# (torch, transformers, etc are only loaded when engine.convert() is called)
-import lib.classes.tts_engines  # noqa: F401
+
+def register_tts_engine(engine_name: str) -> None:
+    """
+    Dynamically import and register only the needed TTS engine.
+    This avoids loading all 8 engines (and their heavy deps) at startup.
+
+    Each engine imports torch, transformers, TTS library, etc. at module level.
+    By only importing the engine we need, we save ~20GB+ of memory.
+    """
+    engine_modules = {
+        'xtts': 'lib.classes.tts_engines.xtts',
+        'bark': 'lib.classes.tts_engines.bark',
+        'vits': 'lib.classes.tts_engines.vits',
+        'tortoise': 'lib.classes.tts_engines.tortoise',
+        'fairseq': 'lib.classes.tts_engines.fairseq',
+        'tacotron': 'lib.classes.tts_engines.tacotron',
+        'yourtts': 'lib.classes.tts_engines.yourtts',
+        'orpheus': 'lib.classes.tts_engines.orpheus',
+    }
+
+    module_name = engine_modules.get(engine_name)
+    if module_name:
+        import importlib
+        importlib.import_module(module_name)
+        print(f"[WORKER] Registered TTS engine: {engine_name}")
+    else:
+        raise ValueError(f"Unknown TTS engine: {engine_name}")
 
 
 def load_session_state(session_dir: str) -> dict | None:
@@ -271,6 +293,9 @@ def run_worker_tts(
         print(f"[WORKER] Processing sentences {sentence_start}-{sentence_end} on {session['device'].upper()}")
         print(f"[WORKER] TTS engine: {session['tts_engine']}, fine_tuned: {session['fine_tuned']}")
 
+        # Dynamically register only the needed TTS engine (saves ~20GB memory)
+        register_tts_engine(session['tts_engine'])
+
         # Initialize TTS engine
         tts_manager = TTSManager(session)
 
@@ -307,8 +332,8 @@ def run_worker_tts(
 
             processed += 1
 
-            # Periodic memory cleanup
-            memory_cleanup(processed, interval=100)
+            # Periodic memory cleanup (every 10 sentences for MPS memory pressure)
+            memory_cleanup(processed, interval=10)
 
         elapsed = time.time() - start_time
         actual_converted = processed - skipped

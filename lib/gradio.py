@@ -491,7 +491,7 @@ def build_interface(args:dict)->gr.Blocks:
                                 with gr.Group(elem_id='gr_group_models', elem_classes=['gr-group']):
                                     gr_models_markdown = gr.Markdown(elem_id='gr_models_markdown', elem_classes=['gr-markdown'], value='Models')
                                     gr_fine_tuned_list = gr.Dropdown(label='Fine Tuned Preset Models', elem_id='gr_fine_tuned_list', choices=fine_tuned_options, type='value', interactive=True)
-                                    gr_group_custom_model = gr.Group(visible=False)
+                                    gr_group_custom_model = gr.Group(visible=visible_gr_group_custom_model)
                                     with gr_group_custom_model:
                                         gr_custom_model_label = gr.Textbox(label='', elem_id='gr_custom_model_label', elem_classes=['gr-label'], interactive=False)
                                         gr_custom_model_file = gr.File(label=f"Upload ZIP File", elem_id='gr_custom_model_file', value=None, file_types=['.zip'], height=100)
@@ -680,46 +680,46 @@ def build_interface(args:dict)->gr.Blocks:
                 
             def disable_on_voice_upload()->tuple:
                 return (
-                    gr.update(interactive=False), gr.update(interactive=False), gr.update(interactive=False), gr.update(interactive=False),
-                    gr.update(interactive=False), gr.update(interactive=False), gr.update(interactive=False), gr.update(interactive=False),
-                    gr.update(visible='hidden'),
-                    gr.update(visible='hidden')
+                    *([gr.update(interactive=False) for _ in range(8)]),
+                    gr.update(visible=False),
+                    gr.update(visible=False)
                 )
             
             def enable_on_voice_upload(session_id: str) -> tuple:
                 session = context.get_session(session_id)
-                outputs = tuple([gr.update(interactive=False) for _ in range(10)])
+                visible = False
                 if session and session.get('id', False):
-                    visible = True if session['voice'] is not None else 'hidden'
-                    convert_btn_enabled = True if session['ebook'] is not None else False
+                    visible = session.get('voice') is not None
                     if session.get('event') == 'confirm_blocks':
-                        return outputs
+                        return (
+                            *([gr.update() for _ in range(8)]),
+                            gr.update(visible=visible),
+                            gr.update(visible=visible)
+                        )
                     return (
-                        gr.update(interactive=True), gr.update(interactive=True), gr.update(interactive=True), gr.update(interactive=True),
-                        gr.update(interactive=True), gr.update(interactive=True), gr.update(interactive=True), gr.update(interactive=convert_btn_enabled),
+                        *([gr.update(interactive=True) for _ in range(8)]),
                         gr.update(visible=visible),
                         gr.update(visible=visible)
                     )
-                return outputs
+                return (
+                    *([gr.update() for _ in range(8)]),
+                    gr.update(visible=False),
+                    gr.update(visible=False)
+                )
 
             def disable_on_custom_upload()->tuple:
-                return (
-                    gr.update(interactive=False), gr.update(interactive=False), gr.update(interactive=False), gr.update(interactive=False),
-                    gr.update(interactive=False), gr.update(interactive=False), gr.update(interactive=False), gr.update(visible='hidden')
-                )
+                outputs = tuple([gr.update(interactive=False) for _ in range(7)])
+                return outputs
             
             def enable_on_custom_upload(session_id:str)->tuple:
                 session = context.get_session(session_id)
-                outputs = tuple([gr.update(interactive=False) for _ in range(8)])
                 if session and session.get('id', False):
                     if session['event'] == 'confirm_blocks':
+                        outputs = tuple([gr.update() for _ in range(7)])
                         return outputs
-                    convert_btn_enabled = True if session['ebook'] is not None else False
-                    custom_del_btn_visible = True if session['custom_model'] is not None else 'hidden'
-                    return (
-                        gr.update(interactive=True), gr.update(interactive=True), gr.update(interactive=True), gr.update(interactive=True),
-                        gr.update(interactive=True), gr.update(interactive=True), gr.update(interactive=convert_btn_enabled), gr.update(visible=custom_del_btn_visible)
-                    )
+                    outputs = tuple([gr.update(interactive=True) for _ in range(7)])
+                    return outputs
+                outputs = tuple([gr.update() for _ in range(7)])
                 return outputs
 
             def show_gr_modal(type:str, msg:str)->str:
@@ -808,7 +808,7 @@ def build_interface(args:dict)->gr.Blocks:
                     if session and session.get('id', False):
                         socket_hash = str(req.session_hash)
                         if not session.get(socket_hash):
-                            outputs = tuple([gr.update() for _ in range(16)])
+                            outputs = tuple([gr.update() for _ in range(15)])
                             return outputs
                         ebook_data = None
                         file_count = session['ebook_mode']
@@ -833,8 +833,7 @@ def build_interface(args:dict)->gr.Blocks:
                                 if not is_valid_gradio_cache(ebook_data):
                                     ebook_data = None
                         session['ebook'] = ebook_data
-                        visible_gr_row_split_hours = True if session['output_split'] else False
-                        visible_gr_group_custom_model = True if session['fine_tuned'] == 'internal' and session['tts_engine'] in [TTS_ENGINES['XTTSv2']] else False
+                        visible_row_split_hours = True if session['output_split'] else False
                         return (
                             gr.update(value=session['ebook']),
                             gr.update(value=session['ebook_mode']),
@@ -849,14 +848,13 @@ def build_interface(args:dict)->gr.Blocks:
                             gr.update(value=session['output_channel']),
                             gr.update(value=bool(session['output_split'])),
                             gr.update(value=session['output_split_hours']),
-                            gr.update(visible=visible_gr_row_split_hours),
-                            update_gr_audiobook_list(session_id),
-                            gr.update(visible=visible_gr_group_custom_model)
+                            gr.update(visible=visible_row_split_hours),
+                            update_gr_audiobook_list(session_id)
                         )
                 except Exception as e:
                     error = f'restore_interface(): {e}'
                     alert_exception(error, session_id)
-                outputs = tuple([gr.update() for _ in range(16)])
+                outputs = tuple([gr.update() for _ in range(15)])
                 return outputs
 
             def restore_audiobook_player(audiobook:str|None)->tuple:
@@ -888,12 +886,12 @@ def build_interface(args:dict)->gr.Blocks:
                     session = context.get_session(session_id)
                     if session and session.get('id', False):
                         session['audiobook'] = selected
-                        group_visible = True if session['audiobook'] else False
+                        group_visible = True if len(audiobook_options) > 0 else False
                         return gr.update(visible=group_visible)
                 except Exception as e:
                     error = f'change_gr_audiobook_list(): {e}'
                     alert_exception(error, session_id)
-                return gr.update(visible=False)
+                return gr.update(visible=group_visible)
 
             def update_gr_audiobook_player(session_id:str)->tuple:
                 try:
@@ -1035,8 +1033,14 @@ def build_interface(args:dict)->gr.Blocks:
                             speaker_path = os.path.abspath(selected)
                             speaker = re.sub(r'\.wav$|\.npz|\.pth$', '', os.path.basename(selected))
                             builtin_root = os.path.join(voices_dir, session['language'])
-                            is_in_builtin = os.path.commonpath([speaker_path, os.path.abspath(builtin_root)]) == os.path.abspath(builtin_root)
-                            is_in_models = os.path.commonpath([speaker_path, os.path.abspath(session['custom_model_dir'])]) == os.path.abspath(session['custom_model_dir'])
+                            is_in_builtin = os.path.commonpath([
+                                speaker_path,
+                                os.path.abspath(builtin_root)
+                            ]) == os.path.abspath(builtin_root)
+                            is_in_models = os.path.commonpath([
+                                speaker_path,
+                                os.path.abspath(session['custom_model_dir'])
+                            ]) == os.path.abspath(session['custom_model_dir'])
                             # Check if voice is built-in
                             is_builtin = any(
                                 speaker in settings.get('voices', {})
@@ -1345,8 +1349,7 @@ def build_interface(args:dict)->gr.Blocks:
                             models = load_engine_presets(session['tts_engine'])
                             session['tts_engine'] = tts_engine
                             if analyze_uploaded_file(custom_file, models['internal']['files']):
-                                session['custom_model'] = custom_file
-                                model = extract_custom_model(session_id)
+                                model = extract_custom_model(custom_file, session_id, models[default_fine_tuned]['files'])
                                 if model is not None:
                                     session['custom_model'] = model
                                     session['voice'] = os.path.join(model, f'{os.path.basename(os.path.normpath(model))}.wav')
@@ -1364,7 +1367,7 @@ def build_interface(args:dict)->gr.Blocks:
                                 state['type'] = 'warning'
                                 state['msg'] = error
                     show_alert(state)
-                return gr.update(value=None), gr.update()
+                return gr.update(), gr.update()
 
             def change_gr_tts_engine_list(engine:str, session_id:str)->tuple:
                 nonlocal models
@@ -1883,7 +1886,7 @@ def build_interface(args:dict)->gr.Blocks:
             gr_custom_model_file.upload(
                 fn=disable_on_custom_upload,
                 inputs=None,
-                outputs=[gr_ebook_file, gr_ebook_mode, gr_language, gr_tts_engine_list, gr_fine_tuned_list, gr_voice_file, gr_convert_btn, gr_custom_model_del_btn]
+                outputs=[gr_ebook_file, gr_ebook_mode, gr_language, gr_tts_engine_list, gr_fine_tuned_list, gr_voice_file, gr_convert_btn]
             ).then(
                 fn=change_gr_custom_model_file,
                 inputs=[gr_custom_model_file, gr_tts_engine_list, gr_session],
@@ -1896,7 +1899,7 @@ def build_interface(args:dict)->gr.Blocks:
             ).then(
                 fn=enable_on_custom_upload,
                 inputs=[gr_session],
-                outputs=[gr_ebook_file, gr_ebook_mode, gr_language, gr_tts_engine_list, gr_fine_tuned_list, gr_voice_file, gr_convert_btn, gr_custom_model_del_btn]
+                outputs=[gr_ebook_file, gr_ebook_mode, gr_language, gr_tts_engine_list, gr_fine_tuned_list, gr_voice_file, gr_convert_btn]
             )
             gr_custom_model_list.change(
                 fn=change_gr_custom_model_list,
@@ -2159,7 +2162,7 @@ def build_interface(args:dict)->gr.Blocks:
                 outputs=[
                     gr_ebook_file, gr_ebook_mode, gr_chapters_preview, gr_device, gr_language, gr_voice_list,
                     gr_tts_engine_list, gr_custom_model_list, gr_fine_tuned_list, gr_output_format_list, gr_output_channel_list,
-                    gr_output_split, gr_output_split_hours, gr_row_output_split_hours, gr_audiobook_list, gr_group_custom_model
+                    gr_output_split, gr_output_split_hours, gr_row_output_split_hours, gr_audiobook_list
                 ]
             ).then(
                 fn=restore_audiobook_player,

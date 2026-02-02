@@ -7,7 +7,6 @@ import os
 import re
 import atexit
 import weakref
-import numpy as np
 
 # Track active Orpheus instances for cleanup on exit
 _active_instances = weakref.WeakSet()
@@ -410,7 +409,7 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
             traceback.print_exc()
             raise ValueError(error)
 
-    def _generate_mlx(self, text: str, max_tokens: int = 2048) -> np.ndarray:
+    def _generate_mlx(self, text: str, max_tokens: int = 2048) -> "np.ndarray":
         """Generate audio using MLX backend.
 
         Note: 125 tokens ≈ 10 seconds of audio, so 2048 tokens ≈ 163 seconds max.
@@ -429,13 +428,14 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
         ):
             audio_data = result.audio
 
+        import numpy as np
+
         if audio_data is None:
             return np.zeros(int(self.SAMPLE_RATE * 0.1), dtype=np.float32)
 
         # MLX returns audio as numpy array or MLX array
         if hasattr(audio_data, 'tolist'):
             # Convert MLX array to numpy
-            import numpy as np
             audio_np = np.array(audio_data, dtype=np.float32)
         else:
             audio_np = audio_data
@@ -562,8 +562,9 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
         ]
         return codes
 
-    def _tokens_to_audio(self, tokens: list) -> np.ndarray:
+    def _tokens_to_audio(self, tokens: list) -> "np.ndarray":
         """Convert Orpheus tokens to audio using SNAC decoder."""
+        import numpy as np
         if not tokens:
             return np.zeros(int(self.SAMPLE_RATE * 0.1), dtype=np.float32)
 

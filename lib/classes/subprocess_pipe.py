@@ -1,4 +1,4 @@
-import os, subprocess, multiprocessing, sys
+import os, subprocess, multiprocessing, re, sys, gradio as gr
 
 from collections.abc import Callable
 
@@ -13,9 +13,6 @@ class SubprocessPipe:
         self.on_progress = on_progress
         self.progress_bar = False
         if self.is_gui_process:
-            # Only import gradio when actually needed (GUI mode)
-            # This avoids ~2GB memory overhead for headless workers
-            import gradio as gr
             self.progress_bar = gr.Progress(track_tqdm=False)
         self._run_process()
         
@@ -41,7 +38,6 @@ class SubprocessPipe:
 
     def _run_process(self)->bool:
         try:
-            import re
             is_ffmpeg = "ffmpeg" in os.path.basename(self.cmd[0])
             if is_ffmpeg:
                 self.process = subprocess.Popen(
@@ -70,10 +66,7 @@ class SubprocessPipe:
             if is_ffmpeg:
                 time_pattern=re.compile(rb'out_time_ms=(\d+)')
                 last_percent=0.0
-                while True:
-                    raw_line = self.process.stderr.readline()
-                    if not raw_line:
-                        break
+                for raw_line in self.process.stderr:
                     line=raw_line.decode(errors='ignore')
                     match=time_pattern.search(raw_line)
                     if match and self.total_duration > 0:

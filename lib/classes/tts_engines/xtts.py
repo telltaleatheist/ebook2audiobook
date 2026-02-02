@@ -153,9 +153,12 @@ class XTTSv2(TTSUtils, TTSRegistry, name='xtts'):
                                     )
                             # Model stays on MPS/CUDA for faster consecutive inference
                         audio_part = result.get('wav')
+                        del result  # Free inference result immediately
                         if is_audio_data_valid(audio_part):
                             src_tensor = self._tensor_type(audio_part)
+                            del audio_part  # Free original audio data
                             part_tensor = src_tensor.clone().detach().unsqueeze(0).cpu()
+                            del src_tensor  # Free intermediate tensor
                             if part_tensor is not None and part_tensor.numel() > 0:
                                 if part[-1].isalnum() or part[-1] == '—':
                                     part_tensor = trim_audio(part_tensor.squeeze(), self.params['samplerate'], 0.001, trim_audio_buffer).unsqueeze(0)
@@ -165,11 +168,13 @@ class XTTSv2(TTSUtils, TTSRegistry, name='xtts'):
                                     silence_time = int(np.random.uniform(0.3, 0.6) * 100) / 100
                                     break_tensor = torch.zeros(1, int(self.params['samplerate'] * silence_time))
                                     self.audio_segments.append(break_tensor.clone())
+                                    del break_tensor  # Free original before clone
                             else:
                                 error = f"part_tensor not valid"
                                 print(error)
                                 return False
                         else:
+                            del audio_part  # Free even on invalid
                             error = f"audio_part not valid"
                             print(error)
                             return False

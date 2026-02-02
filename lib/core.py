@@ -293,16 +293,12 @@ def analyze_uploaded_file(zip_path:str, required_files:list[str])->bool:
         print(error)
         return False
 
-def extract_custom_model(session_id)->str|None:
+def extract_custom_model(file_src:str, session_id, required_files:list)->str|None:
     session = context.get_session(session_id)
     if session and session.get('id', False):
-        file_src = session['custom_model']
-        required_files = default_engine_settings[session['tts_engine']]['files']
         model_path = None
         model_name = re.sub('.zip', '', os.path.basename(file_src), flags=re.IGNORECASE)
         model_name = get_sanitized(model_name)
-        if session['is_gui_process']:
-            progress_bar = gr.Progress(track_tqdm=False)
         try:
             with zipfile.ZipFile(file_src, 'r') as zip_ref:
                 files = zip_ref.namelist()
@@ -311,7 +307,6 @@ def extract_custom_model(session_id)->str|None:
                 model_path = os.path.join(session['custom_model_dir'], tts_dir, model_name)
                 os.makedirs(model_path, exist_ok=True)
                 required_files_lc = set(x.lower() for x in required_files)
-                msg = f'Extracting files to {model_path}...'
                 with tqdm(total=files_length, unit='files') as t:
                     for f in files:
                         base_f = os.path.basename(f).lower()
@@ -320,29 +315,23 @@ def extract_custom_model(session_id)->str|None:
                             with zip_ref.open(f) as src, open(out_path, 'wb') as dst:
                                 shutil.copyfileobj(src, dst)
                         t.update(1)
-                        if session['is_gui_process']:
-                            progress_bar((t.n + 1) / files_length, desc=msg)
             if model_path is not None:
-                msg = f'Normalizing ref.wav…'
+                msg = f'Extracted files to {model_path}. Normalizing ref.wav…'
                 print(msg)
                 voice_ref = os.path.join(model_path, 'ref.wav')
-                voice_name = model_name
-                final_voice_file = os.path.join(model_path, f'{voice_name}.wav')
-                extractor = VoiceExtractor(session, voice_ref, voice_name, final_voice_file)
-                status, msg = extractor.extract_voice()
-                if status:
-                    session['voice'] = final_voice_file
+                voice_output = os.path.join(model_path, f'{model_name}.wav')
+                extractor = VoiceExtractor(session, voice_ref, voice_output)
+                success, error = extractor.normalize_audio(voice_ref, voice_output, voice_output)
+                if success:
                     if os.path.exists(file_src):
                         os.remove(file_src)
                     if os.path.exists(voice_ref):
                         os.remove(voice_ref)
                     return model_path
-                else:
-                    error = f'extract_custom_model() VoiceExtractor.extract_voice() error! {msg}'
-                    print(error)
-            else:
-                error = f'An error occurred     when unzip {file_src}'
+                error = f'normalize_audio {voice_ref} error: {error}'
                 print(error)
+            else:
+                error = f'An error occured when unzip {file_src}'
         except asyncio.exceptions.CancelledError as e:
             DependencyError(e)
             error = f'extract_custom_model asyncio.exceptions.CancelledError: {e}'
@@ -354,7 +343,6 @@ def extract_custom_model(session_id)->str|None:
         if session['is_gui_process']:
             if os.path.exists(file_src):
                 os.remove(file_src)
-        session['custom_model'] = None
     return None
         
 def hash_proxy_dict(proxy_dict)->str:
@@ -1000,8 +988,8 @@ def filter_chapter(idx:int, doc:EpubHtml, session_id:str, stanza_nlp:Pipeline, i
                 print(error)
                 return None
             # clean SML tags badly coded
-            res, text = normalize_sml_tags(text)
-            if res is False:
+            bool, text = normalize_sml_tags(text)
+            if bool is False:
                 print(text)
                 if session['is_gui_process']:
                     show_alert({"type": "warning", "msg": text})
@@ -2269,18 +2257,18 @@ def combine_audio_chapters(session_id:str)->list[str]|None:
                 return None
             chunks_size = 892
             total_duration = 0.0
-            durations = []
+            durations = []  # Track per-file durations for output_split mode
             for i in range(0, len(chapter_files), chunks_size):
                 filepaths = [
                     os.path.join(session['chapters_dir'], f)
                     for f in chapter_files[i:i + chunks_size]
                 ]
-                durations_dict = get_audiolist_duration(filepaths)
-                for path in filepaths:
-                    dur = durations_dict.get(path, 0.0)
-                    durations.append(dur)
-                    total_duration += dur
-            assert len(durations) == len(chapter_files)
+                chunk_durations = get_audiolist_duration(filepaths)
+                total_duration += sum(chunk_durations.values())
+                # Append durations in order
+                for f in chapter_files[i:i + chunks_size]:
+                    fp = os.path.join(session['chapters_dir'], f)
+                    durations.append(chunk_durations.get(os.path.realpath(fp), 0.0))
             exported_files = []
             concat_dir = session['process_dir']
             if session['output_split']:
@@ -2362,8 +2350,7 @@ def combine_audio_chapters(session_id:str)->list[str]|None:
 def assemble_audio_chunks(txt_file:str, out_file:str, is_gui_process:bool)->bool:
 
     def on_progress(p:float)->None:
-        if is_gui_process:
-            progress_bar(p / 100.0, desc='Assemble')
+        progress_bar(p / 100.0, desc='Assemble')
 
     try:
         total_duration = 0.0
@@ -2387,8 +2374,7 @@ def assemble_audio_chunks(txt_file:str, out_file:str, is_gui_process:bool)->bool
             print(f'assemble_audio_chunks() open file {txt_file} Error: {e}')
             return False
 
-        if is_gui_process:
-            progress_bar = gr.Progress(track_tqdm=False)
+        progress_bar = gr.Progress(track_tqdm=False)
 
         cmd = [
             shutil.which('ffmpeg'),
@@ -2617,8 +2603,8 @@ def convert_ebook(args:dict)->tuple:
                         custom_src_name = custom_src_path.stem
                         if not os.path.exists(os.path.join(session['custom_model_dir'], custom_src_name)):
                             try:
-                                if analyze_uploaded_file(session['custom_model'], default_engine_settings[session['tts_engine']]['files']):
-                                    model = extract_custom_model(session_id)
+                                if analyze_uploaded_file(session['custom_model'], default_engine_settings[session['tts_engine']]['internal']['files']):
+                                    model = extract_custom_model(session['custom_model'], session_id, default_engine_settings[session['tts_engine']]['files'])
                                     if model is not None:
                                         session['custom_model'] = model
                                     else:
@@ -3810,19 +3796,3 @@ def worker_only(args: dict) -> dict:
         import traceback
         traceback.print_exc()
         return {'success': False, 'error': str(e)}
-
-
-# =============================================================================
-# BookForge Extension Hooks
-# =============================================================================
-# Register hook accessors for the BookForge extension.
-# This allows the extension to access core.py internals (context, etc.)
-# without modifying the extension when core.py internals change.
-
-try:
-    from bookforge_ext import hooks as bf_hooks
-    bf_hooks.register('get_context', lambda: context)
-    bf_hooks.register('get_context_tracker', lambda: context_tracker)
-    bf_hooks.register('get_active_sessions', lambda: active_sessions)
-except ImportError:
-    pass  # Extension not installed

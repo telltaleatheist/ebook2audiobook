@@ -28,6 +28,9 @@ class TTSUtils:
         elif hasattr(torch, 'mps') and hasattr(torch.mps, 'empty_cache'):
             # MPS (Apple Silicon) memory cleanup
             torch.mps.empty_cache()
+            # Synchronize to ensure operations complete before continuing
+            if hasattr(torch.mps, 'synchronize'):
+                torch.mps.synchronize()
 
     def _model_size_bytes(self, model:Any)->int:
         total = 0

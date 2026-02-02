@@ -1,19 +1,24 @@
-import os, subprocess, shutil, gradio as gr
+import os, sys, subprocess, shutil, json, torchaudio, numpy as np, regex as re, scipy.fftpack, soundfile as sf, gradio as gr
 
 from typing import Any
+from io import BytesIO
 from pydub import AudioSegment, silence
 from pydub.silence import detect_nonsilent
+from demucs.pretrained import get_model
+from demucs.apply import apply_model
+from demucs.audio import AudioFile
 from pathlib import Path
             
+from lib.classes.tts_engines.common.preset_loader import load_engine_presets
 from lib.classes.tts_engines.common.audio import get_audio_duration
+from lib.classes.background_detector import BackgroundDetector
 from lib.classes.subprocess_pipe import SubprocessPipe
 from lib.conf import systems, devices, voice_formats, default_audio_proc_samplerate
 from lib.conf_models import TTS_ENGINES
 
 class VoiceExtractor:
 
-    def __init__(self, session:Any, voice_file:str, voice_name:str, final_voice_file:str|None=None)->None:
-        from lib.classes.tts_engines.common.preset_loader import load_engine_presets
+    def __init__(self, session:Any, voice_file:str, voice_name:str):
         self.wav_file = None
         self.session = session
         self.voice_file = voice_file
@@ -22,7 +27,7 @@ class VoiceExtractor:
         self.demucs_dir = os.path.join(self.output_dir,'htdemucs', voice_name)
         self.voice_track = os.path.join(self.demucs_dir, 'vocals.wav')
         self.proc_voice_file = os.path.join(self.session['voice_dir'], f'{self.voice_name}_proc.wav')
-        self.final_voice_file = final_voice_file if final_voice_file is not None else os.path.join(self.session['voice_dir'], f'{self.voice_name}.wav')
+        self.final_voice_file = os.path.join(self.session['voice_dir'], f'{self.voice_name}.wav')
         self.silence_threshold = -60
         self.is_gui_process = session['is_gui_process']
         if self.is_gui_process:
@@ -71,29 +76,24 @@ class VoiceExtractor:
 
     def _detect_background(self)->tuple[bool,bool,str]:
         try:
-            from lib.classes.background_detector import BackgroundDetector
             msg = 'Detecting if any background noise or music...'
             print(msg)
             if self.is_gui_process:
                 self.progress_bar(1, desc=msg)
             detector = BackgroundDetector(wav_file = self.wav_file)
-            status, report = detector.detect(vad_ratio_thresh = 0.15)
-            if report:
-                print(report)
-                if status:
-                    msg = 'Background detected...'
-                else:
-                    msg = 'No background detected'
-                return True, status, msg
+            status,report = detector.detect(vad_ratio_thresh = 0.15)
+            print(report)
+            if status:
+                msg = 'Background detected...'
+            else:
+                msg = 'No background detected'
+            return True, status, msg
         except Exception as e:
             error = f'_detect_background() error: {e}'
             print(error)
-        return False, False, error
+            return False, False, error
 
     def _demucs_voice(self)->tuple[bool, str]:
-        from demucs.pretrained import get_model
-        from demucs.apply import apply_model
-        from demucs.audio import AudioFile
 
         def demucs_callback(d: dict):
             nonlocal last_percent
@@ -104,16 +104,14 @@ class VoiceExtractor:
                 if percent - last_percent >= 0.01:
                     last_percent = percent
                     print(f"\r[Demucs] {percent*100:.2f}%", end="", flush=True)
-                    if self.is_gui_process:
-                        self.progress_bar(percent, desc=msg)
+                    self.progress_bar(percent, desc=msg)
 
         error = '_demucs_voice() error'
         try:
             system = self.session['system']
             last_percent = 0.0
             msg = 'Extracting Voice...'
-            if self.is_gui_process:
-                self.progress_bar(0.0, desc=msg)
+            self.progress_bar(0.0, desc=msg)
             device = devices['CUDA']['proc'] if self.session['device'] in ['cuda', 'jetson'] else self.session['device'] if devices[self.session['device'].upper()]['found'] else devices['CPU']['proc']
             model = get_model(name="htdemucs")
             model.to(device)
@@ -141,8 +139,7 @@ class VoiceExtractor:
                 callback=demucs_callback,
                 callback_arg={}
             )
-            if self.is_gui_process:
-                self.progress_bar(1.0, desc=msg)
+            self.progress_bar(1.0, desc=msg)
             print("\r[Demucs] 100.00%")
             sources = result[0] if isinstance(result, (tuple, list)) else result
             vocals_idx = model.sources.index("vocals")
@@ -189,7 +186,6 @@ class VoiceExtractor:
     
     def _trim_and_clean(self, silence_threshold:int, min_silence_len:int=200, chunk_size:int=100)->tuple[bool, str]:
         try:
-            import numpy as np
             audio = AudioSegment.from_file(self.voice_track)
             audio = self._remove_silences(
                 audio,
@@ -249,13 +245,16 @@ class VoiceExtractor:
             print(error)
             return False, error
 
-    def normalize_audio(self, src_file:str, proc_file:str, dst_file:str)->tuple[bool, str]:
+    def normalize_audio(self, src_file:str=None, proc_file:str=None, dst_file:str=None)->tuple[bool, str]:
         try:
             msg = 'Normalize audio...'
             print(msg)
             if self.is_gui_process:
                 self.progress_bar(0, desc=msg)
-            cmd = [shutil.which('ffmpeg'), '-hide_banner', '-nostats', '-progress', 'pipe:2', '-i', src_file]
+            src_file = src_file or self.voice_track
+            proc_file = proc_file or self.proc_voice_file
+            dst_file = dst_file or self.final_voice_file
+            cmd = [shutil.which('ffmpeg'), '-hide_banner', '-nostats', '-i', src_file]
             filter_complex = (
                 'agate=threshold=-25dB:ratio=1.4:attack=10:release=250,'
                 'afftdn=nf=-70,'
@@ -332,7 +331,7 @@ class VoiceExtractor:
                             if self.is_gui_process:
                                 self.progress_bar(int(result), desc=msg)
                             if result:
-                                result, msg = self.normalize_audio(self.voice_track, self.proc_voice_file, self.final_voice_file)
+                                result, msg = self.normalize_audio()
                                 print(msg)
                                 if self.is_gui_process:
                                     self.progress_bar(int(result), desc=msg)
