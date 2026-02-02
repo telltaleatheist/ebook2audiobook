@@ -204,7 +204,8 @@ def memory_cleanup(sentence_idx: int = 0, interval: int = 100):
     """
     if sentence_idx % interval == 0:
         gc.collect()
-        if hasattr(torch, 'mps') and hasattr(torch.mps, 'empty_cache'):
+        # Check is_available() not just hasattr - MPS module exists on Linux but backend isn't available
+        if torch.backends.mps.is_available():
             torch.mps.empty_cache()
         elif torch.cuda.is_available():
             torch.cuda.empty_cache()
