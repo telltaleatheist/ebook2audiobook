@@ -36,6 +36,12 @@ from lib.conf_lang import default_language_code
 from lib.classes.tts_manager import TTSManager
 from lib.classes.vram_detector import VRAMDetector
 
+# Import tts_engines to trigger engine registration via __init__.py
+# This populates TTSRegistry.ENGINES so TTSManager can find engines
+# Note: This imports the engine classes but NOT their heavy dependencies
+# (torch, transformers, etc are only loaded when engine.convert() is called)
+import lib.classes.tts_engines  # noqa: F401
+
 
 def load_session_state(session_dir: str) -> dict | None:
     """

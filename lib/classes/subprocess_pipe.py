@@ -1,4 +1,4 @@
-import os, subprocess, multiprocessing, sys, gradio as gr
+import os, subprocess, multiprocessing, sys
 
 from collections.abc import Callable
 
@@ -13,6 +13,9 @@ class SubprocessPipe:
         self.on_progress = on_progress
         self.progress_bar = False
         if self.is_gui_process:
+            # Only import gradio when actually needed (GUI mode)
+            # This avoids ~2GB memory overhead for headless workers
+            import gradio as gr
             self.progress_bar = gr.Progress(track_tqdm=False)
         self._run_process()
         
