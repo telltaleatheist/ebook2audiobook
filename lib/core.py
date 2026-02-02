@@ -3796,3 +3796,19 @@ def worker_only(args: dict) -> dict:
         import traceback
         traceback.print_exc()
         return {'success': False, 'error': str(e)}
+
+
+# =============================================================================
+# BookForge Extension Hooks
+# =============================================================================
+# Register hook accessors for the BookForge extension.
+# This allows the extension to access core.py internals (context, etc.)
+# without modifying the extension when core.py internals change.
+
+try:
+    from bookforge_ext import hooks as bf_hooks
+    bf_hooks.register('get_context', lambda: context)
+    bf_hooks.register('get_context_tracker', lambda: context_tracker)
+    bf_hooks.register('get_active_sessions', lambda: active_sessions)
+except ImportError:
+    pass  # Extension not installed

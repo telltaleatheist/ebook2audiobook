@@ -79,8 +79,9 @@ def main():
 
     # Now import the worker core (after arg parsing to fail fast on bad args)
     # This is where the heavy imports happen
+    # TEST Step 2: Using bookforge_ext worker_core to test if extension causes memory growth
     print(f"[WORKER] Loading TTS worker core...")
-    from lib.worker_core import run_worker_tts
+    from bookforge_ext.parallel.worker_core import run_worker_tts
 
     # Build args dict for worker
     worker_args = {

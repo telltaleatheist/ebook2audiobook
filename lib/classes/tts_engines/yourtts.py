@@ -1,5 +1,8 @@
 from lib.classes.tts_engines.common.headers import *
 from lib.classes.tts_engines.common.preset_loader import load_engine_presets
+import torch
+import torchaudio
+import numpy as np
 
 class YourTTS(TTSUtils, TTSRegistry, name='yourtts'):
 

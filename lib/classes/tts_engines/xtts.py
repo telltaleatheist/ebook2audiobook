@@ -1,5 +1,9 @@
 from lib.classes.tts_engines.common.headers import *
 from lib.classes.tts_engines.common.preset_loader import load_engine_presets
+# TEST Step 3c: Direct imports since headers no longer provides them
+import torch
+import torchaudio
+import numpy as np
 
 class XTTSv2(TTSUtils, TTSRegistry, name='xtts'):
 
@@ -20,6 +24,7 @@ class XTTSv2(TTSUtils, TTSRegistry, name='xtts'):
             enough_vram = self.session['free_vram_gb'] > 4.0
             seed = 0
             #random.seed(seed)
+            #np.random.seed(seed)
             self.amp_dtype = self._apply_gpu_policy(enough_vram=enough_vram, seed=seed)
             self.xtts_speakers = self._load_xtts_builtin_list()
             self.engine = self.load_engine()
@@ -29,78 +34,52 @@ class XTTSv2(TTSUtils, TTSRegistry, name='xtts'):
 
     def load_engine(self)->Any:
         try:
-            from huggingface_hub import hf_hub_download
-            msg = f'Loading TTS {self.tts_key} model, it takes a while, please be patient…'
+            msg = f"Loading TTS {self.tts_key} model, it takes a while, please be patient…"
             print(msg)
             self._cleanup_memory()
-            engine = loaded_tts.get(self.tts_key)
+            engine = loaded_tts.get(self.tts_key, False)
             if not engine:
                 if self.session['custom_model'] is not None:
-                    try:
-                        config_path = os.path.join(self.session['custom_model_dir'], self.session['tts_engine'], self.session['custom_model'], default_engine_settings[TTS_ENGINES['XTTSv2']]['files'][0])
-                        checkpoint_path = os.path.join(self.session['custom_model_dir'], self.session['tts_engine'], self.session['custom_model'], default_engine_settings[TTS_ENGINES['XTTSv2']]['files'][1])
-                        vocab_path = os.path.join(self.session['custom_model_dir'], self.session['tts_engine'], self.session['custom_model'], default_engine_settings[TTS_ENGINES['XTTSv2']]['files'][2])
-                        self.tts_key = f'{self.session["tts_engine"]}-{self.session["custom_model"]}'
-                        engine = self._load_checkpoint(tts_engine=self.session['tts_engine'], key=self.tts_key, checkpoint_path=checkpoint_path, config_path=config_path, vocab_path=vocab_path)
-                    except Exception as e:
-                        error = f'load_engine(): custom checkpoint loading failed: {e}'
-                        raise RuntimeError(error) from e
+                    config_path = os.path.join(self.session['custom_model_dir'], self.session['tts_engine'], self.session['custom_model'], default_engine_settings[TTS_ENGINES['XTTSv2']]['files'][0])
+                    checkpoint_path = os.path.join(self.session['custom_model_dir'], self.session['tts_engine'], self.session['custom_model'], default_engine_settings[TTS_ENGINES['XTTSv2']]['files'][1])
+                    vocab_path = os.path.join(self.session['custom_model_dir'], self.session['tts_engine'], self.session['custom_model'],default_engine_settings[TTS_ENGINES['XTTSv2']]['files'][2])
+                    self.tts_key = f"{self.session['tts_engine']}-{self.session['custom_model']}"
+                    engine = self._load_checkpoint(tts_engine=self.session['tts_engine'], key=self.tts_key, checkpoint_path=checkpoint_path, config_path=config_path, vocab_path=vocab_path)
                 else:
-                    try:
-                        hf_repo = self.models[self.session['fine_tuned']]['repo']
-                        if self.session['fine_tuned'] == 'internal':
-                            hf_sub = ''
-                            if self.speakers_path is None:
-                                self.speakers_path = hf_hub_download(repo_id=hf_repo, filename='speakers_xtts.pth', cache_dir=self.cache_dir)
-                        else:
-                            hf_sub = self.models[self.session['fine_tuned']]['sub']
-                        config_path = hf_hub_download(repo_id=hf_repo, filename=f'{hf_sub}{self.models[self.session["fine_tuned"]]["files"][0]}', cache_dir=self.cache_dir)
-                        checkpoint_path = hf_hub_download(repo_id=hf_repo, filename=f'{hf_sub}{self.models[self.session["fine_tuned"]]["files"][1]}', cache_dir=self.cache_dir)
-                        vocab_path = hf_hub_download(repo_id=hf_repo, filename=f'{hf_sub}{self.models[self.session["fine_tuned"]]["files"][2]}', cache_dir=self.cache_dir)
-                        engine = self._load_checkpoint(tts_engine=self.session['tts_engine'], key=self.tts_key, checkpoint_path=checkpoint_path, config_path=config_path, vocab_path=vocab_path)
-                    except Exception as e:
-                        error = f'load_engine(): HuggingFace checkpoint loading failed: {e}'
-                        raise RuntimeError(error) from e
-            if engine:
+                    hf_repo = self.models[self.session['fine_tuned']]['repo']
+                    if self.session['fine_tuned'] == 'internal':
+                        hf_sub = ''
+                        if self.speakers_path is None:
+                            self.speakers_path = hf_hub_download(repo_id=hf_repo, filename='speakers_xtts.pth', cache_dir=self.cache_dir)
+                    else:
+                        hf_sub = self.models[self.session['fine_tuned']]['sub']
+                    config_path = hf_hub_download(repo_id=hf_repo, filename=f"{hf_sub}{self.models[self.session['fine_tuned']]['files'][0]}", cache_dir=self.cache_dir)
+                    checkpoint_path = hf_hub_download(repo_id=hf_repo, filename=f"{hf_sub}{self.models[self.session['fine_tuned']]['files'][1]}", cache_dir=self.cache_dir)
+                    vocab_path = hf_hub_download(repo_id=hf_repo, filename=f"{hf_sub}{self.models[self.session['fine_tuned']]['files'][2]}", cache_dir=self.cache_dir)
+                    engine = self._load_checkpoint(tts_engine=self.session['tts_engine'], key=self.tts_key, checkpoint_path=checkpoint_path, config_path=config_path, vocab_path=vocab_path)
+            if engine and engine is not None:
                 msg = f'TTS {self.tts_key} Loaded!'
-                print(msg)
                 return engine
-            error = 'load_engine(): engine is None'
-            raise RuntimeError(error)
         except Exception as e:
             error = f'load_engine() error: {e}'
-            raise RuntimeError(error) from e
+            raise ValueError(error)
 
     def convert(self, sentence_index:int, sentence:str)->bool:
         try:
-            import torch
-            import torchaudio
-            import numpy as np
-            from lib.classes.tts_engines.common.audio import trim_audio, is_audio_data_valid
             if self.engine:
                 final_sentence_file = os.path.join(self.session['sentences_dir'], f'{sentence_index}.{default_audio_proc_format}')
-                device = devices['CUDA']['proc'] if self.session['device'] in [devices['CUDA']['proc'], devices['JETSON']['proc']] else self.session['device']
+                device = devices['CUDA']['proc'] if self.session['device'] in ['cuda', 'jetson'] else self.session['device'] if devices[self.session['device'].upper()]['found'] else devices['CPU']['proc']
                 sentence_parts = self._split_sentence_on_sml(sentence)
                 if not self._set_voice():
                     return False
-                if self.params['current_voice'] is not None and self.params['current_voice'] in self.params['latent_embedding'].keys():
-                    self.params['gpt_cond_latent'], self.params['speaker_embedding'] = self.params['latent_embedding'][self.params['current_voice']]
-                else:
-                    msg = 'Computing speaker latents…'
-                    print(msg)
-                    if self.speaker in default_engine_settings[TTS_ENGINES['XTTSv2']]['voices'].keys():
-                        self.params['gpt_cond_latent'], self.params['speaker_embedding'] = self.xtts_speakers[default_engine_settings[TTS_ENGINES['XTTSv2']]['voices'][self.speaker]].values()
-                    else:
-                        self.params['gpt_cond_latent'], self.params['speaker_embedding'] = self.engine.get_conditioning_latents(audio_path=[self.params['current_voice']], librosa_trim_db=30, load_sr=24000, sound_norm_refs=True)  
-                    self.params['latent_embedding'][self.params['current_voice']] = self.params['gpt_cond_latent'], self.params['speaker_embedding']
                 self.audio_segments = []
                 for part in sentence_parts:
                     part = part.strip()
                     if not part:
                         continue
                     if SML_TAG_PATTERN.fullmatch(part):
-                        res, error = self._convert_sml(part)
-                        if not res:
+                        sml_success, error = self._convert_sml(part)
+                        if sml_success is False:
                             print(error)
                             return False
                         continue
@@ -111,6 +90,16 @@ class XTTSv2(TTSUtils, TTSRegistry, name='xtts'):
                         if part.endswith("'"):
                             part = part[:-1]
                         part = part.replace('.', ' ;\n')
+                        if self.params['voice_path'] is not None and self.params['voice_path'] in self.params['latent_embedding'].keys():
+                            self.params['gpt_cond_latent'], self.params['speaker_embedding'] = self.params['latent_embedding'][self.params['voice_path']]
+                        else:
+                            msg = 'Computing speaker latents…'
+                            print(msg)
+                            if self.speaker in default_engine_settings[TTS_ENGINES['XTTSv2']]['voices'].keys():
+                                self.params['gpt_cond_latent'], self.params['speaker_embedding'] = self.xtts_speakers[default_engine_settings[TTS_ENGINES['XTTSv2']]['voices'][self.speaker]].values()
+                            else:
+                                self.params['gpt_cond_latent'], self.params['speaker_embedding'] = self.engine.get_conditioning_latents(audio_path=[self.params['voice_path']], librosa_trim_db=30, load_sr=24000, sound_norm_refs=True)  
+                            self.params['latent_embedding'][self.params['voice_path']] = self.params['gpt_cond_latent'], self.params['speaker_embedding']
                         fine_tuned_params = {
                             key.removeprefix("xtts_"): cast_type(self.session[key])
                             for key, cast_type in {
@@ -153,28 +142,22 @@ class XTTSv2(TTSUtils, TTSRegistry, name='xtts'):
                                     )
                             # Model stays on MPS/CUDA for faster consecutive inference
                         audio_part = result.get('wav')
-                        del result  # Free inference result immediately
                         if is_audio_data_valid(audio_part):
                             src_tensor = self._tensor_type(audio_part)
-                            del audio_part  # Free original audio data
                             part_tensor = src_tensor.clone().detach().unsqueeze(0).cpu()
-                            del src_tensor  # Free intermediate tensor
                             if part_tensor is not None and part_tensor.numel() > 0:
                                 if part[-1].isalnum() or part[-1] == '—':
                                     part_tensor = trim_audio(part_tensor.squeeze(), self.params['samplerate'], 0.001, trim_audio_buffer).unsqueeze(0)
                                 self.audio_segments.append(part_tensor)
                                 if not re.search(r'\w$', part, flags=re.UNICODE) and part[-1] != '—':
-                                    #np.random.seed(seed)
                                     silence_time = int(np.random.uniform(0.3, 0.6) * 100) / 100
                                     break_tensor = torch.zeros(1, int(self.params['samplerate'] * silence_time))
                                     self.audio_segments.append(break_tensor.clone())
-                                    del break_tensor  # Free original before clone
                             else:
                                 error = f"part_tensor not valid"
                                 print(error)
                                 return False
                         else:
-                            del audio_part  # Free even on invalid
                             error = f"audio_part not valid"
                             print(error)
                             return False
