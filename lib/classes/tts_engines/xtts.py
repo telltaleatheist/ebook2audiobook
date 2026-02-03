@@ -90,6 +90,8 @@ class XTTSv2(TTSUtils, TTSRegistry, name='xtts'):
                         if part.endswith("'"):
                             part = part[:-1]
                         part = part.replace('.', ' ;\n')
+                        # Split long text to avoid truncation (XTTS has 250 char limit)
+                        text_subparts = self._split_long_text(part, max_length=250)
                         if self.params['voice_path'] is not None and self.params['voice_path'] in self.params['latent_embedding'].keys():
                             self.params['gpt_cond_latent'], self.params['speaker_embedding'] = self.params['latent_embedding'][self.params['voice_path']]
                         else:
@@ -98,7 +100,7 @@ class XTTSv2(TTSUtils, TTSRegistry, name='xtts'):
                             if self.speaker in default_engine_settings[TTS_ENGINES['XTTSv2']]['voices'].keys():
                                 self.params['gpt_cond_latent'], self.params['speaker_embedding'] = self.xtts_speakers[default_engine_settings[TTS_ENGINES['XTTSv2']]['voices'][self.speaker]].values()
                             else:
-                                self.params['gpt_cond_latent'], self.params['speaker_embedding'] = self.engine.get_conditioning_latents(audio_path=[self.params['voice_path']], librosa_trim_db=30, load_sr=24000, sound_norm_refs=True)  
+                                self.params['gpt_cond_latent'], self.params['speaker_embedding'] = self.engine.get_conditioning_latents(audio_path=[self.params['voice_path']], librosa_trim_db=30, load_sr=24000, sound_norm_refs=True)
                             self.params['latent_embedding'][self.params['voice_path']] = self.params['gpt_cond_latent'], self.params['speaker_embedding']
                         fine_tuned_params = {
                             key.removeprefix("xtts_"): cast_type(self.session[key])
@@ -118,49 +120,54 @@ class XTTSv2(TTSUtils, TTSRegistry, name='xtts'):
                             }.items()
                             if self.session.get(key) is not None
                         }
-                        with torch.no_grad():
-                            self.engine.to(device)
-                            if device == devices['CPU']['proc']:
-                                result = self.engine.inference(
-                                    text=part,
-                                    language=self.session['language_iso1'],
-                                    gpt_cond_latent=self.params['gpt_cond_latent'],
-                                    speaker_embedding=self.params['speaker_embedding'],
-                                    **fine_tuned_params
-                                )
-                            else:
-                                with torch.autocast(
-                                    device_type=device,
-                                    dtype=self.amp_dtype
-                                ):
+                        # Process each text subpart to avoid truncation
+                        for subpart in text_subparts:
+                            subpart = subpart.strip()
+                            if not subpart or not any(c.isalnum() for c in subpart):
+                                continue
+                            with torch.no_grad():
+                                self.engine.to(device)
+                                if device == devices['CPU']['proc']:
                                     result = self.engine.inference(
-                                        text=part,
+                                        text=subpart,
                                         language=self.session['language_iso1'],
                                         gpt_cond_latent=self.params['gpt_cond_latent'],
                                         speaker_embedding=self.params['speaker_embedding'],
                                         **fine_tuned_params
                                     )
-                            # Model stays on MPS/CUDA for faster consecutive inference
-                        audio_part = result.get('wav')
-                        if is_audio_data_valid(audio_part):
-                            src_tensor = self._tensor_type(audio_part)
-                            part_tensor = src_tensor.clone().detach().unsqueeze(0).cpu()
-                            if part_tensor is not None and part_tensor.numel() > 0:
-                                if part[-1].isalnum() or part[-1] == '—':
-                                    part_tensor = trim_audio(part_tensor.squeeze(), self.params['samplerate'], 0.001, trim_audio_buffer).unsqueeze(0)
-                                self.audio_segments.append(part_tensor)
-                                if not re.search(r'\w$', part, flags=re.UNICODE) and part[-1] != '—':
-                                    silence_time = int(np.random.uniform(0.3, 0.6) * 100) / 100
-                                    break_tensor = torch.zeros(1, int(self.params['samplerate'] * silence_time))
-                                    self.audio_segments.append(break_tensor.clone())
+                                else:
+                                    with torch.autocast(
+                                        device_type=device,
+                                        dtype=self.amp_dtype
+                                    ):
+                                        result = self.engine.inference(
+                                            text=subpart,
+                                            language=self.session['language_iso1'],
+                                            gpt_cond_latent=self.params['gpt_cond_latent'],
+                                            speaker_embedding=self.params['speaker_embedding'],
+                                            **fine_tuned_params
+                                        )
+                                # Model stays on MPS/CUDA for faster consecutive inference
+                            audio_part = result.get('wav')
+                            if is_audio_data_valid(audio_part):
+                                src_tensor = self._tensor_type(audio_part)
+                                part_tensor = src_tensor.clone().detach().unsqueeze(0).cpu()
+                                if part_tensor is not None and part_tensor.numel() > 0:
+                                    if subpart[-1].isalnum() or subpart[-1] == '—':
+                                        part_tensor = trim_audio(part_tensor.squeeze(), self.params['samplerate'], 0.001, trim_audio_buffer).unsqueeze(0)
+                                    self.audio_segments.append(part_tensor)
+                                    if not re.search(r'\w$', subpart, flags=re.UNICODE) and subpart[-1] != '—':
+                                        silence_time = int(np.random.uniform(0.3, 0.6) * 100) / 100
+                                        break_tensor = torch.zeros(1, int(self.params['samplerate'] * silence_time))
+                                        self.audio_segments.append(break_tensor.clone())
+                                else:
+                                    error = f"part_tensor not valid"
+                                    print(error)
+                                    return False
                             else:
-                                error = f"part_tensor not valid"
+                                error = f"audio_part not valid"
                                 print(error)
                                 return False
-                        else:
-                            error = f"audio_part not valid"
-                            print(error)
-                            return False
                 if self.audio_segments:
                     segment_tensor = torch.cat(self.audio_segments, dim=-1)
                     torchaudio.save(final_sentence_file, segment_tensor, self.params['samplerate'], format=default_audio_proc_format)

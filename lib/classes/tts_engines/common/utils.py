@@ -442,6 +442,54 @@ class TTSUtils:
                 parts.append(tail)
         return parts
 
+    def _split_long_text(self, text:str, max_length:int=250)->list[str]:
+        """Split text longer than max_length at natural break points.
+
+        Splits at punctuation marks (comma, semicolon, colon, dashes) or
+        at word boundaries if no punctuation is found within the limit.
+        """
+        if len(text) <= max_length:
+            return [text]
+
+        result = []
+        remaining = text
+
+        # Punctuation marks to split at, in order of preference
+        split_chars = [',', ';', ':', '—', '–', ' - ']
+
+        while len(remaining) > max_length:
+            # Find the best split point within max_length
+            split_pos = -1
+
+            # Try each punctuation mark
+            for char in split_chars:
+                # Look for the last occurrence of this char within max_length
+                pos = remaining.rfind(char, 0, max_length)
+                if pos > split_pos and pos > max_length // 4:  # Don't split too early
+                    split_pos = pos + len(char)  # Include the punctuation
+                    break
+
+            # If no punctuation found, split at the last space
+            if split_pos == -1:
+                pos = remaining.rfind(' ', 0, max_length)
+                if pos > max_length // 4:  # Don't split too early
+                    split_pos = pos + 1  # Include the space
+                else:
+                    # Fallback: hard split at max_length (shouldn't happen often)
+                    split_pos = max_length
+
+            # Add the chunk and continue with remaining
+            chunk = remaining[:split_pos].strip()
+            if chunk:
+                result.append(chunk)
+            remaining = remaining[split_pos:].strip()
+
+        # Add the final piece
+        if remaining:
+            result.append(remaining)
+
+        return result
+
     def _convert_sml(self, sml:str)->tuple[bool, str]:
         import torch
         import numpy as np
