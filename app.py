@@ -15,7 +15,7 @@ warnings.filterwarnings('ignore', category=SyntaxWarning)
 warnings.filterwarnings('ignore', category=UserWarning, module='jieba._compat')
 
 def init_multiprocessing():
-    if sys.platform == systems['WIN32']:
+    if sys.platform == systems['WINDOWS']:
         try:
             multiprocessing.set_start_method('spawn')
         except RuntimeError:
