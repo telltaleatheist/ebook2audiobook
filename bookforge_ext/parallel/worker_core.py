@@ -302,6 +302,7 @@ def run_worker_tts(
 
         # Process sentences
         total_to_process = sentence_end - sentence_start + 1
+        total_sentences = state['total_sentences']
         processed = 0
         skipped = 0
         start_time = time.time()
@@ -321,9 +322,9 @@ def run_worker_tts(
                 processed += 1
                 continue
 
-            # Show progress
+            # Show progress (global sentence position)
             progress_pct = (processed / total_to_process) * 100
-            print(f"Converting sentence {i} - {progress_pct:.2f}%: {processed}/{total_to_process}")
+            print(f"Converting sentence {i}/{total_sentences} ({progress_pct:.1f}%)")
 
             # Convert sentence to audio
             success = tts_manager.convert_sentence2audio(i, sentence)
