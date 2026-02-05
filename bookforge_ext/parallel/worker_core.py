@@ -323,7 +323,7 @@ def run_worker_tts(
 
             # Show progress
             progress_pct = (processed / total_to_process) * 100
-            print(f"**Recovering missing file sentence {i}** - Converting {progress_pct:.2f}%: : {processed}/{total_to_process}")
+            print(f"Converting sentence {i} - {progress_pct:.2f}%: {processed}/{total_to_process}")
 
             # Convert sentence to audio
             success = tts_manager.convert_sentence2audio(i, sentence)
