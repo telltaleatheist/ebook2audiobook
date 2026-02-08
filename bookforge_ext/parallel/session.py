@@ -16,6 +16,7 @@ import os
 import shutil
 import uuid
 from datetime import datetime
+from pathlib import Path
 
 from lib.conf import (
     tmp_dir,
@@ -367,8 +368,10 @@ def prep_ebook_info(args: dict, core_module) -> dict | None:
         session['fine_tuned'] = args.get('fine_tuned', default_fine_tuned)
         session['voice'] = args.get('voice')
         session['output_format'] = args.get('output_format', default_output_format)
+        # Must set BEFORE get_chapters() - controls whether breaks between words are preserved
+        session['sentence_per_paragraph'] = bool(args.get('sentence_per_paragraph', False))
 
-        print(f"[PREP] fine_tuned={session['fine_tuned']}, voice={session['voice']}, tts_engine={session['tts_engine']}")
+        print(f"[PREP] fine_tuned={session['fine_tuned']}, voice={session['voice']}, tts_engine={session['tts_engine']}, sentence_per_paragraph={session['sentence_per_paragraph']}")
 
         # Setup directories using ebook- prefix for parallel sessions
         session['session_dir'] = os.path.join(tmp_dir, f"ebook-{session_id}")
@@ -936,36 +939,89 @@ def assemble_audiobook(args: dict, core_module) -> dict:
         # Store selected chapters for combine_audio_chapters
         session['selected_chapters'] = selected_chapters
 
-        # Combine sentences into chapters (only for selected chapters)
-        sentence_offset = 0
-        for i, chapter in enumerate(session['chapters']):
-            chapter_num = i + 1
+        # Check for bilingual mode
+        if args.get('bilingual'):
+            # Bilingual assembly: pair source/target sentences with pauses
+            from .bilingual import combine_bilingual_audio, build_bilingual_vtt
 
-            # Skip chapters not in selection
-            if chapter_num not in selected_chapters:
+            pause_duration = args.get('bilingual_pause', 0.3)
+            gap_duration = args.get('bilingual_gap', 1.0)
+
+            print(f"[ASSEMBLE] Bilingual mode: pause={pause_duration}s, gap={gap_duration}s")
+
+            # Count total sentences
+            all_sentences = []
+            for chapter in session['chapters']:
+                all_sentences.extend(chapter)
+            num_sentences = len(all_sentences)
+
+            print(f"[ASSEMBLE] Total sentences: {num_sentences}")
+
+            # Combine all sentences as bilingual pairs
+            chapter_file = os.path.join(session['chapters_dir'], f'1.{default_audio_proc_format}')
+            if not combine_bilingual_audio(
+                sentences_dir=session['sentences_dir'],
+                output_file=chapter_file,
+                num_sentences=num_sentences,
+                pause_duration=pause_duration,
+                gap_duration=gap_duration,
+                audio_format=default_audio_proc_format
+            ):
+                return {'success': False, 'error': 'Bilingual audio combination failed'}
+
+            # Build bilingual VTT
+            print("[ASSEMBLE] Creating bilingual VTT subtitle file...")
+            vtt_path = os.path.join(session['process_dir'], Path(session['final_name']).stem + '.vtt')
+            if not build_bilingual_vtt(
+                sentences_dir=session['sentences_dir'],
+                sentence_texts=all_sentences,
+                output_path=vtt_path,
+                pause_duration=pause_duration,
+                gap_duration=gap_duration,
+                audio_format=default_audio_proc_format
+            ):
+                print("[ASSEMBLE] Warning: Bilingual VTT creation failed (continuing without subtitles)")
+
+            # Update session to have single chapter for combine_audio_chapters
+            session['chapters'] = [all_sentences]
+            session['selected_chapters'] = [1]
+
+            # Combine (single chapter) into final audiobook
+            print("[ASSEMBLE] Combining into final audiobook...")
+            exported_files = combine_audio_chapters(session_id)
+
+        else:
+            # Normal (non-bilingual) assembly
+            # Combine sentences into chapters (only for selected chapters)
+            sentence_offset = 0
+            for i, chapter in enumerate(session['chapters']):
+                chapter_num = i + 1
+
+                # Skip chapters not in selection
+                if chapter_num not in selected_chapters:
+                    sentence_offset += len(chapter)
+                    continue
+
+                chapter_filename = f'{chapter_num}.{default_audio_proc_format}'
+                start_sentence = sentence_offset
+                end_sentence = sentence_offset + len(chapter) - 1
+
+                print(f"[ASSEMBLE] Chapter {chapter_num}: sentences {start_sentence}-{end_sentence}")
+
+                if not combine_audio_sentences(session_id, chapter_filename, start_sentence, end_sentence):
+                    return {'success': False, 'error': f'Failed to combine sentences for chapter {chapter_num}'}
+
                 sentence_offset += len(chapter)
-                continue
 
-            chapter_filename = f'{chapter_num}.{default_audio_proc_format}'
-            start_sentence = sentence_offset
-            end_sentence = sentence_offset + len(chapter) - 1
+            # Build VTT subtitle file (only for selected chapters)
+            print("[ASSEMBLE] Creating VTT subtitle file...")
+            selected_chapter_data = [session['chapters'][i-1] for i in selected_chapters]
+            if not build_vtt_file(session_id, selected_chapter_data, core_module):
+                print("[ASSEMBLE] Warning: VTT file creation failed (continuing without subtitles)")
 
-            print(f"[ASSEMBLE] Chapter {chapter_num}: sentences {start_sentence}-{end_sentence}")
-
-            if not combine_audio_sentences(session_id, chapter_filename, start_sentence, end_sentence):
-                return {'success': False, 'error': f'Failed to combine sentences for chapter {chapter_num}'}
-
-            sentence_offset += len(chapter)
-
-        # Build VTT subtitle file (only for selected chapters)
-        print("[ASSEMBLE] Creating VTT subtitle file...")
-        selected_chapter_data = [session['chapters'][i-1] for i in selected_chapters]
-        if not build_vtt_file(session_id, selected_chapter_data, core_module):
-            print("[ASSEMBLE] Warning: VTT file creation failed (continuing without subtitles)")
-
-        # Combine chapters into final audiobook
-        print("[ASSEMBLE] Combining chapters into final audiobook...")
-        exported_files = combine_audio_chapters(session_id)
+            # Combine chapters into final audiobook
+            print("[ASSEMBLE] Combining chapters into final audiobook...")
+            exported_files = combine_audio_chapters(session_id)
 
         if exported_files and len(exported_files) > 0:
             return {

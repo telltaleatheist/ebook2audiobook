@@ -62,6 +62,8 @@ def main():
                        help='Voice file override (default: from session state)')
     parser.add_argument('--output_format', type=str, default=None,
                        help='Output format override (default: from session state)')
+    parser.add_argument('--speed', type=float, default=None,
+                       help='TTS speed override for XTTS (default: from session state)')
 
     args = parser.parse_args()
 
@@ -91,6 +93,7 @@ def main():
         'fine_tuned': args.fine_tuned,
         'voice': args.voice,
         'output_format': args.output_format,
+        'speed': args.speed,
     }
 
     # Run TTS conversion

@@ -995,10 +995,26 @@ def filter_chapter(idx:int, doc:EpubHtml, session_id:str, stanza_nlp:Pipeline, i
                     show_alert({"type": "warning", "msg": text})
                 return None
             # remove any [break] between words or cutting words
+            # Skip break removal in sentence_per_paragraph mode - we need those breaks!
             break_token = re.escape(sml_token('break'))
             strip_break_spaces_re = re.compile(rf'\s*{break_token}\s*')
-            break_between_alnum_re = re.compile(rf'(?<=[\w]){break_token}(?=[\w])', flags=re.UNICODE)
             text = strip_break_spaces_re.sub(sml_token('break'), text)
+
+            # In sentence_per_paragraph mode, split on breaks NOW before escape_sml replaces them
+            # Each paragraph becomes one sentence, preserving the original structure
+            if session.get('sentence_per_paragraph', False):
+                msg = 'Sentence-per-paragraph mode: preserving paragraph boundaries…'
+                print(msg)
+                paragraphs = text.split(sml_token('break'))
+                sentences = [p.strip() for p in paragraphs if p.strip()]
+                if len(sentences) == 0:
+                    error = 'No sentences found!'
+                    print(error)
+                    return None
+                print(f'[sentence_per_paragraph] Extracted {len(sentences)} paragraphs as sentences')
+                return sentences
+
+            break_between_alnum_re = re.compile(rf'(?<=[\w]){break_token}(?=[\w])', flags=re.UNICODE)
             text = break_between_alnum_re.sub(' ', text)
             # escape all SML tags to not be touched by any text treatment
             text, sml_blocks = escape_sml(text)
@@ -1069,6 +1085,7 @@ def filter_chapter(idx:int, doc:EpubHtml, session_id:str, stanza_nlp:Pipeline, i
             msg = 'Normalize text…'
             print(msg)
             text = normalize_text(text, lang, lang_iso1, tts_engine)
+
             msg = f'Get sentences…'
             print(msg)
             sentences = get_sentences(text, session_id)
@@ -2600,6 +2617,7 @@ def convert_ebook(args:dict)->tuple:
                 session['xtts_top_p'] = float(args['xtts_top_p'])
                 session['xtts_speed'] = float(args['xtts_speed'])
                 session['xtts_enable_text_splitting'] = bool(args['xtts_enable_text_splitting'])
+                session['sentence_per_paragraph'] = bool(args.get('sentence_per_paragraph', False))
                 session['bark_text_temp'] =  float(args['bark_text_temp'])
                 session['bark_waveform_temp'] =  float(args['bark_waveform_temp'])
                 session['audiobooks_dir'] = str(args['audiobooks_dir']) if args['audiobooks_dir'] else None

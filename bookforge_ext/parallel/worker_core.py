@@ -190,7 +190,7 @@ def create_worker_session(state: dict, args: dict) -> dict:
         'xtts_repetition_penalty': state.get('xtts_repetition_penalty') or default_engine_settings[TTS_ENGINES['XTTSv2']]['repetition_penalty'],
         'xtts_top_k': state.get('xtts_top_k') or default_engine_settings[TTS_ENGINES['XTTSv2']]['top_k'],
         'xtts_top_p': state.get('xtts_top_p') or default_engine_settings[TTS_ENGINES['XTTSv2']]['top_p'],
-        'xtts_speed': state.get('xtts_speed') or default_engine_settings[TTS_ENGINES['XTTSv2']]['speed'],
+        'xtts_speed': args.get('speed') or state.get('xtts_speed') or default_engine_settings[TTS_ENGINES['XTTSv2']]['speed'],
         'xtts_enable_text_splitting': state.get('xtts_enable_text_splitting') or default_engine_settings[TTS_ENGINES['XTTSv2']]['enable_text_splitting'],
     }
 

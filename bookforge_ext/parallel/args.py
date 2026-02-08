@@ -9,7 +9,9 @@ These are added to the main argparse parser when BookForge extension is loaded.
 PARALLEL_OPTIONS = [
     '--prep_only', '--worker_mode', '--assemble_only',
     '--sentence_start', '--sentence_end', '--chapter_start', '--chapter_end',
-    '--resume_session', '--list_sessions', '--no_split', '--chapters', '--skip_deps'
+    '--resume_session', '--list_sessions', '--no_split', '--chapters', '--skip_deps',
+    '--bilingual', '--bilingual_pause', '--bilingual_gap', '--skip_assembly',
+    '--sentence_per_paragraph', '--skip_headings'
 ]
 
 
@@ -87,4 +89,43 @@ def add_arguments(parser):
     parallel_group.add_argument(
         '--skip_deps', action='store_true',
         help='Skip dependency/device package checks. Use when deps are already installed.'
+    )
+
+    # Bilingual audiobook options
+    parallel_group.add_argument(
+        '--bilingual', action='store_true',
+        help='(assemble_only) Bilingual mode: pairs alternating source/target sentences '
+             'with pauses between them. Sentence 0 is source, 1 is target, 2 is source, etc.'
+    )
+
+    parallel_group.add_argument(
+        '--bilingual_pause', type=float, default=0.3,
+        help='(bilingual) Pause duration in seconds between source and target sentence. '
+             'Default: 0.3'
+    )
+
+    parallel_group.add_argument(
+        '--bilingual_gap', type=float, default=1.0,
+        help='(bilingual) Gap duration in seconds between sentence pairs. '
+             'Default: 1.0'
+    )
+
+    parallel_group.add_argument(
+        '--skip_assembly', action='store_true',
+        help='Skip the assembly phase - only generate sentence audio files. '
+             'Returns the sentences directory path for external assembly. '
+             'Used for dual-voice bilingual workflows where assembly happens later.'
+    )
+
+    parallel_group.add_argument(
+        '--sentence_per_paragraph', action='store_true',
+        help='Treat each HTML paragraph (<p> tag) as a single sentence. '
+             'Disables automatic sentence splitting. Use for pre-segmented EPUBs '
+             'where paragraph boundaries should be preserved exactly.'
+    )
+
+    parallel_group.add_argument(
+        '--skip_headings', action='store_true',
+        help='Skip reading heading tags (h1-h4) as audio. Use for bilingual EPUBs '
+             'where chapter/section headings should not be narrated.'
     )
