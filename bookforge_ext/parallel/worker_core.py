@@ -21,7 +21,16 @@ import sys
 import time
 from datetime import datetime
 
+import psutil
 import torch
+
+
+def log_memory(label: str):
+    """Log current memory usage for debugging."""
+    process = psutil.Process(os.getpid())
+    mem_info = process.memory_info()
+    rss_gb = mem_info.rss / (1024 ** 3)
+    print(f"[MEMORY] {label}: {rss_gb:.2f} GB")
 
 from lib.conf import (
     tmp_dir,
@@ -35,6 +44,16 @@ from lib.conf_lang import default_language_code
 # Import TTS Manager and VRAM detector (lightweight)
 from lib.classes.tts_manager import TTSManager
 from lib.classes.vram_detector import VRAMDetector
+
+# Fix device detection: DeviceInstaller doesn't run in workers, so devices['MPS']['found']
+# stays False and xtts.py falls back to CPU even when user selects MPS.
+# Set the flag here so user's device choice is respected.
+if torch.backends.mps.is_available():
+    devices['MPS']['found'] = True
+if torch.cuda.is_available():
+    devices['CUDA']['found'] = True
+
+log_memory("After imports")
 
 
 def register_tts_engine(engine_name: str) -> None:
@@ -294,11 +313,20 @@ def run_worker_tts(
         print(f"[WORKER] Processing sentences {sentence_start}-{sentence_end} on {session['device'].upper()}")
         print(f"[WORKER] TTS engine: {session['tts_engine']}, fine_tuned: {session['fine_tuned']}")
 
+        # DEBUG: Dump full session dict for memory debugging
+        print(f"[WORKER DEBUG] Full session dict:")
+        for k, v in sorted(session.items()):
+            if k not in ('chapter_sentences',):  # Skip large data
+                print(f"  {k}: {v}")
+
         # Dynamically register only the needed TTS engine (saves ~20GB memory)
         register_tts_engine(session['tts_engine'])
+        log_memory("After register_tts_engine")
 
         # Initialize TTS engine
+        log_memory("Before TTSManager init")
         tts_manager = TTSManager(session)
+        log_memory("After TTSManager init (model loaded)")
 
         # Process sentences
         total_to_process = sentence_end - sentence_start + 1
@@ -334,11 +362,16 @@ def run_worker_tts(
 
             processed += 1
 
+            # Log memory after first sentence
+            if processed == 1:
+                log_memory("After first sentence TTS")
+
             # Periodic memory cleanup (every 10 sentences for MPS memory pressure)
             memory_cleanup(processed, interval=10)
 
         elapsed = time.time() - start_time
         actual_converted = processed - skipped
+        log_memory("After all sentences processed")
 
         print(f"[WORKER] Completed: {actual_converted} converted, {skipped} skipped in {elapsed:.1f}s")
 

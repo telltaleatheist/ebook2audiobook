@@ -194,13 +194,20 @@ class TTSUtils:
 
     def _load_checkpoint(self,**kwargs:Any)->Any:
         try:
+            import psutil
+            def _log_mem(label):
+                rss = psutil.Process(os.getpid()).memory_info().rss / (1024**3)
+                print(f"[CHECKPOINT-MEM] {label}: {rss:.2f} GB")
+
             with _lock:
                 key = kwargs.get('key')
                 engine = loaded_tts.get(key, False)
                 if not engine:
+                    _log_mem(f"Start loading {key}")
                     engine_name = kwargs.get('tts_engine', None)
                     from TTS.tts.configs.xtts_config import XttsConfig
                     from TTS.tts.models.xtts import Xtts
+                    _log_mem("After TTS imports")
                     checkpoint_path = kwargs.get('checkpoint_path')
                     config_path = kwargs.get('config_path',None)
                     vocab_path = kwargs.get('vocab_path',None)
@@ -215,13 +222,16 @@ class TTSUtils:
                     config = XttsConfig()
                     config.models_dir = os.path.join('models','tts')
                     config.load_json(config_path)
+                    _log_mem("After config load")
                     engine = Xtts.init_from_config(config)
+                    _log_mem("After init_from_config")
                     engine.load_checkpoint(
                         config,
                         checkpoint_path = checkpoint_path,
                         vocab_path = vocab_path,
                         eval = True
-                    ) 
+                    )
+                    _log_mem("After load_checkpoint")
                 if engine:
                     vram_dict = VRAMDetector().detect_vram(self.session['device'], self.session['script_mode'])
                     self.session['free_vram_gb'] = vram_dict.get('free_vram_gb', 0)
@@ -259,17 +269,33 @@ class TTSUtils:
             voice_parts = Path(voice_path).parts
             if (self.session['language'] in voice_parts or speaker in default_engine_settings[TTS_ENGINES['BARK']]['voices'] or self.session['language'] == 'eng'):
                 return voice_path
+
+            # Check if converted voice file already exists (e.g., pre-generated during prep)
+            # CON is a reserved name on windows
+            lang_dir = 'con-' if self.session['language'] == 'con' else self.session['language']
+            existing_voice_path = re.sub(r'([\\/])eng([\\/])', rf'\1{lang_dir}\2', voice_path)
+            if os.path.exists(existing_voice_path):
+                print(f"[VOICE-CONV] Using pre-existing voice: {existing_voice_path}")
+                return existing_voice_path
+
             xtts = TTS_ENGINES['XTTSv2']
             if self.session['language'] in default_engine_settings[xtts].get('languages', {}):
                 default_text_file = os.path.join(voices_dir, self.session['language'], 'default.txt')
                 if os.path.exists(default_text_file):
+                    import psutil
+                    def _voiceconv_mem(label):
+                        rss = psutil.Process(os.getpid()).memory_info().rss / (1024**3)
+                        print(f"[VOICE-CONV-MEM] {label}: {rss:.2f} GB")
+
                     msg = f"Converting builtin eng voice to {self.session['language']}..."
                     print(msg)
+                    _voiceconv_mem("Start voice conversion")
                     key = f'{xtts}-internal'
                     default_text = Path(default_text_file).read_text(encoding='utf-8')
                     self._cleanup_memory()
                     engine = loaded_tts.get(key, False)
                     if not engine:
+                        _voiceconv_mem("Before loading internal model")
                         vram_dict = VRAMDetector().detect_vram(self.session['device'], self.session['script_mode'])
                         self.session['free_vram_gb'] = vram_dict.get('free_vram_gb', 0)
                         models_loaded_size_gb = self._loaded_tts_size_gb(loaded_tts)
@@ -281,6 +307,7 @@ class TTSUtils:
                         checkpoint_path = hf_hub_download(repo_id=hf_repo, filename=f"{hf_sub}{default_engine_settings[xtts]['files'][1]}", cache_dir=self.cache_dir)
                         vocab_path = hf_hub_download(repo_id=hf_repo, filename=f"{hf_sub}{default_engine_settings[xtts]['files'][2]}", cache_dir=self.cache_dir)
                         engine = self._load_checkpoint(tts_engine=xtts, key=key, checkpoint_path=checkpoint_path, config_path=config_path, vocab_path=vocab_path)
+                        _voiceconv_mem("After loading internal model")
                     if engine:
                         device = devices['CUDA']['proc'] if self.session['device'] in ['cuda', 'jetson'] else self.session['device']
                         if speaker in default_engine_settings[xtts]['voices'].keys():
@@ -341,7 +368,15 @@ class TTSUtils:
                                 if normalize_audio(proc_voice_path, new_voice_path, default_audio_proc_samplerate, self.session['is_gui_process']):
                                     del audio_sentence, sourceTensor, audio_tensor
                                     Path(proc_voice_path).unlink(missing_ok=True)
+                                    # Cleanup the internal voice conversion model to free ~3GB memory
+                                    if key in loaded_tts:
+                                        del loaded_tts[key]
                                     gc.collect()
+                                    if torch.backends.mps.is_available():
+                                        torch.mps.empty_cache()
+                                    elif torch.cuda.is_available():
+                                        torch.cuda.empty_cache()
+                                    print(f"[VOICE-CONV] Cleaned up internal model, freed memory")
                                     self.engine = loaded_tts.get(self.tts_key, False)
                                     if not self.engine:
                                         self._load_engine()
@@ -354,6 +389,14 @@ class TTSUtils:
                         error = f'_check_xtts_builtin_speakers() error: {xtts} is False'
                 else:
                     error = f'The translated {default_text_file} could not be found! Voice cloning file will stay in English.'
+                # Cleanup internal model on any error path
+                if key in loaded_tts:
+                    del loaded_tts[key]
+                    gc.collect()
+                    if torch.backends.mps.is_available():
+                        torch.mps.empty_cache()
+                    elif torch.cuda.is_available():
+                        torch.cuda.empty_cache()
                 print(error)
             else:
                 return voice_path
@@ -363,6 +406,15 @@ class TTSUtils:
                 Path(new_voice_path).unlink(missing_ok=True)
             if proc_voice_path:
                 Path(proc_voice_path).unlink(missing_ok=True)
+            # Cleanup internal model on exception
+            internal_key = f'{TTS_ENGINES["XTTSv2"]}-internal'
+            if internal_key in loaded_tts:
+                del loaded_tts[internal_key]
+                gc.collect()
+                if torch.backends.mps.is_available():
+                    torch.mps.empty_cache()
+                elif torch.cuda.is_available():
+                    torch.cuda.empty_cache()
             print(error)
             return False
         

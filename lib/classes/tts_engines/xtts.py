@@ -121,12 +121,20 @@ class XTTSv2(TTSUtils, TTSRegistry, name='xtts'):
                             if self.session.get(key) is not None
                         }
                         # Process each text subpart to avoid truncation
-                        for subpart in text_subparts:
+                        for subpart_idx, subpart in enumerate(text_subparts):
                             subpart = subpart.strip()
                             if not subpart or not any(c.isalnum() for c in subpart):
                                 continue
                             with torch.no_grad():
+                                # Log memory before first to(device) call
+                                if subpart_idx == 0 and sentence_index == 0:
+                                    import psutil
+                                    rss = psutil.Process(os.getpid()).memory_info().rss / (1024**3)
+                                    print(f"[XTTS-MEM] Before to({device}): {rss:.2f} GB")
                                 self.engine.to(device)
+                                if subpart_idx == 0 and sentence_index == 0:
+                                    rss = psutil.Process(os.getpid()).memory_info().rss / (1024**3)
+                                    print(f"[XTTS-MEM] After to({device}): {rss:.2f} GB")
                                 if device == devices['CPU']['proc']:
                                     result = self.engine.inference(
                                         text=subpart,
@@ -148,6 +156,10 @@ class XTTSv2(TTSUtils, TTSRegistry, name='xtts'):
                                             **fine_tuned_params
                                         )
                                 # Model stays on MPS/CUDA for faster consecutive inference
+                                if subpart_idx == 0 and sentence_index == 0:
+                                    import psutil
+                                    rss = psutil.Process(os.getpid()).memory_info().rss / (1024**3)
+                                    print(f"[XTTS-MEM] After first inference: {rss:.2f} GB")
                             audio_part = result.get('wav')
                             if is_audio_data_valid(audio_part):
                                 src_tensor = self._tensor_type(audio_part)

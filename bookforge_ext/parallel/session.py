@@ -368,6 +368,40 @@ def prep_ebook_info(args: dict, core_module) -> dict | None:
         session['fine_tuned'] = args.get('fine_tuned', default_fine_tuned)
         session['voice'] = args.get('voice')
         session['output_format'] = args.get('output_format', default_output_format)
+
+        # XTTS settings - save to session-state.json so workers use them instead of defaults
+        # CLI args use short names (temperature, top_p, etc.) but session uses xtts_ prefix
+        xtts_settings_saved = []
+        if args.get('temperature') is not None:
+            session['xtts_temperature'] = float(args['temperature'])
+            xtts_settings_saved.append(f"temperature={args['temperature']}")
+        if args.get('length_penalty') is not None:
+            session['xtts_length_penalty'] = float(args['length_penalty'])
+            xtts_settings_saved.append(f"length_penalty={args['length_penalty']}")
+        if args.get('num_beams') is not None:
+            session['xtts_num_beams'] = int(args['num_beams'])
+            xtts_settings_saved.append(f"num_beams={args['num_beams']}")
+        if args.get('repetition_penalty') is not None:
+            session['xtts_repetition_penalty'] = float(args['repetition_penalty'])
+            xtts_settings_saved.append(f"repetition_penalty={args['repetition_penalty']}")
+        if args.get('top_k') is not None:
+            session['xtts_top_k'] = int(args['top_k'])
+            xtts_settings_saved.append(f"top_k={args['top_k']}")
+        if args.get('top_p') is not None:
+            session['xtts_top_p'] = float(args['top_p'])
+            xtts_settings_saved.append(f"top_p={args['top_p']}")
+        if args.get('speed') is not None:
+            session['xtts_speed'] = float(args['speed'])
+            xtts_settings_saved.append(f"speed={args['speed']}")
+        if args.get('enable_text_splitting'):
+            session['xtts_enable_text_splitting'] = True
+            xtts_settings_saved.append("enable_text_splitting=True")
+
+        if xtts_settings_saved:
+            print(f"[PREP] XTTS settings saved to session: {', '.join(xtts_settings_saved)}")
+        else:
+            print("[PREP] WARNING: No XTTS settings found in args - workers will use defaults")
+
         # Must set BEFORE get_chapters() - controls whether breaks between words are preserved
         session['sentence_per_paragraph'] = bool(args.get('sentence_per_paragraph', False))
 

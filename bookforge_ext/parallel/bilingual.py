@@ -208,11 +208,10 @@ def combine_dual_voice_audio(
     Structure: [Source₀] → [pause] → [Target₀] → [gap] → [Source₁] → ...
 
     This version uses TWO directories for proper accent separation:
-    - source_sentences_dir/1.flac, 2.flac, 3.flac... (source language, skips 0.flac)
-    - target_sentences_dir/1.flac, 2.flac, 3.flac... (target language, skips 0.flac)
+    - source_sentences_dir/0.flac, 1.flac, 2.flac... (source language)
+    - target_sentences_dir/0.flac, 1.flac, 2.flac... (target language)
 
-    NOTE: Skips audio file 0.flac because bilingual EPUBs prepend "bookforge" as sentence 0,
-    which e2a uses as the chapter title. The actual content starts at sentence 1.
+    Audio files are numbered to match sentence_pairs directly (no offset).
 
     Args:
         source_sentences_dir: Directory with source language sentences (1.flac, 2.flac, ...)
@@ -231,7 +230,6 @@ def combine_dual_voice_audio(
     print(f"[BILINGUAL-DUAL] Source: {source_sentences_dir}")
     print(f"[BILINGUAL-DUAL] Target: {target_sentences_dir}")
     print(f"[BILINGUAL-DUAL] pause={pause_duration}s, gap={gap_duration}s")
-    print(f"[BILINGUAL-DUAL] Skipping audio file 0 (bookforge chapter marker)")
 
     if num_pairs < 1:
         print("[BILINGUAL-DUAL] Error: Need at least 1 pair")
@@ -253,8 +251,8 @@ def combine_dual_voice_audio(
 
         with open(concat_list_path, 'w', encoding='utf-8') as f:
             for pair_idx in range(num_pairs):
-                # Skip audio file 0 (bookforge chapter marker) - actual content starts at file 1
-                audio_idx = pair_idx + 1
+                # Audio files are numbered to match sentence_pairs directly (no offset)
+                audio_idx = pair_idx
                 source_file = os.path.join(source_sentences_dir, f"{audio_idx}.{audio_format}")
                 target_file = os.path.join(target_sentences_dir, f"{audio_idx}.{audio_format}")
 
@@ -429,12 +427,11 @@ def build_dual_voice_vtt(
     """
     Build a VTT subtitle file for dual-voice bilingual audio.
 
-    NOTE: Skips audio file 0.flac because bilingual EPUBs prepend "bookforge" as sentence 0,
-    which e2a uses as the chapter title. The actual content starts at audio file 1.
+    Audio files are numbered to match sentence_pairs directly (no offset).
 
     Args:
-        source_sentences_dir: Directory with source language sentences (1.flac, 2.flac, ...)
-        target_sentences_dir: Directory with target language sentences (1.flac, 2.flac, ...)
+        source_sentences_dir: Directory with source language sentences (0.flac, 1.flac, ...)
+        target_sentences_dir: Directory with target language sentences (0.flac, 1.flac, ...)
         sentence_pairs: List of dicts with 'source' and 'target' text keys
         output_path: Path for the output VTT file
         pause_duration: Pause duration between source and target
@@ -446,7 +443,6 @@ def build_dual_voice_vtt(
     """
     num_pairs = len(sentence_pairs)
     print(f"[BILINGUAL-VTT-DUAL] Building VTT with {num_pairs} pairs")
-    print(f"[BILINGUAL-VTT-DUAL] Skipping audio file 0 (bookforge chapter marker)")
 
     if num_pairs < 1:
         print("[BILINGUAL-VTT-DUAL] Error: Need at least 1 pair")
@@ -465,8 +461,8 @@ def build_dual_voice_vtt(
     target_durations = []
 
     for i in range(num_pairs):
-        # Skip audio file 0 (bookforge chapter marker) - actual content starts at file 1
-        audio_idx = i + 1
+        # Audio files are numbered to match sentence_pairs directly (no offset)
+        audio_idx = i
         source_file = os.path.join(source_sentences_dir, f"{audio_idx}.{audio_format}")
         target_file = os.path.join(target_sentences_dir, f"{audio_idx}.{audio_format}")
 
@@ -561,6 +557,8 @@ def run_dual_voice_assembly(
         with open(sentence_pairs_path, 'r', encoding='utf-8') as f:
             sentence_pairs = json.load(f)
 
+        # sentence_pairs contains only real content (no bookforge marker)
+        # But audio files have bookforge at index 0, so we still skip audio file 0
         num_pairs = len(sentence_pairs)
         print(f"[BILINGUAL-ASSEMBLY] Loaded {num_pairs} sentence pairs")
 
