@@ -9,4 +9,4 @@ python_env/
 tmp/gradio/
 
 .DS_Store
-*.wixobj
+*.wixobjbookforge_ext/**/__pycache__/
