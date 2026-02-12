@@ -3547,7 +3547,8 @@ def assemble_audiobook(args: dict) -> dict:
             return {'success': False, 'error': 'No session ID provided'}
 
         # Setup session from saved state
-        session_dir = os.path.join(tmp_dir, f"ebook-{session_id}")
+        # Use explicit --session_dir if provided, otherwise default to tmp_dir
+        session_dir = args.get('session_dir') or os.path.join(tmp_dir, f"ebook-{session_id}")
         if not os.path.exists(session_dir):
             return {'success': False, 'error': f"Session directory not found: {session_dir}"}
 
