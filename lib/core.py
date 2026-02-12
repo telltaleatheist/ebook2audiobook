@@ -3564,8 +3564,10 @@ def assemble_audiobook(args: dict) -> dict:
         # Populate from state
         session['session_dir'] = state['session_dir']
         session['process_dir'] = state['process_dir']
-        session['chapters_dir'] = state.get('chapters_dir') or os.path.join(state['process_dir'], 'chapters')
-        session['sentences_dir'] = state.get('chapters_dir_sentences') or os.path.join(state['process_dir'], 'chapters', 'sentences')
+        # Always derive directories from corrected process_dir
+        # (session-state.json may contain stale paths from a different machine or WSL)
+        session['chapters_dir'] = os.path.join(state['process_dir'], 'chapters')
+        session['sentences_dir'] = os.path.join(state['process_dir'], 'chapters', 'sentences')
         session['language'] = state.get('language', default_language_code)
         session['output_format'] = args.get('output_format') or state.get('output_format', default_output_format)
         session['audiobooks_dir'] = args.get('audiobooks_dir') or state.get('audiobooks_dir', audiobooks_cli_dir)
@@ -3593,8 +3595,14 @@ def assemble_audiobook(args: dict) -> dict:
             print('[ASSEMBLE] Loading chapter data from session-state.json')
             session['chapters'] = state['chapter_sentences']
             session['metadata'] = state.get('metadata', {})
-            session['cover'] = state.get('cover')
             session['filename_noext'] = state.get('filename_noext')
+            # Re-derive cover path from corrected process_dir
+            # (session-state.json may contain stale WSL path)
+            raw_cover = state.get('cover')
+            if isinstance(raw_cover, str) and session.get('filename_noext'):
+                session['cover'] = os.path.join(state['process_dir'], session['filename_noext'] + '.jpg')
+            else:
+                session['cover'] = raw_cover
             # Load TOC chapter titles for proper chapter markers
             session['chapter_titles'] = state.get('chapter_titles', [])
             if session['chapter_titles']:
@@ -3774,11 +3782,19 @@ def worker_only(args: dict) -> dict:
         # Populate session from state
         session['session_dir'] = state['session_dir']
         session['process_dir'] = state['process_dir']
-        session['chapters_dir'] = state.get('chapters_dir') or os.path.join(state['process_dir'], 'chapters')
-        session['sentences_dir'] = state.get('chapters_dir_sentences') or os.path.join(state['process_dir'], 'chapters', 'sentences')
+        # Always derive directories from corrected process_dir
+        # (session-state.json may contain stale paths from a different machine or WSL)
+        session['chapters_dir'] = os.path.join(state['process_dir'], 'chapters')
+        session['sentences_dir'] = os.path.join(state['process_dir'], 'chapters', 'sentences')
         session['epub_path'] = state.get('epub_path_internal')
         session['filename_noext'] = state.get('filename_noext')
-        session['cover'] = state.get('cover')
+        # Re-derive cover path from corrected process_dir
+        # (session-state.json may contain stale WSL path)
+        raw_cover = state.get('cover')
+        if isinstance(raw_cover, str) and session.get('filename_noext'):
+            session['cover'] = os.path.join(state['process_dir'], session['filename_noext'] + '.jpg')
+        else:
+            session['cover'] = raw_cover
         session['language'] = state.get('language', default_language_code)
         session['language_iso1'] = state.get('language_iso1', 'en')
         session['tts_engine'] = args.get('tts_engine') or state.get('tts_engine') or get_compatible_tts_engines(session['language'])[0]

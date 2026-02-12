@@ -843,7 +843,8 @@ def assemble_audiobook(args: dict, core_module) -> dict:
             return {'success': False, 'error': 'No session ID provided'}
 
         # Setup session from saved state
-        session_dir = os.path.join(tmp_dir, f"ebook-{session_id}")
+        # Use explicit --session_dir if provided, otherwise fall back to tmp_dir
+        session_dir = args.get('session_dir') or os.path.join(tmp_dir, f"ebook-{session_id}")
         if not os.path.exists(session_dir):
             return {'success': False, 'error': f"Session directory not found: {session_dir}"}
 
@@ -857,10 +858,12 @@ def assemble_audiobook(args: dict, core_module) -> dict:
             session = context.set_session(session_id)
 
         # Populate from state
+        # Always derive directories from the corrected process_dir/session_dir
+        # (session-state.json may contain stale paths from a different machine or WSL)
         session['session_dir'] = state['session_dir']
         session['process_dir'] = state['process_dir']
-        session['chapters_dir'] = state.get('chapters_dir') or os.path.join(state['process_dir'], 'chapters')
-        session['sentences_dir'] = state.get('chapters_dir_sentences') or os.path.join(state['process_dir'], 'chapters', 'sentences')
+        session['chapters_dir'] = os.path.join(state['process_dir'], 'chapters')
+        session['sentences_dir'] = os.path.join(state['process_dir'], 'chapters', 'sentences')
         session['language'] = state.get('language', default_language_code)
         session['output_format'] = args.get('output_format') or state.get('output_format', default_output_format)
         session['audiobooks_dir'] = args.get('audiobooks_dir') or state.get('audiobooks_dir', audiobooks_cli_dir)
@@ -888,8 +891,14 @@ def assemble_audiobook(args: dict, core_module) -> dict:
             print('[ASSEMBLE] Loading chapter data from session-state.json')
             session['chapters'] = state['chapter_sentences']
             session['metadata'] = state.get('metadata', {})
-            session['cover'] = state.get('cover')
             session['filename_noext'] = state.get('filename_noext')
+            # Re-derive cover path from corrected process_dir
+            # (session-state.json may contain stale WSL path)
+            raw_cover = state.get('cover')
+            if isinstance(raw_cover, str) and session.get('filename_noext'):
+                session['cover'] = os.path.join(state['process_dir'], session['filename_noext'] + '.jpg')
+            else:
+                session['cover'] = raw_cover
             # Load TOC chapter titles for proper chapter markers
             session['chapter_titles'] = state.get('chapter_titles', [])
             if session['chapter_titles']:
