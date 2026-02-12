@@ -2212,14 +2212,25 @@ def combine_audio_chapters(session_id:str)->list[str]|None:
                     '-y', ffmpeg_final_file
                 ]
             else:
-                cmd += [
-                    '-filter_threads', '0',
-                    '-filter_complex_threads', '0',
-                    '-af', 'loudnorm=I=-16:LRA=11:TP=-1.5:linear=true,afftdn=nf=-70',
-                    '-threads', '0',
-                    '-progress', 'pipe:2',
-                    '-y', ffmpeg_final_file
-                ]
+                # Check duration - skip heavy filters for long audiobooks (>2 hours)
+                # loudnorm with linear=true requires analyzing entire file in memory
+                audio_duration = get_audio_duration(ffmpeg_combined_audio)
+                if audio_duration and audio_duration > 7200:  # 2 hours in seconds
+                    print(f'Skipping loudnorm filter for long audiobook ({audio_duration/3600:.1f} hours) to avoid memory issues')
+                    cmd += [
+                        '-threads', '0',
+                        '-progress', 'pipe:2',
+                        '-y', ffmpeg_final_file
+                    ]
+                else:
+                    cmd += [
+                        '-filter_threads', '0',
+                        '-filter_complex_threads', '0',
+                        '-af', 'loudnorm=I=-16:LRA=11:TP=-1.5:linear=true,afftdn=nf=-70',
+                        '-threads', '0',
+                        '-progress', 'pipe:2',
+                        '-y', ffmpeg_final_file
+                    ]
             proc_pipe = SubprocessPipe(cmd, is_gui_process=session['is_gui_process'], total_duration=get_audio_duration(ffmpeg_combined_audio), msg='Export')
             if proc_pipe:
                 if os.path.exists(ffmpeg_final_file) and os.path.getsize(ffmpeg_final_file) > 0:
