@@ -11,7 +11,7 @@ PARALLEL_OPTIONS = [
     '--sentence_start', '--sentence_end', '--chapter_start', '--chapter_end',
     '--resume_session', '--list_sessions', '--no_split', '--chapters', '--skip_deps',
     '--bilingual', '--bilingual_pause', '--bilingual_gap', '--skip_assembly',
-    '--sentence_per_paragraph', '--skip_headings'
+    '--sentence_per_paragraph', '--skip_headings', '--session_dir'
 ]
 
 
@@ -128,4 +128,11 @@ def add_arguments(parser):
         '--skip_headings', action='store_true',
         help='Skip reading heading tags (h1-h4) as audio. Use for bilingual EPUBs '
              'where chapter/section headings should not be narrated.'
+    )
+
+    parallel_group.add_argument(
+        '--session_dir', type=str, default=None,
+        help='(assemble_only) Explicit path to session directory. '
+             'Overrides default tmp_dir/ebook-{session} location. '
+             'Used when session has been cached to an external location.'
     )
