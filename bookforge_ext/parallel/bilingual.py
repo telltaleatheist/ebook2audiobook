@@ -251,8 +251,8 @@ def combine_dual_voice_audio(
 
         with open(concat_list_path, 'w', encoding='utf-8') as f:
             for pair_idx in range(num_pairs):
-                # Audio files are numbered to match sentence_pairs directly (no offset)
-                audio_idx = pair_idx
+                # Audio file 0 is the "bookforge." marker — real content starts at index 1
+                audio_idx = pair_idx + 1
                 source_file = os.path.join(source_sentences_dir, f"{audio_idx}.{audio_format}")
                 target_file = os.path.join(target_sentences_dir, f"{audio_idx}.{audio_format}")
 
@@ -427,7 +427,7 @@ def build_dual_voice_vtt(
     """
     Build a VTT subtitle file for dual-voice bilingual audio.
 
-    Audio files are numbered to match sentence_pairs directly (no offset).
+    Audio file 0 is the "bookforge." marker; real content starts at index 1.
 
     Args:
         source_sentences_dir: Directory with source language sentences (0.flac, 1.flac, ...)
@@ -461,8 +461,8 @@ def build_dual_voice_vtt(
     target_durations = []
 
     for i in range(num_pairs):
-        # Audio files are numbered to match sentence_pairs directly (no offset)
-        audio_idx = i
+        # Audio file 0 is the "bookforge." marker — real content starts at index 1
+        audio_idx = i + 1
         source_file = os.path.join(source_sentences_dir, f"{audio_idx}.{audio_format}")
         target_file = os.path.join(target_sentences_dir, f"{audio_idx}.{audio_format}")
 
@@ -558,7 +558,7 @@ def run_dual_voice_assembly(
             sentence_pairs = json.load(f)
 
         # sentence_pairs contains only real content (no bookforge marker)
-        # But audio files have bookforge at index 0, so we still skip audio file 0
+        # Audio file 0 is the "bookforge." marker — combine/VTT skip it via +1 offset
         num_pairs = len(sentence_pairs)
         print(f"[BILINGUAL-ASSEMBLY] Loaded {num_pairs} sentence pairs")
 
