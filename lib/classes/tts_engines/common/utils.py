@@ -379,7 +379,7 @@ class TTSUtils:
                                     print(f"[VOICE-CONV] Cleaned up internal model, freed memory")
                                     self.engine = loaded_tts.get(self.tts_key, False)
                                     if not self.engine:
-                                        self._load_engine()
+                                        self.engine = self.load_engine()
                                     return new_voice_path
                                 else:
                                     error = 'normalize_audio() error:'
