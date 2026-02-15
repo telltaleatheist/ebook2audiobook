@@ -14,6 +14,17 @@ import tempfile
 from pathlib import Path
 
 
+def ffmpeg_concat_escape(filepath: str) -> str:
+    """
+    Escape a file path for use in FFmpeg's concat demuxer single-quoted strings.
+
+    The concat demuxer uses single quotes: file 'path'
+    An apostrophe in the path (e.g., Aesop's_Fables) prematurely closes the quote.
+    Fix: replace ' with '\\'' (end quote, escaped literal quote, start new quote).
+    """
+    return filepath.replace("'", "'\\''")
+
+
 def generate_silence(duration: float, sample_rate: int = 24000, output_path: str = None) -> str:
     """
     Generate a silent audio file of specified duration.
@@ -147,10 +158,11 @@ def combine_bilingual_audio(
                     continue
 
                 # Use forward slashes for ffmpeg compatibility (works on Windows too)
-                source_path = source_file.replace(os.sep, '/')
-                target_path = target_file.replace(os.sep, '/')
-                pause_path = pause_file.replace(os.sep, '/')
-                gap_path = gap_file.replace(os.sep, '/')
+                # Escape apostrophes for FFmpeg concat demuxer single-quoting
+                source_path = ffmpeg_concat_escape(source_file.replace(os.sep, '/'))
+                target_path = ffmpeg_concat_escape(target_file.replace(os.sep, '/'))
+                pause_path = ffmpeg_concat_escape(pause_file.replace(os.sep, '/'))
+                gap_path = ffmpeg_concat_escape(gap_file.replace(os.sep, '/'))
 
                 # Write: source → pause → target → gap (except no gap after last pair)
                 f.write(f"file '{source_path}'\n")
@@ -265,10 +277,11 @@ def combine_dual_voice_audio(
                     continue
 
                 # Use forward slashes for ffmpeg compatibility
-                source_path = source_file.replace(os.sep, '/')
-                target_path = target_file.replace(os.sep, '/')
-                pause_path = pause_file.replace(os.sep, '/')
-                gap_path = gap_file.replace(os.sep, '/')
+                # Escape apostrophes for FFmpeg concat demuxer single-quoting
+                source_path = ffmpeg_concat_escape(source_file.replace(os.sep, '/'))
+                target_path = ffmpeg_concat_escape(target_file.replace(os.sep, '/'))
+                pause_path = ffmpeg_concat_escape(pause_file.replace(os.sep, '/'))
+                gap_path = ffmpeg_concat_escape(gap_file.replace(os.sep, '/'))
 
                 # Write: source → pause → target → gap (except no gap after last pair)
                 f.write(f"file '{source_path}'\n")
@@ -557,10 +570,25 @@ def run_dual_voice_assembly(
         with open(sentence_pairs_path, 'r', encoding='utf-8') as f:
             sentence_pairs = json.load(f)
 
-        # sentence_pairs contains only real content (no bookforge marker)
-        # Audio file 0 is the "bookforge." marker — combine/VTT skip it via +1 offset
+        total_pairs = len(sentence_pairs)
+        print(f"[BILINGUAL-ASSEMBLY] Loaded {total_pairs} sentence pairs from file")
+
+        # Count how many audio files actually exist (handles test mode naturally)
+        actual_pairs = 0
+        for i in range(total_pairs):
+            src = os.path.join(source_sentences_dir, f"{i}.{audio_format}")
+            tgt = os.path.join(target_sentences_dir, f"{i}.{audio_format}")
+            if os.path.exists(src) and os.path.exists(tgt):
+                actual_pairs = i + 1  # Track highest contiguous index
+            else:
+                break  # Audio files are sequential, stop at first gap
+
+        if actual_pairs < total_pairs:
+            print(f"[BILINGUAL-ASSEMBLY] Only {actual_pairs}/{total_pairs} pairs have audio files (test mode?)")
+            sentence_pairs = sentence_pairs[:actual_pairs]
+
         num_pairs = len(sentence_pairs)
-        print(f"[BILINGUAL-ASSEMBLY] Loaded {num_pairs} sentence pairs")
+        print(f"[BILINGUAL-ASSEMBLY] Assembling {num_pairs} pairs")
 
         # Output paths
         os.makedirs(output_dir, exist_ok=True)

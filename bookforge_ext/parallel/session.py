@@ -404,8 +404,10 @@ def prep_ebook_info(args: dict, core_module) -> dict | None:
 
         # Must set BEFORE get_chapters() - controls whether breaks between words are preserved
         session['sentence_per_paragraph'] = bool(args.get('sentence_per_paragraph', False))
+        # Skip heading text in TTS (headings parsed for chapter detection but not spoken)
+        session['skip_headings'] = bool(args.get('skip_headings', False))
 
-        print(f"[PREP] fine_tuned={session['fine_tuned']}, voice={session['voice']}, tts_engine={session['tts_engine']}, sentence_per_paragraph={session['sentence_per_paragraph']}")
+        print(f"[PREP] fine_tuned={session['fine_tuned']}, voice={session['voice']}, tts_engine={session['tts_engine']}, sentence_per_paragraph={session['sentence_per_paragraph']}, skip_headings={session['skip_headings']}")
 
         # Setup directories using ebook- prefix for parallel sessions
         session['session_dir'] = os.path.join(tmp_dir, f"ebook-{session_id}")

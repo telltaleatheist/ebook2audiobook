@@ -194,20 +194,13 @@ class TTSUtils:
 
     def _load_checkpoint(self,**kwargs:Any)->Any:
         try:
-            import psutil
-            def _log_mem(label):
-                rss = psutil.Process(os.getpid()).memory_info().rss / (1024**3)
-                print(f"[CHECKPOINT-MEM] {label}: {rss:.2f} GB")
-
             with _lock:
                 key = kwargs.get('key')
                 engine = loaded_tts.get(key, False)
                 if not engine:
-                    _log_mem(f"Start loading {key}")
                     engine_name = kwargs.get('tts_engine', None)
                     from TTS.tts.configs.xtts_config import XttsConfig
                     from TTS.tts.models.xtts import Xtts
-                    _log_mem("After TTS imports")
                     checkpoint_path = kwargs.get('checkpoint_path')
                     config_path = kwargs.get('config_path',None)
                     vocab_path = kwargs.get('vocab_path',None)
@@ -222,16 +215,13 @@ class TTSUtils:
                     config = XttsConfig()
                     config.models_dir = os.path.join('models','tts')
                     config.load_json(config_path)
-                    _log_mem("After config load")
                     engine = Xtts.init_from_config(config)
-                    _log_mem("After init_from_config")
                     engine.load_checkpoint(
                         config,
                         checkpoint_path = checkpoint_path,
                         vocab_path = vocab_path,
                         eval = True
                     )
-                    _log_mem("After load_checkpoint")
                 if engine:
                     vram_dict = VRAMDetector().detect_vram(self.session['device'], self.session['script_mode'])
                     self.session['free_vram_gb'] = vram_dict.get('free_vram_gb', 0)

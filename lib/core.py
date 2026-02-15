@@ -924,16 +924,34 @@ def filter_chapter(idx:int, doc:EpubHtml, session_id:str, stanza_nlp:Pipeline, i
                 return None
             msg = f'Parsing xhtml markers…'
             print(msg)
+            # Build set of normalized TOC titles for detecting chapter titles
+            # that lost their heading tags (e.g. after AI cleanup converted <h2> to <p>)
+            toc_titles_normalized = set()
+            for t in session.get('chapter_titles', []):
+                ct = re.sub(r'[.!?…]+$', '', t.strip()).lower()
+                if ct:
+                    toc_titles_normalized.add(ct)
+            if toc_titles_normalized:
+                print(f'[HEADING] {len(toc_titles_normalized)} TOC titles loaded for heading detection')
             text_list = []
             handled_tables = set()
             prev_typ = None
+            last_heading_normalized = None  # Track last heading to deduplicate body text
             for typ, payload in tuples_list:
                 if typ == 'heading':
-                    text_list.append(payload.strip())
+                    if not session.get('skip_headings', False):
+                        title = payload.strip()
+                        # Add period to chapter titles so TTS pauses after them
+                        if title and title[-1] not in '.!?…':
+                            title += '.'
+                        text_list.append(title)
+                        last_heading_normalized = re.sub(r'[.!?…]+$', '', title).lower()
                 elif typ in ('break', 'pause'):
                     if prev_typ != typ:
                         text_list.append(sml_token(typ))
+                    # Don't clear last_heading — breaks often sit between heading and duplicate text
                 elif typ == 'table':
+                    last_heading_normalized = None
                     table = payload
                     if table in handled_tables:
                         prev_typ = typ
@@ -957,6 +975,19 @@ def filter_chapter(idx:int, doc:EpubHtml, session_id:str, stanza_nlp:Pipeline, i
                 else:
                     text = payload.strip()
                     if text:
+                        text_check = re.sub(r'[.!?…]+$', '', text).lower()
+                        # Deduplicate: if body text matches the heading we just added, skip it
+                        if last_heading_normalized and text_check == last_heading_normalized:
+                            print(f'[HEADING] Skipping duplicate body text: "{text}"')
+                            last_heading_normalized = None
+                            prev_typ = typ
+                            continue
+                        last_heading_normalized = None
+                        # Check if this text matches a TOC chapter title whose heading tag was lost
+                        if text_check in toc_titles_normalized:
+                            if text[-1] not in '.!?…':
+                                text += '.'
+                            print(f'[HEADING] Detected chapter title from TOC match: "{text}"')
                         text_list.append(text)
                 prev_typ = typ
             msg = f'Flattening as raw text…'
@@ -2629,6 +2660,7 @@ def convert_ebook(args:dict)->tuple:
                 session['xtts_speed'] = float(args['xtts_speed'])
                 session['xtts_enable_text_splitting'] = bool(args['xtts_enable_text_splitting'])
                 session['sentence_per_paragraph'] = bool(args.get('sentence_per_paragraph', False))
+                session['skip_headings'] = bool(args.get('skip_headings', False))
                 session['bark_text_temp'] =  float(args['bark_text_temp'])
                 session['bark_waveform_temp'] =  float(args['bark_waveform_temp'])
                 session['audiobooks_dir'] = str(args['audiobooks_dir']) if args['audiobooks_dir'] else None
