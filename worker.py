@@ -35,6 +35,8 @@ def main():
     # Required arguments
     parser.add_argument('--session', type=str, required=True,
                        help='Session ID from prep phase')
+    parser.add_argument('--session_dir', type=str, default=None,
+                       help='Session directory path (overrides default tmp location)')
 
     # Sentence mode arguments
     parser.add_argument('--sentence_start', type=int, default=None,
@@ -103,7 +105,8 @@ def main():
         sentence_end=args.sentence_end,
         args=worker_args,
         chapter_start=args.chapter_start,
-        chapter_end=args.chapter_end
+        chapter_end=args.chapter_end,
+        session_dir_override=args.session_dir
     )
 
     # Output result as JSON (for parsing by caller)

@@ -236,7 +236,8 @@ def run_worker_tts(
     sentence_end: int,
     args: dict,
     chapter_start: int | None = None,
-    chapter_end: int | None = None
+    chapter_end: int | None = None,
+    session_dir_override: str | None = None
 ) -> dict:
     """
     Run TTS conversion for an assigned sentence range.
@@ -259,8 +260,9 @@ def run_worker_tts(
         dict with success status and details
     """
     try:
-        # Load session state
-        session_dir = os.path.join(tmp_dir, f"ebook-{session_id}")
+        # Load session state — use override path if provided (for cached sessions
+        # that aren't in the default e2a tmp dir)
+        session_dir = session_dir_override or os.path.join(tmp_dir, f"ebook-{session_id}")
         if not os.path.exists(session_dir):
             return {'success': False, 'error': f"Session directory not found: {session_dir}"}
 
