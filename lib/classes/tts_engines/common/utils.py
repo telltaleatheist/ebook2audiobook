@@ -28,8 +28,11 @@ class TTSUtils:
             torch.cuda.empty_cache()
             torch.cuda.ipc_collect()
             torch.cuda.synchronize()
-        elif hasattr(torch, 'mps') and hasattr(torch.mps, 'empty_cache'):
-            # MPS (Apple Silicon) memory cleanup
+        elif torch.backends.mps.is_available():
+            # MPS (Apple Silicon) memory cleanup. Note: on non-Apple CPU builds
+            # torch.mps.empty_cache exists but raises ("Cannot execute emptyCache()
+            # without MPS backend"), so we must gate on the backend actually being
+            # available, not merely on the attribute existing.
             torch.mps.empty_cache()
 
     def _loaded_tts_size_gb(self, loaded_tts:Dict[str, "Module"])->float:
