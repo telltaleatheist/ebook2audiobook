@@ -496,8 +496,10 @@ class TTSUtils:
         result = []
         remaining = text
 
-        # Punctuation marks to split at, in order of preference
-        split_chars = [',', ';', ':', '—', '–', ' - ']
+        # Punctuation marks to split at, in order of preference.
+        # Sentence-ending punctuation first (period/question/exclamation + space),
+        # then clause-level punctuation (comma, semicolon, etc.)
+        split_chars = ['. ', '? ', '! ', ',', ';', ':', '—', '–', ' - ']
 
         while len(remaining) > max_length:
             # Find the best split point within max_length

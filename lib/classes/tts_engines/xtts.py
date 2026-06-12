@@ -89,9 +89,8 @@ class XTTSv2(TTSUtils, TTSRegistry, name='xtts'):
                         trim_audio_buffer = 0.006
                         if part.endswith("'"):
                             part = part[:-1]
-                        part = part.replace('.', ' ;\n')
-                        # Split long text to avoid truncation (XTTS has 250 char limit)
-                        text_subparts = self._split_long_text(part, max_length=250)
+                        # Split long text to avoid truncation by XTTS's autoregressive decoder
+                        text_subparts = self._split_long_text(part, max_length=200)
                         if self.params['voice_path'] is not None and self.params['voice_path'] in self.params['latent_embedding'].keys():
                             self.params['gpt_cond_latent'], self.params['speaker_embedding'] = self.params['latent_embedding'][self.params['voice_path']]
                         else:
