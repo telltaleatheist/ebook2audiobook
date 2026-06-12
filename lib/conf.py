@@ -65,8 +65,15 @@ else:
 os.environ['CUDA_CACHE_MAXSIZE'] = '2147483648'
 os.environ['SUNO_OFFLOAD_CPU'] = 'False'
 os.environ['SUNO_USE_SMALL_MODELS'] = 'False'
-if sys.platform == 'win32':
-    os.environ['ESPEAK_DATA_PATH'] = os.path.expandvars(r"%USERPROFILE%\scoop\apps\espeak-ng\current\eSpeak NG\espeak-ng-data")
+# espeak-ng: prefer the pip-bundled library/data (espeakng-loader) so phonemizer
+# works inside a frozen/relocated env with no system espeak-ng install.
+try:
+    import espeakng_loader
+    os.environ.setdefault('PHONEMIZER_ESPEAK_LIBRARY', str(espeakng_loader.get_library_path()))
+    os.environ.setdefault('ESPEAK_DATA_PATH', str(espeakng_loader.get_data_path()))
+except ImportError:
+    if sys.platform == 'win32':
+        os.environ['ESPEAK_DATA_PATH'] = os.path.expandvars(r"%USERPROFILE%\scoop\apps\espeak-ng\current\eSpeak NG\espeak-ng-data")
 
 # ---------------------------------------------------------------------
 # Version and runtime config
