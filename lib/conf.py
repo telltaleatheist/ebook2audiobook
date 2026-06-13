@@ -14,6 +14,24 @@ tmp_dir = os.path.join(_e2a_root, 'tmp')
 tempfile.tempdir = tmp_dir
 tmp_expire = 7 # days
 
+# multiprocessing binds AF_UNIX sockets under its temp dir, and macOS caps
+# socket paths at 104 bytes. With tempfile/TMPDIR redirected into a deep e2a
+# root (e.g. ~/Library/Application Support/bookforge-app/runtime/e2a/tmp in
+# the packaged app), Manager() dies with "OSError: AF_UNIX path too long".
+# Pin multiprocessing's temp dir (sockets only) to a short system path.
+# /tmp is used instead of tempfile.gettempdir() because spawned children
+# inherit the TMPDIR override below and would resolve the deep path again.
+if sys.platform != 'win32':
+    import shutil as _shutil
+    import multiprocessing.process as _mp_process
+    import multiprocessing.util as _mp_util
+    _mp_config = _mp_process.current_process()._config
+    if 'tempdir' not in _mp_config:
+        _mp_socket_dir = tempfile.mkdtemp(prefix='pymp-', dir='/tmp')
+        _mp_config['tempdir'] = _mp_socket_dir
+        _mp_util.Finalize(None, _shutil.rmtree, args=[_mp_socket_dir],
+                          kwargs={'ignore_errors': True}, exitpriority=-100)
+
 models_dir = os.path.join(_e2a_root, 'models')
 ebooks_dir = os.path.join(_e2a_root, 'ebooks')
 voices_dir = os.path.join(_e2a_root, 'voices')
