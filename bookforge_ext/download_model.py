@@ -26,6 +26,7 @@ import argparse
 import json
 import os
 import sys
+import threading
 
 
 def _resolve_preset(engine, preset):
@@ -57,6 +58,64 @@ def _make_bf_tqdm():
     return BFTqdm
 
 
+def _dir_bytes(d):
+    """Sum the byte size of every file under d (best-effort, never raises)."""
+    total = 0
+    for dirpath, _dirnames, filenames in os.walk(d):
+        for f in filenames:
+            try:
+                total += os.path.getsize(os.path.join(dirpath, f))
+            except OSError:
+                pass
+    return total
+
+
+def _download_stanza(args, root):
+    """Fetch a Stanza language pack into <root>/models/stanza/<lang>/."""
+    stanza_dir = os.path.join(root, "models", "stanza")
+    os.makedirs(stanza_dir, exist_ok=True)
+    lang_dir = os.path.join(stanza_dir, args.lang)
+
+    # Poll the language dir's on-disk size and mirror it as BF_PROGRESS lines.
+    stop = threading.Event()
+
+    def _poll():
+        while not stop.is_set():
+            try:
+                recv = _dir_bytes(lang_dir)
+                sys.stdout.write(f"BF_PROGRESS {recv} {args.total} {args.lang}\n")
+                sys.stdout.flush()
+            except Exception:
+                pass
+            stop.wait(0.5)
+
+    poller = None
+    if args.bf_progress:
+        poller = threading.Thread(target=_poll, daemon=True)
+        poller.start()
+
+    try:
+        import stanza
+        stanza.download(args.lang, model_dir=stanza_dir)
+    except Exception as e:
+        stop.set()
+        if poller is not None:
+            poller.join(timeout=1)
+        print(json.dumps({"ok": False, "error": str(e)}))
+        return 1
+
+    stop.set()
+    if poller is not None:
+        poller.join(timeout=1)
+
+    if not os.path.isdir(lang_dir) or not os.listdir(lang_dir):
+        print(json.dumps({"ok": False, "error": f"download finished but {lang_dir} is missing or empty"}))
+        return 1
+
+    print(json.dumps({"ok": True, "dir": lang_dir, "lang": args.lang}))
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--engine", default="xtts")
@@ -65,6 +124,8 @@ def main():
     ap.add_argument("--sub", default="")
     ap.add_argument("--files", nargs="*")
     ap.add_argument("--cache-dir", dest="cache_dir")
+    ap.add_argument("--lang")
+    ap.add_argument("--total", type=int, default=0)
     ap.add_argument("--bf-progress", action="store_true")
     args = ap.parse_args()
 
@@ -72,6 +133,11 @@ def main():
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     if root not in sys.path:
         sys.path.insert(0, root)
+
+    # Stanza language packs are segmentation models, not HF voices — different
+    # mechanism, same output contract (BF_PROGRESS + a single final JSON line).
+    if args.engine == "stanza":
+        return _download_stanza(args, root)
 
     # Importing lib.conf sets HUGGINGFACE_HUB_CACHE/HF_HOME = <root>/models/tts —
     # the exact dir xtts.py downloads into. Fall back to that path if conf can't
