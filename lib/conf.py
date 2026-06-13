@@ -10,11 +10,17 @@ max_python_version = (3,12)
 # This ensures consistent paths regardless of where python is invoked from
 _e2a_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-# E2A_TMP_DIR relocates all temp/session storage (BookForge points it at a
-# scratch folder on the library volume so cached sessions clone instantly).
-tmp_dir = os.environ.get('E2A_TMP_DIR') or os.path.join(_e2a_root, 'tmp')
+# E2A_TMP_DIR relocates SESSION storage only (BookForge points it at a big
+# scratch volume). Calibre temp and tempfile stay on local disk: the scratch
+# may be ExFAT/NTFS, where macOS AppleDouble ._* sidecar files in calibre's
+# staging dir crash its EPUB3 upgrade (and small-file temp churn is slow).
+_session_scratch = os.environ.get('E2A_TMP_DIR')
+_local_tmp = os.path.join(_e2a_root, 'tmp')
+tmp_dir = _session_scratch or _local_tmp
 os.makedirs(tmp_dir, exist_ok=True)
-tempfile.tempdir = tmp_dir
+if not _session_scratch:
+    # Legacy behavior: everything (tempfile, calibre, TMPDIR) under <root>/tmp
+    tempfile.tempdir = tmp_dir
 tmp_expire = 7 # days
 
 # multiprocessing binds AF_UNIX sockets under its temp dir, and macOS caps
@@ -49,10 +55,14 @@ os.environ['PYTHONIOENCODING'] = 'utf-8'
 os.environ['COQUI_TOS_AGREED'] = '1'
 os.environ['PYTHONIOENCODING'] = 'utf-8'
 os.environ['CALIBRE_NO_NATIVE_FILEDIALOGS'] = '1'
-os.environ['CALIBRE_TEMP_DIR'] = tmp_dir
-os.environ['CALIBRE_CACHE_DIRECTORY'] = tmp_dir
-os.environ['CALIBRE_CONFIG_DIRECTORY'] = tmp_dir
-os.environ['TMPDIR'] = tmp_dir
+# Calibre dirs + TMPDIR stay on the LOCAL tmp even when sessions are
+# relocated — see the E2A_TMP_DIR note above.
+os.makedirs(_local_tmp, exist_ok=True)
+os.environ['CALIBRE_TEMP_DIR'] = _local_tmp
+os.environ['CALIBRE_CACHE_DIRECTORY'] = _local_tmp
+os.environ['CALIBRE_CONFIG_DIRECTORY'] = _local_tmp
+if not _session_scratch:
+    os.environ['TMPDIR'] = tmp_dir
 os.environ['GRADIO_DEBUG'] = '0'
 os.environ['DO_NOT_TRACK'] = 'True'
 os.environ['HUGGINGFACE_HUB_CACHE'] = tts_dir
