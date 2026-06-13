@@ -59,6 +59,8 @@ def save_session_state(session_id: str, args: dict, prep_result: dict, core_modu
             'language_iso1': session.get('language_iso1', 'en'),
             'voice': session.get('voice'),
             'fine_tuned': session.get('fine_tuned'),
+            'custom_model': session.get('custom_model'),
+            'custom_model_dir': session.get('custom_model_dir'),
             'tts_engine': session.get('tts_engine'),
             'device': args.get('device', default_device),
             'output_format': args.get('output_format', default_output_format),
@@ -367,6 +369,11 @@ def prep_ebook_info(args: dict, core_module) -> dict | None:
         session['audiobooks_dir'] = args.get('audiobooks_dir', audiobooks_cli_dir)
         session['fine_tuned'] = args.get('fine_tuned', default_fine_tuned)
         session['voice'] = args.get('voice')
+        # Pre-staged custom model (BookForge user-added voices): --custom_model is a
+        # NAME and --custom_model_dir is the staging root. No zip extraction here —
+        # the checkpoint files are loaded in place by the engine. fine_tuned stays a
+        # valid preset key (used for samplerate); the custom checkpoint overrides it.
+        session['custom_model'] = args.get('custom_model')
         session['output_format'] = args.get('output_format', default_output_format)
 
         # XTTS settings - save to session-state.json so workers use them instead of defaults
@@ -414,7 +421,9 @@ def prep_ebook_info(args: dict, core_module) -> dict | None:
         session['process_dir'] = os.path.join(session['session_dir'], f"{hashlib.md5(session['ebook'].encode()).hexdigest()}")
         session['chapters_dir'] = os.path.join(session['process_dir'], 'chapters')
         session['sentences_dir'] = os.path.join(session['chapters_dir'], 'sentences')
-        session['custom_model_dir'] = os.path.join(models_dir, '__sessions', f"model-{session_id}")
+        # A pre-staged custom_model_dir (BookForge) is used in place; otherwise the
+        # session-derived dir is used (legacy zip-extraction path in lib/core.py).
+        session['custom_model_dir'] = args.get('custom_model_dir') or os.path.join(models_dir, '__sessions', f"model-{session_id}")
         session['voice_dir'] = os.path.join(voices_dir, '__sessions', f"voice-{session_id}", session['language'])
 
         # Detect VRAM

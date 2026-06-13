@@ -189,8 +189,11 @@ def create_worker_session(state: dict, args: dict) -> dict:
         'language_iso1': state.get('language_iso1', 'en'),
         'voice': args.get('voice') or state.get('voice'),
         'voice_dir': os.path.join(state['process_dir'], 'voices'),
-        'custom_model': None,
-        'custom_model_dir': os.path.join(state['process_dir'], 'models'),
+        # Pre-staged custom voice (BookForge): name + staging root come from the
+        # prep args or the persisted session state. None → built-in/fine-tuned model.
+        'custom_model': args.get('custom_model') or state.get('custom_model'),
+        'custom_model_dir': (args.get('custom_model_dir') or state.get('custom_model_dir')
+                             or os.path.join(state['process_dir'], 'models')),
         'audiobooks_dir': args.get('output_dir') or state.get('audiobooks_dir'),
         'session_dir': state['session_dir'],
         'process_dir': state['process_dir'],

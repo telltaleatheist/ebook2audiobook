@@ -11,7 +11,7 @@ PARALLEL_OPTIONS = [
     '--sentence_start', '--sentence_end', '--chapter_start', '--chapter_end',
     '--resume_session', '--list_sessions', '--no_split', '--chapters', '--skip_deps',
     '--bilingual', '--bilingual_pause', '--bilingual_gap', '--skip_assembly',
-    '--sentence_per_paragraph', '--skip_headings', '--session_dir'
+    '--sentence_per_paragraph', '--skip_headings', '--session_dir', '--custom_model_dir'
 ]
 
 
@@ -135,4 +135,13 @@ def add_arguments(parser):
         help='(assemble_only) Explicit path to session directory. '
              'Overrides default tmp_dir/ebook-{session} location. '
              'Used when session has been cached to an external location.'
+    )
+
+    parallel_group.add_argument(
+        '--custom_model_dir', type=str, default=None,
+        help='(BookForge) Root of a PRE-STAGED custom model layout '
+             '(custom_model_dir/<engine>/<custom_model>/{config.json,model.pth,vocab.json}). '
+             'When set, --custom_model is treated as the model NAME and no zip '
+             'extraction is performed — the files are loaded in place. Used for '
+             'user-added fine-tuned XTTS voices in full audiobook generation.'
     )

@@ -66,6 +66,10 @@ def main():
                        help='Output format override (default: from session state)')
     parser.add_argument('--speed', type=float, default=None,
                        help='TTS speed override for XTTS (default: from session state)')
+    parser.add_argument('--custom_model', type=str, default=None,
+                       help='Custom model NAME for a pre-staged user voice (default: from session state)')
+    parser.add_argument('--custom_model_dir', type=str, default=None,
+                       help='Staging root for a pre-staged custom model (default: from session state)')
 
     args = parser.parse_args()
 
@@ -96,6 +100,8 @@ def main():
         'voice': args.voice,
         'output_format': args.output_format,
         'speed': args.speed,
+        'custom_model': args.custom_model,
+        'custom_model_dir': args.custom_model_dir,
     }
 
     # Run TTS conversion
