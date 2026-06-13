@@ -1,12 +1,9 @@
-lib/__pycache__/
-lib/classes/__pycache__/
-lib/classes/tts_engines/__pycache__/
-lib/classes/tts_engines/common/__pycache__/
-lib/classes/tts_engines/presets/__pycache__/
+__pycache__/
 
 python_env/
 
-tmp/gradio/
+tmp/
+models/
 
 .DS_Store
-*.wixobjbookforge_ext/**/__pycache__/
+*.wixobj
