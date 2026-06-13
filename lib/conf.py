@@ -10,7 +10,10 @@ max_python_version = (3,12)
 # This ensures consistent paths regardless of where python is invoked from
 _e2a_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-tmp_dir = os.path.join(_e2a_root, 'tmp')
+# E2A_TMP_DIR relocates all temp/session storage (BookForge points it at a
+# scratch folder on the library volume so cached sessions clone instantly).
+tmp_dir = os.environ.get('E2A_TMP_DIR') or os.path.join(_e2a_root, 'tmp')
+os.makedirs(tmp_dir, exist_ok=True)
 tempfile.tempdir = tmp_dir
 tmp_expire = 7 # days
 

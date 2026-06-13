@@ -1,6 +1,7 @@
 __pycache__/
 
 python_env/
+orpheus_env/
 
 tmp/
 models/
