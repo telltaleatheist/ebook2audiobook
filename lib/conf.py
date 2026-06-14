@@ -102,6 +102,21 @@ try:
     import espeakng_loader
     os.environ.setdefault('PHONEMIZER_ESPEAK_LIBRARY', str(espeakng_loader.get_library_path()))
     os.environ.setdefault('ESPEAK_DATA_PATH', str(espeakng_loader.get_data_path()))
+    # coqui-tts (TTS.tts.utils.text.phonemizers.espeak_wrapper) shells out to the
+    # espeak-ng EXECUTABLE rather than the phonemizer ctypes library. On Windows
+    # the relocatable env ships only the DLL (via espeakng-loader), so XTTS fails
+    # to load ("espeak-ng --voices returned non-zero exit status"). Ship a matching
+    # espeak-ng.exe (1.52, same as the loader's data) and put it on PATH so the
+    # CLI resolves. Must run BEFORE TTS is imported (worker imports lib.conf first).
+    if sys.platform == 'win32':
+        _espeak_bin = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            'ext', 'espeak-ng-win',
+        )
+        if os.path.isfile(os.path.join(_espeak_bin, 'espeak-ng.exe')):
+            os.environ['PATH'] = _espeak_bin + os.pathsep + os.environ.get('PATH', '')
+            # The bundled exe is version-matched to the loader's data; point it there.
+            os.environ['ESPEAK_DATA_PATH'] = str(espeakng_loader.get_data_path())
 except ImportError:
     if sys.platform == 'win32':
         os.environ['ESPEAK_DATA_PATH'] = os.path.expandvars(r"%USERPROFILE%\scoop\apps\espeak-ng\current\eSpeak NG\espeak-ng-data")
