@@ -8,3 +8,7 @@ models/
 
 .DS_Store
 *.wixobj
+
+# Python build artifacts (e.g. num2words setup.py build output)
+build/
+*.egg-info/

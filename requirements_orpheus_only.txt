@@ -1,0 +1,29 @@
+# Minimal requirements for Orpheus TTS in WSL
+# Use with: pip install -r requirements_orpheus_only.txt
+#
+# NOTE: Install torch/torchaudio FIRST:
+#   pip install torch==2.5.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cu121
+
+# vLLM 0.7.3 (recommended by Orpheus authors for stability)
+vllm==0.7.3
+
+# Orpheus TTS and audio decoder
+orpheus-speech
+snac
+
+# Core dependencies
+transformers
+huggingface_hub
+regex
+numpy
+scipy
+soundfile
+
+# Ebook parsing (for worker functionality)
+ebooklib
+beautifulsoup4
+lxml
+
+# Utilities
+tqdm
+packaging
