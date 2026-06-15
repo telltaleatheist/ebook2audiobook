@@ -12,6 +12,7 @@ Usage:
         [--cache-dir DIR]      # override the HF cache (used by the seed builder)
         [--bf-progress]        # emit BF_PROGRESS lines on stdout for the UI
         [--repo R --sub S/ --files config.json model.pth vocab.json]   # bypass presets
+        [--ref Name_24khz.wav] # reference clip in the sub-folder, fetched + echoed back
 
 Output contract:
     - Progress: with --bf-progress, lines "BF_PROGRESS <received> <total> <desc>"
@@ -270,6 +271,10 @@ def main():
     ap.add_argument("--repo")
     ap.add_argument("--sub", default="")
     ap.add_argument("--files", nargs="*")
+    # Reference clip filename within the voice's HF sub-folder (catalog `ref`,
+    # e.g. "Name_24khz.wav"). Downloaded alongside the checkpoint and echoed back
+    # so the app can register a self-contained voice. Absent for the base model.
+    ap.add_argument("--ref")
     ap.add_argument("--cache-dir", dest="cache_dir")
     ap.add_argument("--lang")
     ap.add_argument("--total", type=int, default=0)
@@ -311,9 +316,19 @@ def main():
         print(json.dumps({"ok": False, "error": "no files to download"}))
         return 2
 
+    # The reference clip (catalog `ref`, e.g. "Name_24khz.wav") lives in the same
+    # HF sub-folder as the checkpoint and must ride along so a downloaded voice is
+    # self-contained (conditioning latents are computed from it). Fetch it WITH the
+    # checkpoint, but keep it OUT of dl_files so the headline-checkpoint sanity
+    # check and the reported `files` map stay checkpoint-only.
+    ref_name = (args.ref or "").strip()
+    fetch_files = list(dl_files)
+    if ref_name and ref_name not in fetch_files:
+        fetch_files.append(ref_name)
+
     cache_dir = args.cache_dir or default_cache
     os.makedirs(cache_dir, exist_ok=True)
-    patterns = [f"{sub}{f}" for f in dl_files]
+    patterns = [f"{sub}{f}" for f in fetch_files]
 
     tqdm_class = _make_bf_tqdm() if args.bf_progress else None
 
@@ -332,7 +347,7 @@ def main():
     except Exception as e:
         # Upstream HuggingFace failed — fall back to the BookForge mirror, which
         # writes the same HF-cache layout so the engine resolves it identically.
-        snap = _download_xtts_from_mirror(repo, sub, dl_files, cache_dir, args.bf_progress)
+        snap = _download_xtts_from_mirror(repo, sub, fetch_files, cache_dir, args.bf_progress)
         if snap is None:
             print(json.dumps({"ok": False, "error": f"HuggingFace download failed ({e}); no mirror fallback available"}))
             return 1
@@ -347,7 +362,16 @@ def main():
         print(json.dumps({"ok": False, "error": f"download finished but {model_file} is missing"}))
         return 1
 
-    print(json.dumps({"ok": True, "snapshotDir": snap, "subDir": sub_dir, "files": resolved}))
+    result = {"ok": True, "snapshotDir": snap, "subDir": sub_dir, "files": resolved}
+    # Report the downloaded reference clip's path so the app can register the voice
+    # (checkpoint + clip) for the player and full-audiobook generation. If the clip
+    # didn't come down (an older repo without it), the voice still installs — it
+    # just won't auto-register a clip.
+    if ref_name:
+        ref_path = os.path.join(sub_dir, ref_name)
+        if os.path.exists(ref_path):
+            result["ref"] = ref_path
+    print(json.dumps(result))
     return 0
 
 
