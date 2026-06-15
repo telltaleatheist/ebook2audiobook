@@ -321,6 +321,9 @@ def main():
     ap.add_argument("--repo")
     ap.add_argument("--sub", default="")
     ap.add_argument("--files", nargs="*")
+    # A reference clip filename to fetch ALONGSIDE the checkpoint (catalog voices
+    # are self-contained — the model is useless without a clip to clone from).
+    ap.add_argument("--ref")
     ap.add_argument("--cache-dir", dest="cache_dir")
     ap.add_argument("--lang")
     ap.add_argument("--total", type=int, default=0)
@@ -354,13 +357,18 @@ def main():
             print(json.dumps({"ok": False, "error": str(e)}))
             return 2
 
-    # Download every repo file except ref.wav (a local reference clip, not in the
-    # HF repo). Fine-tuned voices have 3 (config/model/vocab); the base model adds
-    # speakers_xtts.pth.
+    # Checkpoint files: 3 for fine-tuned voices (config/model/vocab); the base
+    # model adds speakers_xtts.pth. Drop a stray legacy 'ref.wav' here — the real
+    # reference clip is fetched explicitly via --ref below (it may even BE named
+    # ref.wav, in which case we re-add it).
     dl_files = [f for f in (files or []) if f != "ref.wav"]
     if not dl_files:
         print(json.dumps({"ok": False, "error": "no files to download"}))
         return 2
+
+    # Append the reference clip so it lands in the same snapshot dir as the model.
+    if args.ref and args.ref not in dl_files:
+        dl_files.append(args.ref)
 
     cache_dir = args.cache_dir or default_cache
     os.makedirs(cache_dir, exist_ok=True)
@@ -405,7 +413,18 @@ def main():
         print(json.dumps({"ok": False, "error": f"download finished but {model_file} is missing"}))
         return 1
 
-    print(json.dumps({"ok": True, "snapshotDir": snap, "subDir": sub_dir, "files": resolved}))
+    # Surface the reference clip path so the caller can register a self-contained
+    # voice (checkpoint + clip). Non-fatal if it's missing: the model still works
+    # for any voice that has a bundled clip (the caller just won't register it as
+    # a downloaded voice). This keeps the mirror fallback — which may not host the
+    # clip — usable when HuggingFace is unreachable.
+    ref_path = resolved.get(args.ref) if args.ref else None
+    if args.ref and (not ref_path or not os.path.exists(ref_path)):
+        sys.stderr.write(f"[download_model] reference clip {args.ref} unavailable; continuing without it\n")
+        ref_path = None
+
+    print(json.dumps({"ok": True, "snapshotDir": snap, "subDir": sub_dir,
+                      "files": resolved, "ref": ref_path}))
     return 0
 
 
