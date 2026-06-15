@@ -85,6 +85,32 @@ def _with_retry(fn, *, attempts=4, base_delay=2.0, label=""):
         raise last
 
 
+def _enforce_request_timeouts(connect=30, read=90):
+    """Stanza and huggingface_hub download via `requests`, which has NO timeout by
+    default. A stalled CDN read then blocks FOREVER — the socket sits in
+    CLOSE_WAIT/ESTABLISHED with no data flowing — and _with_retry never fires
+    because a hung read raises nothing. Inject a default (connect, read) timeout
+    on every requests call so a stall raises requests.Timeout, which _is_transient
+    treats as retryable. read=90s of total silence = genuinely stalled (a healthy
+    download delivers bytes continuously, so this never trips a slow-but-live one).
+    Idempotent; a no-op if requests isn't importable."""
+    try:
+        import requests
+    except Exception:
+        return
+    if getattr(requests.Session.request, "_bf_timeout_patched", False):
+        return
+    _orig = requests.Session.request
+
+    def _patched(self, *args, **kwargs):
+        if kwargs.get("timeout") is None:
+            kwargs["timeout"] = (connect, read)
+        return _orig(self, *args, **kwargs)
+
+    _patched._bf_timeout_patched = True
+    requests.Session.request = _patched
+
+
 def _resolve_preset(engine, preset):
     """Look up (repo, sub, files) from e2a's own preset tables (single source)."""
     from lib.classes.tts_engines.common.preset_loader import load_engine_presets
@@ -329,6 +355,10 @@ def main():
     ap.add_argument("--total", type=int, default=0)
     ap.add_argument("--bf-progress", action="store_true")
     args = ap.parse_args()
+
+    # Make every requests-based download (stanza + huggingface_hub) time out on a
+    # stall instead of hanging forever, so _with_retry can recover.
+    _enforce_request_timeouts()
 
     # bookforge_ext sits at the e2a root, so root = parent of this package dir.
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
