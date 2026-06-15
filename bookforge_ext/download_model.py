@@ -30,6 +30,7 @@ import os
 import shutil
 import sys
 import threading
+import time
 import urllib.error
 import urllib.request
 import zipfile
@@ -45,6 +46,70 @@ MIRROR_BASE = os.environ.get("BOOKFORGE_MIRROR_BASE", "https://owenmorgan.com/bo
 # the exact repo ids from electron/xtts-voices.ts (BASE_REPO / FINE_TUNED_REPO).
 _BASE_REPO = "coqui/XTTS-v2"
 _FINE_TUNED_REPO = "drewThomasson/fineTunedTTSModels"
+
+
+def _is_transient(exc):
+    """True for download errors worth retrying — network blips, dropped
+    connections, and HuggingFace rate-limiting / 5xx. These are exactly what
+    sank single large files (a voice .pth, a language pack) during a first-run
+    download burst while dozens of others succeeded."""
+    if isinstance(exc, (urllib.error.URLError, ConnectionError, TimeoutError)):
+        return True
+    msg = str(exc).lower()
+    for sig in ('429', 'too many requests', 'rate limit', 'timed out', 'timeout',
+                'connection reset', 'connection aborted', 'broken pipe',
+                'temporarily unavailable', 'incompleteread', 'eof occurred',
+                '500', '502', '503', '504', 'remote end closed'):
+        if sig in msg:
+            return True
+    return False
+
+
+def _with_retry(fn, *, attempts=4, base_delay=2.0, label=""):
+    """Run fn(), retrying transient failures with exponential backoff (2,4,8s).
+    Permanent errors (e.g. a missing model) re-raise immediately so the caller's
+    mirror fallback still runs. Backoff also gives HuggingFace room if it's
+    rate-limiting us."""
+    last = None
+    for i in range(1, attempts + 1):
+        try:
+            return fn()
+        except Exception as e:  # noqa: BLE001 — classify, then re-raise
+            last = e
+            if not _is_transient(e) or i == attempts:
+                raise
+            delay = base_delay * (2 ** (i - 1))
+            sys.stderr.write(f"[download_model] {label} attempt {i}/{attempts} failed ({e}); retrying in {delay:.0f}s\n")
+            sys.stderr.flush()
+            time.sleep(delay)
+    if last is not None:
+        raise last
+
+
+def _enforce_request_timeouts(connect=30, read=90):
+    """Stanza and huggingface_hub download via `requests`, which has NO timeout by
+    default. A stalled CDN read then blocks FOREVER — the socket sits in
+    CLOSE_WAIT/ESTABLISHED with no data flowing — and _with_retry never fires
+    because a hung read raises nothing. Inject a default (connect, read) timeout
+    on every requests call so a stall raises requests.Timeout, which _is_transient
+    treats as retryable. read=90s of total silence = genuinely stalled (a healthy
+    download delivers bytes continuously, so this never trips a slow-but-live one).
+    Idempotent; a no-op if requests isn't importable."""
+    try:
+        import requests
+    except Exception:
+        return
+    if getattr(requests.Session.request, "_bf_timeout_patched", False):
+        return
+    _orig = requests.Session.request
+
+    def _patched(self, *args, **kwargs):
+        if kwargs.get("timeout") is None:
+            kwargs["timeout"] = (connect, read)
+        return _orig(self, *args, **kwargs)
+
+    _patched._bf_timeout_patched = True
+    requests.Session.request = _patched
 
 
 def _resolve_preset(engine, preset):
@@ -240,10 +305,22 @@ def _download_stanza(args, root):
 
     try:
         import stanza
-        stanza.download(args.lang, model_dir=stanza_dir)
+        _with_retry(lambda: stanza.download(args.lang, model_dir=stanza_dir),
+                    label=f"stanza:{args.lang}")
+    except KeyError as e:
+        # Stanza lists this language (it has a lang_name) but ships only character
+        # language models — no tokenize/'packages' to download. There is no
+        # sentence-segmentation model, so this is permanent: don't retry/mirror,
+        # and say so clearly instead of a generic "download failed".
+        stop.set()
+        if poller is not None:
+            poller.join(timeout=1)
+        print(json.dumps({"ok": False,
+                          "error": f"Stanza has no sentence-segmentation model for '{args.lang}' — this language can't be downloaded."}))
+        return 2
     except Exception as e:
-        # Upstream (Stanford/HF) failed — fall back to the BookForge mirror's
-        # default.zip. The poller keeps reporting on-disk progress meanwhile.
+        # Upstream (Stanford/HF) failed after retries — fall back to the BookForge
+        # mirror's default.zip. The poller keeps reporting on-disk progress.
         mirror = _download_stanza_from_mirror(args.lang, stanza_dir, args.bf_progress)
         if mirror is None:
             stop.set()
@@ -281,6 +358,10 @@ def main():
     ap.add_argument("--bf-progress", action="store_true")
     args = ap.parse_args()
 
+    # Make every requests-based download (stanza + huggingface_hub) time out on a
+    # stall instead of hanging forever, so _with_retry can recover.
+    _enforce_request_timeouts()
+
     # bookforge_ext sits at the e2a root, so root = parent of this package dir.
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     if root not in sys.path:
@@ -308,9 +389,10 @@ def main():
             print(json.dumps({"ok": False, "error": str(e)}))
             return 2
 
-    # Download every repo file except ref.wav (a local reference clip, not in the
-    # HF repo). Fine-tuned voices have 3 (config/model/vocab); the base model adds
-    # speakers_xtts.pth.
+    # Checkpoint files: 3 for fine-tuned voices (config/model/vocab); the base
+    # model adds speakers_xtts.pth. Drop a stray legacy 'ref.wav' here — the real
+    # reference clip is fetched explicitly via --ref below (it may even BE named
+    # ref.wav, in which case we re-add it).
     dl_files = [f for f in (files or []) if f != "ref.wav"]
     if not dl_files:
         print(json.dumps({"ok": False, "error": "no files to download"}))
@@ -338,12 +420,19 @@ def main():
         kwargs = dict(repo_id=repo, allow_patterns=patterns, cache_dir=cache_dir)
         if tqdm_class is not None:
             kwargs["tqdm_class"] = tqdm_class
-        try:
-            snap = snapshot_download(**kwargs)
-        except TypeError:
-            # Older huggingface_hub without tqdm_class — retry with default bars.
-            kwargs.pop("tqdm_class", None)
-            snap = snapshot_download(**kwargs)
+
+        def _do_snapshot():
+            try:
+                return snapshot_download(**kwargs)
+            except TypeError:
+                # Older huggingface_hub without tqdm_class — use default bars.
+                kwargs.pop("tqdm_class", None)
+                return snapshot_download(**kwargs)
+
+        # Retry transient HF failures (rate-limit / reset / timeout on the big
+        # .pth) before giving up to the mirror — this is what dropped voices like
+        # Bob Odenkirk during the first-run burst even though the files exist.
+        snap = _with_retry(_do_snapshot, label=f"hf:{repo}")
     except Exception as e:
         # Upstream HuggingFace failed — fall back to the BookForge mirror, which
         # writes the same HF-cache layout so the engine resolves it identically.
@@ -371,6 +460,8 @@ def main():
         ref_path = os.path.join(sub_dir, ref_name)
         if os.path.exists(ref_path):
             result["ref"] = ref_path
+        else:
+            sys.stderr.write(f"[download_model] reference clip {ref_name} unavailable; continuing without it\n")
     print(json.dumps(result))
     return 0
 
