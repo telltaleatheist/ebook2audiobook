@@ -180,6 +180,8 @@ class TTSUtils:
         try:
             with _lock:
                 from TTS.api import TTS as TTSEngine
+                from lib.classes.tts_engines.common.coqui_patches import apply_coqui_patches
+                apply_coqui_patches()
                 engine = loaded_tts.get(key, False)
                 if not engine:
                     engine = TTSEngine(model_path)
@@ -204,6 +206,8 @@ class TTSUtils:
                     engine_name = kwargs.get('tts_engine', None)
                     from TTS.tts.configs.xtts_config import XttsConfig
                     from TTS.tts.models.xtts import Xtts
+                    from lib.classes.tts_engines.common.coqui_patches import apply_coqui_patches
+                    apply_coqui_patches()
                     checkpoint_path = kwargs.get('checkpoint_path')
                     config_path = kwargs.get('config_path',None)
                     vocab_path = kwargs.get('vocab_path',None)
