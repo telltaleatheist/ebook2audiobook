@@ -320,7 +320,7 @@ def extract_custom_model(file_src:str, session_id, required_files:list)->str|Non
                 print(msg)
                 voice_ref = os.path.join(model_path, 'ref.wav')
                 voice_output = os.path.join(model_path, f'{model_name}.wav')
-                extractor = VoiceExtractor(session, voice_ref, voice_output)
+                extractor = VoiceExtractor(session, voice_ref, model_name)
                 success, error = extractor.normalize_audio(voice_ref, voice_output, voice_output)
                 if success:
                     if os.path.exists(file_src):
@@ -2682,14 +2682,14 @@ def convert_ebook(args:dict)->tuple:
                         custom_src_name = custom_src_path.stem
                         if not os.path.exists(os.path.join(session['custom_model_dir'], custom_src_name)):
                             try:
-                                if analyze_uploaded_file(session['custom_model'], default_engine_settings[session['tts_engine']]['internal']['files']):
+                                if analyze_uploaded_file(session['custom_model'], default_engine_settings[session['tts_engine']]['files']):
                                     model = extract_custom_model(session['custom_model'], session_id, default_engine_settings[session['tts_engine']]['files'])
                                     if model is not None:
                                         session['custom_model'] = model
                                     else:
                                         error = f"{model} could not be extracted or mandatory files are missing"
                                 else:
-                                    error = f'{os.path.basename(f)} is not a valid model or some required files are missing'
+                                    error = f'{os.path.basename(session["custom_model"])} is not a valid model or some required files are missing'
                             except ModuleNotFoundError as e:
                                 error = f"No presets module for TTS engine '{session['tts_engine']}': {e}"
                                 print(error)

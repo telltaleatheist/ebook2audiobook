@@ -119,7 +119,23 @@ try:
             os.environ['ESPEAK_DATA_PATH'] = str(espeakng_loader.get_data_path())
 except ImportError:
     if sys.platform == 'win32':
-        os.environ['ESPEAK_DATA_PATH'] = os.path.expandvars(r"%USERPROFILE%\scoop\apps\espeak-ng\current\eSpeak NG\espeak-ng-data")
+        # espeakng_loader not installed (dev checkout). Still prepend the bundled,
+        # self-contained espeak-ng.exe (ships its own libespeak-ng.dll) so the CLI
+        # resolves to it. A system espeak-ng (e.g. scoop) breaks when run as a
+        # subprocess of torch-python (DLL conflict -> empty --version -> coqui
+        # espeak_wrapper IndexError on output.split()[3]).
+        _espeak_bin = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            'ext', 'espeak-ng-win',
+        )
+        if os.path.isfile(os.path.join(_espeak_bin, 'espeak-ng.exe')):
+            os.environ['PATH'] = _espeak_bin + os.pathsep + os.environ.get('PATH', '')
+        # Correct scoop data dir is '...\current\espeak-ng-data' (no 'eSpeak NG'
+        # subdir). A wrong/nonexistent ESPEAK_DATA_PATH makes espeak-ng emit empty
+        # output -> coqui espeak_wrapper IndexError. Only set it if it resolves.
+        _edp = os.path.expandvars(r"%USERPROFILE%\scoop\apps\espeak-ng\current\espeak-ng-data")
+        if os.path.isdir(_edp):
+            os.environ['ESPEAK_DATA_PATH'] = _edp
 
 # ---------------------------------------------------------------------
 # Version and runtime config
