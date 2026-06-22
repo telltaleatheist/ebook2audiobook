@@ -11,7 +11,8 @@ PARALLEL_OPTIONS = [
     '--sentence_start', '--sentence_end', '--chapter_start', '--chapter_end',
     '--resume_session', '--list_sessions', '--no_split', '--chapters', '--skip_deps',
     '--bilingual', '--bilingual_pause', '--bilingual_gap', '--skip_assembly',
-    '--sentence_per_paragraph', '--skip_headings', '--session_dir', '--custom_model_dir'
+    '--sentence_per_paragraph', '--skip_headings', '--session_dir', '--custom_model_dir',
+    '--sentences_dir'
 ]
 
 
@@ -135,6 +136,15 @@ def add_arguments(parser):
         help='(assemble_only) Explicit path to session directory. '
              'Overrides default tmp_dir/ebook-{session} location. '
              'Used when session has been cached to an external location.'
+    )
+
+    parallel_group.add_argument(
+        '--sentences_dir', type=str, default=None,
+        help='(assemble_only) Override ONLY the sentence-audio source folder, while '
+             'keeping chapter mapping / metadata / VTT from the session state. The '
+             'folder must contain sentence files named {i}.<ext> matching the session. '
+             'Used by BookForge to assemble a post-processed sentence set (e.g. RVC '
+             'voice-enhanced renders) without disturbing the cached original sentences.'
     )
 
     parallel_group.add_argument(

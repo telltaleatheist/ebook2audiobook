@@ -874,7 +874,18 @@ def assemble_audiobook(args: dict, core_module) -> dict:
         session['session_dir'] = state['session_dir']
         session['process_dir'] = state['process_dir']
         session['chapters_dir'] = os.path.join(state['process_dir'], 'chapters')
-        session['sentences_dir'] = os.path.join(state['process_dir'], 'chapters', 'sentences')
+        # BookForge: --sentences_dir overrides ONLY the sentence-audio source so we can
+        # assemble a post-processed set (e.g. RVC voice-enhanced renders) while leaving
+        # the original XTTS sentences cached in place. Chapter mapping / metadata / VTT
+        # still come from the unchanged session state. Default = the session's own sentences.
+        sentences_dir_override = args.get('sentences_dir')
+        if sentences_dir_override:
+            if not os.path.isdir(sentences_dir_override):
+                return {'success': False, 'error': f"Sentences directory not found: {sentences_dir_override}"}
+            session['sentences_dir'] = os.path.abspath(sentences_dir_override)
+            print(f"[ASSEMBLE] Using overridden sentences_dir: {session['sentences_dir']}")
+        else:
+            session['sentences_dir'] = os.path.join(state['process_dir'], 'chapters', 'sentences')
         session['language'] = state.get('language', default_language_code)
         session['output_format'] = args.get('output_format') or state.get('output_format', default_output_format)
         session['audiobooks_dir'] = args.get('audiobooks_dir') or state.get('audiobooks_dir', audiobooks_cli_dir)
