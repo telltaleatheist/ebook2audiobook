@@ -15,3 +15,6 @@ build/
 
 # Runtime TTS session data (written under voices/ during conversion)
 voices/__sessions/
+
+# Runtime logs
+logs/
