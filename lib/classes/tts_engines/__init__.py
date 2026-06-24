@@ -6,3 +6,4 @@ from .tacotron import Tacotron2
 from .yourtts import YourTTS
 from .orpheus import Orpheus
 from .voxtral import Voxtral
+from .f5 import F5

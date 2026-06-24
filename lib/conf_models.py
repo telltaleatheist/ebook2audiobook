@@ -12,7 +12,8 @@ TTS_ENGINES = {
     "TACOTRON2": "tacotron",
     "YOURTTS": "yourtts",
     "ORPHEUS": "orpheus",
-    "VOXTRAL": "voxtral"
+    "VOXTRAL": "voxtral",
+    "F5": "f5"
 }
 
 TTS_VOICE_CONVERSION = {
@@ -214,5 +215,17 @@ default_engine_settings = {
             "cheerful_female": "Cheerful (Female)"
         },
         "rating": {"VRAM": 8, "CPU": 2, "RAM": 8, "Realism": 7}  # ElevenLabs-class prosody
+    },
+    TTS_ENGINES['F5']: {
+        # F5-TTS clones from a reference clip + its transcript (no built-in speaker
+        # presets), like XTTS — the voice comes from the selected voice clip, not
+        # this block. core.py still indexes 'rating'/'languages'/'samplerate'
+        # generically, so the block must exist or the pipeline KeyErrors before TTS
+        # for --tts_engine f5.
+        "languages": {"eng": "en"},  # shipped builds are English (lucasnewman/f5-tts-mlx; SWivid base)
+        "samplerate": 24000,
+        "files": [],  # weights pulled from HF on first use
+        "voices": {},  # clone-only; reference clips come from the voice catalog
+        "rating": {"VRAM": 4, "CPU": 2, "RAM": 4, "Realism": 6}
     }
 }
