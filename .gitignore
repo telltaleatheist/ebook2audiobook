@@ -12,3 +12,6 @@ models/
 # Python build artifacts (e.g. num2words setup.py build output)
 build/
 *.egg-info/
+
+# Runtime TTS session data (written under voices/ during conversion)
+voices/__sessions/
