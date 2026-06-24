@@ -5,3 +5,4 @@ from .fairseq import Fairseq
 from .tacotron import Tacotron2
 from .yourtts import YourTTS
 from .orpheus import Orpheus
+from .voxtral import Voxtral
