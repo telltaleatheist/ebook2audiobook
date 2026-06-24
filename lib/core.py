@@ -1006,8 +1006,14 @@ def filter_chapter(idx:int, doc:EpubHtml, session_id:str, stanza_nlp:Pipeline, i
             msg = f'Flattening as raw text…'
             print(msg)
             # Orpheus: use full max_chars (~250 for English) to keep complete sentences
-            # while staying under audio token limits
-            if tts_engine == 'orpheus':
+            # while staying under audio token limits.
+            # Voxtral is a long-form model (official design point ≈500-char inputs):
+            # rendering one short sentence per generation makes every sentence an
+            # independent "take" with inconsistent prosody. Group into larger chunks
+            # so prosody stays coherent across sentences.
+            if tts_engine == 'voxtral':
+                max_chars = language_mapping[lang]['max_chars'] * 2  # ~500 chars
+            elif tts_engine == 'orpheus':
                 max_chars = language_mapping[lang]['max_chars']  # ~250 chars for English
             else:
                 max_chars = int(language_mapping[lang]['max_chars'] / 1.5)
@@ -1266,8 +1272,12 @@ def get_sentences(text:str, session_id:str)->list|None:
             return None
         lang, tts_engine = session['language'], session['tts_engine']
         # Use full max_chars (~250 for English) - splits at soft punctuation only if needed
-        # This produces better prosody by keeping full sentences together
+        # This produces better prosody by keeping full sentences together.
+        # Voxtral is a long-form model — double the chunk size (~500 chars, its design
+        # point) so multiple sentences render together and prosody stays consistent.
         max_chars = language_mapping[lang]['max_chars']
+        if tts_engine == 'voxtral':
+            max_chars *= 2
 
         assert not SML_TAG_PATTERN.search(text)
 
@@ -1411,6 +1421,21 @@ def get_sentences(text:str, session_id:str)->list|None:
                     joined.append(s)
             return joined
         else:
+            if tts_engine == 'voxtral':
+                # Voxtral is a long-form model: greedily pack adjacent sentences up to
+                # max_chars so each generation spans several sentences. Rendering one
+                # short sentence per call makes every sentence an independent "take"
+                # with inconsistent timbre/prosody — the packing keeps prosody coherent.
+                packed = []
+                for s in final_list:
+                    s = s.strip()
+                    if not s:
+                        continue
+                    if packed and clean_len(packed[-1]) + 1 + clean_len(s) <= max_chars:
+                        packed[-1] = packed[-1].rstrip() + ' ' + s.lstrip()
+                    else:
+                        packed.append(s)
+                return packed
             return final_list
     except Exception as e:
         print(f'get_sentences() error: {e}')

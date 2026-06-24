@@ -57,7 +57,9 @@ class Voxtral(TTSUtils, TTSRegistry, name='voxtral'):
     """
 
     MODEL = 'mistralai/Voxtral-4B-TTS-2603'
-    MLX_MODEL = 'mlx-community/Voxtral-4B-TTS-2603-mlx-4bit'
+    # bf16 (full precision) — 4bit/6bit produced noticeably worse prosody on Mac
+    # MLX; bf16 is the best of the three (~9 GB weights, pulled from HF on first use).
+    MLX_MODEL = 'mlx-community/Voxtral-4B-TTS-2603-mlx-bf16'
     SAMPLE_RATE = 24000
 
     # English-relevant presets (the model also ships de/es/fr/it/nl/pt/hi/ar).
@@ -235,14 +237,31 @@ class Voxtral(TTSUtils, TTSRegistry, name='voxtral'):
         # argument), so a clone request — self.voice is None — falls back to the
         # default preset on this backend. Reference-clip cloning stays on vLLM-omni.
         voice = self.voice or self.DEFAULT_VOICE
+        # Sampling tuned on Apple Silicon bf16: temp 0.35 gave the most natural
+        # prosody in listening tests (0.8 acceptable; 0.5/0.25 degraded badly).
+        # Env-overridable so the BookForge wizard / quick experiments can retune
+        # without code edits (mirrors VOXTRAL_CFG_ALPHA on the vLLM path).
+        temperature = float(os.environ.get('VOXTRAL_TEMPERATURE', '0.35'))
+        top_p = float(os.environ.get('VOXTRAL_TOP_P', '0.9'))
+        top_k = int(os.environ.get('VOXTRAL_TOP_K', '50'))
         chunks = []
-        for result in self.mlx_model.generate(text=text, voice=voice):
+        for result in self.mlx_model.generate(
+            text=text, voice=voice, temperature=temperature, top_p=top_p, top_k=top_k
+        ):
             audio = getattr(result, 'audio', None)
             if audio is not None:
                 chunks.append(np.asarray(audio, dtype=np.float32).reshape(-1))
         if not chunks:
             return np.zeros(int(self.params['samplerate'] * 0.1), dtype=np.float32)
-        return np.concatenate(chunks)
+        audio = np.concatenate(chunks)
+        # mlx-audio's voxtral_tts emits consistently low-amplitude audio (~0.1 peak)
+        # — fully voiced, just quiet. e2a's convert() only attenuates (max>1.0), never
+        # boosts, so without this the assembled book sounds faint/whispery. Peak-
+        # normalize to a normal speech level here (the vLLM-omni path is already hot).
+        peak = float(np.abs(audio).max())
+        if peak > 1e-5:
+            audio = audio / peak * 0.95
+        return audio
 
     def convert(self, sentence_index: int, sentence: str) -> bool:
         try:
@@ -278,8 +297,12 @@ class Voxtral(TTSUtils, TTSRegistry, name='voxtral'):
 
                 audio_tensor = torch.from_numpy(audio_np).float()
                 if audio_tensor.dim() == 1:
+                    # Low threshold: Voxtral's sentence-initial unvoiced consonants
+                    # (th/s/f/h, "Those"/"By"/"An") sit well below 0.01 and were being
+                    # trimmed as silence, clipping the first syllable. 0.002 keeps them
+                    # while still trimming true lead/trail silence.
                     audio_tensor = trim_audio(audio_tensor, self.SAMPLE_RATE,
-                                              silence_threshold=0.01, buffer_sec=0.20)
+                                              silence_threshold=0.002, buffer_sec=0.10)
                     if len(audio_tensor) == 0:
                         audio_tensor = torch.zeros(int(self.SAMPLE_RATE * 0.1))
                     audio_tensor = audio_tensor.unsqueeze(0)
