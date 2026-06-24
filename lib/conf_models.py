@@ -11,7 +11,8 @@ TTS_ENGINES = {
     "FAIRSEQ": "fairseq",
     "TACOTRON2": "tacotron",
     "YOURTTS": "yourtts",
-    "ORPHEUS": "orpheus"
+    "ORPHEUS": "orpheus",
+    "VOXTRAL": "voxtral"
 }
 
 TTS_VOICE_CONVERSION = {
@@ -193,5 +194,25 @@ default_engine_settings = {
         },
         "emotion_tags": ["<laugh>", "<chuckle>", "<sigh>", "<cough>", "<sniffle>", "<groan>", "<yawn>", "<gasp>"],
         "rating": {"VRAM": 8, "CPU": 2, "RAM": 8, "Realism": 6}  # Higher realism than XTTS
+    },
+    TTS_ENGINES['VOXTRAL']: {
+        # Voxtral ships presets in 9 languages; map each to its mlx voice-embedding
+        # prefix. core.get_compatible_tts_engines() reads these keys, and core.py
+        # indexes default_engine_settings[tts_engine]['rating'/'languages'] generically
+        # — without this block the pipeline KeyErrors before TTS for --tts_engine voxtral.
+        "languages": {
+            "eng": "en", "deu": "de", "spa": "es", "fra": "fr", "ita": "it",
+            "nld": "nl", "por": "pt", "hin": "hi", "ara": "ar"
+        },
+        "samplerate": 24000,
+        "files": [],  # weights pulled from HF (mlx-community/Voxtral-4B-TTS-2603-mlx-4bit on Mac)
+        "voices": {
+            "neutral_male": "Neutral (Male)",
+            "neutral_female": "Neutral (Female)",
+            "casual_male": "Casual (Male)",
+            "casual_female": "Casual (Female)",
+            "cheerful_female": "Cheerful (Female)"
+        },
+        "rating": {"VRAM": 8, "CPU": 2, "RAM": 8, "Realism": 7}  # ElevenLabs-class prosody
     }
 }
