@@ -157,9 +157,30 @@ class F5(TTSUtils, TTSRegistry, name='f5'):
 
     def _load_cuda_engine(self):
         # SWivid f5_tts package; F5TTS() loads the default base model + vocoder.
+        self._patch_torchaudio_to_soundfile()
         from f5_tts.api import F5TTS
         print("Loading F5 (CUDA): f5_tts default model")
         return F5TTS()
+
+    @staticmethod
+    def _patch_torchaudio_to_soundfile():
+        """torchaudio 2.x routes load() through torchcodec, which is brittle on
+        Windows (a fragile torch/torchcodec/ffmpeg DLL version match). f5_tts loads
+        the reference clip via torchaudio.load — redirect it to libsndfile
+        (soundfile), which reads wav/flac directly with no ffmpeg/torchcodec.
+        NOTE: with an empty ref_text, f5_tts auto-transcribes via the transformers
+        Whisper pipeline, which ALSO pulls torchcodec — so prefer providing
+        ref_audio_text (resolved in _resolve_reference)."""
+        import torchaudio
+        import soundfile as sf
+        import torch as _torch
+        if getattr(torchaudio.load, '_bf_soundfile', False):
+            return
+        def _sf_load(uri, *args, **kwargs):
+            data, sr = sf.read(str(uri), dtype='float32', always_2d=True)
+            return _torch.from_numpy(data.T.copy()), sr
+        _sf_load._bf_soundfile = True
+        torchaudio.load = _sf_load
 
     # ── generation ───────────────────────────────────────────────────────────
 
