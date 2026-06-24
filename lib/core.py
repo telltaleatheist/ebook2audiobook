@@ -881,6 +881,19 @@ def filter_chapter(idx:int, doc:EpubHtml, session_id:str, stanza_nlp:Pipeline, i
         else:
             return math2words(m, lang, lang_iso1, tts_engine, is_num2words_compat)
 
+    def _date_num_repl(m):
+        # Inside a date span, a bare day-of-month (1-31) is read as an ordinal
+        # ("March 12" -> "March twelfth"), not a cardinal. Years (4-digit) are
+        # already converted above; anything else falls back to _num_repl.
+        s = m.group(0)
+        if re.fullmatch(r"\d{4}", s):
+            return s
+        if s.isdigit() and is_num2words_compat:
+            n = int(s)
+            if 1 <= n <= 31:
+                return num2words(n, to='ordinal', lang=(lang_iso1 or 'en'))
+        return _num_repl(m)
+
     try:
         msg = f'----------\nParsing doc {idx}'
         print(msg)
@@ -1082,8 +1095,8 @@ def filter_chapter(idx:int, doc:EpubHtml, session_id:str, stanza_nlp:Pipeline, i
                                     lambda m: math2words(m.group(), lang, lang_iso1, tts_engine, is_num2words_compat),
                                     processed
                                 )
-                            # 3) convert other numbers (skip 4-digit years)
-                            processed = re_num.sub(_num_repl, processed)
+                            # 3) day-of-month -> ordinal; other numbers -> _num_repl
+                            processed = re_num.sub(_date_num_repl, processed)
                             result.append(processed)
                             last_pos = end
                         result.append(text[last_pos:])
@@ -1104,6 +1117,10 @@ def filter_chapter(idx:int, doc:EpubHtml, session_id:str, stanza_nlp:Pipeline, i
                             lambda m: year2words(m.group(), lang, lang_iso1, is_num2words_compat),
                             text
                         )
+            # year-form ALL remaining 4-digit years (1000-2099), even outside a
+            # stanza-detected date span ("October 1933" -> "nineteen thirty-three").
+            text = re.sub(r"(?<!\d)(1\d{3}|20\d{2})(?!\d)",
+                          lambda m: year2words(m.group(), lang, lang_iso1, is_num2words_compat), text)
             msg = 'Convert romans to numbers…'
             print(msg)
             text = roman2number(text)
