@@ -226,10 +226,23 @@ class Voxtral(TTSUtils, TTSRegistry, name='voxtral'):
         return audio_tensor.float().detach().cpu().numpy()
 
     def _generate_mlx(self, text: str) -> np.ndarray:
-        # Mac path — verify/finish on Apple Silicon.
-        result = self.mlx_model.generate(text=text, voice=self.voice)
-        audio_data = getattr(result, 'audio', result)
-        return np.asarray(audio_data, dtype=np.float32)
+        # Verified on Apple Silicon (M1 Ultra, mlx-audio 0.4.4): voxtral_tts
+        # Model.generate() is a GENERATOR yielding GenerationResult chunks whose
+        # .audio is an mlx array — same pattern as orpheus.py. Concatenate the
+        # chunks into one 24 kHz waveform.
+        #
+        # MLX exposes preset voices only (generate(voice=...) has no reference-audio
+        # argument), so a clone request — self.voice is None — falls back to the
+        # default preset on this backend. Reference-clip cloning stays on vLLM-omni.
+        voice = self.voice or self.DEFAULT_VOICE
+        chunks = []
+        for result in self.mlx_model.generate(text=text, voice=voice):
+            audio = getattr(result, 'audio', None)
+            if audio is not None:
+                chunks.append(np.asarray(audio, dtype=np.float32).reshape(-1))
+        if not chunks:
+            return np.zeros(int(self.params['samplerate'] * 0.1), dtype=np.float32)
+        return np.concatenate(chunks)
 
     def convert(self, sentence_index: int, sentence: str) -> bool:
         try:
