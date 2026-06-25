@@ -598,8 +598,13 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
             # Clean up the sentence for TTS
             sentence = sentence.strip()
 
-            # Strip SML tags that Orpheus doesn't understand (it has its own emotion tags)
-            # E2a uses [break], [pause], [music], [sfx], [silence] etc.
+            # The e2a text pipeline marks logical boundaries — paragraph breaks
+            # (\n\n) and headings/divs — with [pause]/[break] tokens. Capture that
+            # BEFORE stripping so we can lengthen the trailing pause there (Orpheus
+            # has no SML; it uses its own emotion tags, so the tokens are removed).
+            has_logical_pause = bool(
+                re.search(r'\[(?:pause|break|silence)(?::[^\]]+)?\]', sentence, flags=re.IGNORECASE)
+            )
             sentence = re.sub(r'\[(?:break|pause|music|sfx|silence)(?::[^\]]+)?\]', '', sentence, flags=re.IGNORECASE)
             sentence = sentence.strip()
 
@@ -656,6 +661,18 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
                     else:
                         # Audio is all zeros, create minimal silence
                         audio_tensor = torch.zeros(1, int(self.params['samplerate'] * 0.1))
+
+                    # Inter-sentence pause so narration breathes instead of rushing.
+                    # A comfortable base gap on every sentence, and a longer gap at
+                    # logical boundaries the text pipeline flagged with [pause]/[break]
+                    # (paragraph ends, headings). Both tunable via env without a rebuild.
+                    base_gap = float(os.environ.get('ORPHEUS_SENTENCE_GAP', '0.32'))
+                    para_gap = float(os.environ.get('ORPHEUS_PARAGRAPH_GAP', '0.70'))
+                    gap_sec = para_gap if has_logical_pause else base_gap
+                    if gap_sec > 0:
+                        audio_tensor = audio_tensor.cpu()
+                        pad = torch.zeros(1, int(self.params['samplerate'] * gap_sec))
+                        audio_tensor = torch.cat([audio_tensor, pad], dim=1)
 
                     # Save the audio file
                     torchaudio.save(
