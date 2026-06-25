@@ -662,13 +662,18 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
                         # Audio is all zeros, create minimal silence
                         audio_tensor = torch.zeros(1, int(self.params['samplerate'] * 0.1))
 
-                    # Inter-sentence pause so narration breathes instead of rushing.
-                    # A comfortable base gap on every sentence, and a longer gap at
-                    # logical boundaries the text pipeline flagged with [pause]/[break]
-                    # (paragraph ends, headings). Both tunable via env without a rebuild.
-                    base_gap = float(os.environ.get('ORPHEUS_SENTENCE_GAP', '0.32'))
-                    para_gap = float(os.environ.get('ORPHEUS_PARAGRAPH_GAP', '0.70'))
-                    gap_sec = para_gap if has_logical_pause else base_gap
+                    # Inter-sentence pause. Adopt e2a's cross-engine standard: the
+                    # same randomized np.random.uniform(0.3, 0.6) gap that xtts/vits/
+                    # bark/tacotron/fairseq insert after a sentence (randomized so the
+                    # cadence isn't mechanical). A longer gap at logical boundaries the
+                    # text pipeline flagged with [pause]/[break] (paragraph ends,
+                    # headings). Env overrides force a fixed value (0 disables).
+                    _base_env = os.environ.get('ORPHEUS_SENTENCE_GAP')
+                    _para_env = os.environ.get('ORPHEUS_PARAGRAPH_GAP')
+                    if has_logical_pause:
+                        gap_sec = float(_para_env) if _para_env is not None else int(np.random.uniform(0.6, 0.9) * 100) / 100
+                    else:
+                        gap_sec = float(_base_env) if _base_env is not None else int(np.random.uniform(0.3, 0.6) * 100) / 100
                     if gap_sec > 0:
                         audio_tensor = audio_tensor.cpu()
                         pad = torch.zeros(1, int(self.params['samplerate'] * gap_sec))
