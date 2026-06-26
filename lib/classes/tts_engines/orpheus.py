@@ -328,11 +328,21 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
             torch.cuda.reset_peak_memory_stats()
             print("Orpheus: CUDA state cleaned before vLLM init")
 
+        # gpu_memory_utilization: fraction of TOTAL VRAM vLLM reserves for weights
+        # + KV cache. Default 0.70 (not 0.85) because on a desktop the GPU is SHARED
+        # with the Windows compositor / browser / Electron GPU process. At 0.85 vLLM
+        # grabs ~20.4 GiB of 24, leaving too little for the desktop — and when VRAM
+        # is oversubscribed the WDDM driver spills GPU memory into SYSTEM RAM, which
+        # thrashes and maxes both (observed: hard OOM crash). 0.70 ≈ 16.8 GiB still
+        # leaves ample KV cache for batched Orpheus (weights are only ~6.2 GiB).
+        # Override with ORPHEUS_GPU_MEM_UTIL for headless / dedicated-GPU machines.
+        gpu_mem_util = float(os.environ.get('ORPHEUS_GPU_MEM_UTIL', '0.70'))
+        print(f"Orpheus: vLLM gpu_memory_utilization={gpu_mem_util}")
         engine = LLM(
             model=self.TRANSFORMERS_MODEL,
             dtype="float16",
             max_model_len=4096,
-            gpu_memory_utilization=0.85,
+            gpu_memory_utilization=gpu_mem_util,
             enforce_eager=use_eager,
         )
         self._device = 'cuda'
