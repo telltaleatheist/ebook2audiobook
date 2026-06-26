@@ -713,9 +713,11 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
         vLLM is built to run many prompts at once: batching is faster (real
         concurrency) AND collapses tens of thousands of single-prompt calls into
         ~len(book)/BATCH_SIZE calls, which avoids the steady host-RAM growth the
-        per-call path caused over a long book. Non-vLLM backends (MLX/transformers)
-        fall back to per-item convert().
+        per-call path caused over a long book. MLX has its own batched path
+        (_convert_mlx_batch); transformers falls back to per-item convert().
         """
+        if self.backend == 'mlx' and self.mlx_model:
+            return self._convert_mlx_batch(items)
         if self.backend != 'vllm' or not self.engine:
             return [self.convert(idx, s) for idx, s in items]
         try:
@@ -757,6 +759,95 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
             return [results.get(idx, False) for idx, _ in items]
         except Exception as e:
             print(f'Orpheus.convert_batch() error: {e}')
+            import traceback
+            traceback.print_exc()
+            # A batch-level failure shouldn't lose the whole chunk — retry per item.
+            return [self.convert(idx, s) for idx, s in items]
+
+    def _convert_mlx_batch(self, items: list) -> list:
+        """Batched MLX decode via mlx_lm.BatchGenerator (Mac).
+
+        items: list of (sentence_index, sentence). Returns list[bool] aligned to items.
+
+        Mirrors the vLLM batch path — same per-item clean / _has_logical_pause /
+        _write_silence handling and _save_audio finalize (so inter-sentence and
+        paragraph pauses are preserved) — but drives ONE continuous-batching
+        generate over the whole chunk instead of len(chunk) single-prompt calls.
+
+        mlx_lm.BatchGenerator handles left-padding, a per-row BatchKVCache, and
+        per-row stop tokens; insert() takes pre-tokenized prompts, which Orpheus
+        needs (custom special-token prompts, not plain text). Audio is then
+        reconstructed per row exactly as llama.py generate() does for the
+        non-streaming path: parse_output(prompt+generated) -> decode_audio_from_codes.
+
+        Memory stays bounded: the bf16 weights (~6 GB) dominate, so the batched
+        KV cache + activations add little — peak RSS is roughly flat across batch
+        sizes (measured ~10 GB at B=16 on M1 Ultra, ~3.6x throughput vs per-item).
+        Sampling matches the single-seq MLX path (_generate_mlx): temp 0.6,
+        top_p 0.9, repetition_penalty 1.1.
+        """
+        try:
+            import numpy as np
+            import mlx.core as mx
+            from mlx_lm.generate import BatchGenerator
+            from mlx_lm.sample_utils import make_sampler, make_logits_processors
+            from mlx_audio.tts.models.llama.llama import decode_audio_from_codes
+
+            results = {}
+            gen = []  # (idx, prompt_tokens, has_logical_pause) for non-empty sentences
+            for idx, sentence in items:
+                has_pause = self._has_logical_pause(sentence)
+                clean = self._clean_sentence_for_tts(sentence)
+                if not clean:
+                    results[idx] = self._write_silence(idx)
+                else:
+                    # prepare_input_ids prepends "voice: " itself; pass voice, not a
+                    # pre-formatted string. Single-string call returns a [1, T] array.
+                    ptoks = self.mlx_model.prepare_input_ids(clean, self.voice)[0].tolist()
+                    gen.append((idx, ptoks, has_pause))
+
+            if gen:
+                bg = BatchGenerator(
+                    self.mlx_model,
+                    max_tokens=2048,
+                    stop_tokens={self.END_OF_AUDIO_TOKEN},
+                    sampler=make_sampler(0.6, top_p=0.9),
+                    logits_processors=make_logits_processors(None, 1.1, 20),
+                    completion_batch_size=len(gen),
+                    prefill_batch_size=len(gen),
+                )
+                uids = bg.insert([list(p) for _, p, _ in gen])
+                out = {u: [] for u in uids}
+                while responses := bg.next():
+                    for r in responses:
+                        if r.finish_reason != 'stop':  # stop token (128258) is dropped
+                            out[r.uid].append(r.token)
+                bg.close()
+                # uids come back in insert order == gen order.
+                for (idx, ptoks, has_pause), uid in zip(gen, uids):
+                    try:
+                        ids = mx.array([ptoks + out[uid]])
+                        code_lists = self.mlx_model.parse_output(ids)
+                        if code_lists and len(code_lists[0]) > 0:
+                            audio = np.array(
+                                decode_audio_from_codes(code_lists[0])[0], dtype=np.float32
+                            )
+                        else:
+                            audio = np.zeros(int(self.SAMPLE_RATE * 0.1), dtype=np.float32)
+                        results[idx] = self._save_audio(idx, audio, has_pause)
+                    except Exception as decode_err:
+                        print(f"Orpheus MLX batch decode error for sentence {idx}: {decode_err}")
+                        results[idx] = False
+
+            # Bound MLX's reclaimable scratch pool between chunks (mlx_audio's own
+            # generate() does this per segment). Active memory is already flat —
+            # the weights dominate — but this keeps the cache pool from sitting
+            # large on a machine running other apps.
+            mx.clear_cache()
+            self._cleanup_memory()
+            return [results.get(idx, False) for idx, _ in items]
+        except Exception as e:
+            print(f'Orpheus._convert_mlx_batch() error: {e}')
             import traceback
             traceback.print_exc()
             # A batch-level failure shouldn't lose the whole chunk — retry per item.
