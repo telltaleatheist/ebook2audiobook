@@ -340,39 +340,84 @@ def run_worker_tts(
         skipped = 0
         start_time = time.time()
 
-        for i in range(sentence_start, sentence_end + 1):
-            # Check if already exists (for resume)
-            output_file = os.path.join(session['sentences_dir'], f'{i}.{default_audio_proc_format}')
-            if os.path.exists(output_file) and os.path.getsize(output_file) > 1024:
-                skipped += 1
+        # Batched path: engines like Orpheus (vLLM) convert many sentences in one
+        # call — faster, and it avoids the host-RAM creep of tens of thousands of
+        # single-prompt calls. We still emit ONE "Converting sentence" line per
+        # sentence so BookForge's stdout progress counter stays accurate.
+        use_batch = tts_manager.supports_batch and tts_manager.batch_size > 1
+        if use_batch:
+            batch_size = tts_manager.batch_size
+            print(f"[WORKER] Batched inference enabled (batch size {batch_size})")
+            first_logged = False
+            pending = []  # (sentence_index, sentence)
+
+            def _flush_batch():
+                nonlocal processed, first_logged
+                if not pending:
+                    return
+                results = tts_manager.convert_sentences_batch(pending)
+                for (idx, _), ok in zip(pending, results):
+                    if not ok:
+                        print(f"[WORKER] Warning: Failed to convert sentence {idx}")
+                    processed += 1
+                    progress_pct = (processed / total_to_process) * 100
+                    print(f"Converting sentence {idx}/{total_sentences} ({progress_pct:.1f}%)")
+                    if not first_logged:
+                        log_memory("After first sentence TTS")
+                        first_logged = True
+                pending.clear()
+
+            for i in range(sentence_start, sentence_end + 1):
+                # Skip already-rendered (resume) and empty sentences — same as the
+                # per-sentence path; empties never reach the batch.
+                output_file = os.path.join(session['sentences_dir'], f'{i}.{default_audio_proc_format}')
+                if os.path.exists(output_file) and os.path.getsize(output_file) > 1024:
+                    skipped += 1
+                    processed += 1
+                    continue
+                sentence = all_sentences[i]
+                if not sentence or not sentence.strip():
+                    skipped += 1
+                    processed += 1
+                    continue
+                pending.append((i, sentence))
+                if len(pending) >= batch_size:
+                    _flush_batch()
+            _flush_batch()
+        else:
+            for i in range(sentence_start, sentence_end + 1):
+                # Check if already exists (for resume)
+                output_file = os.path.join(session['sentences_dir'], f'{i}.{default_audio_proc_format}')
+                if os.path.exists(output_file) and os.path.getsize(output_file) > 1024:
+                    skipped += 1
+                    processed += 1
+                    continue
+
+                sentence = all_sentences[i]
+                if not sentence or not sentence.strip():
+                    # Empty sentence - create silence
+                    skipped += 1
+                    processed += 1
+                    continue
+
+                # Show progress (global sentence position)
+                progress_pct = (processed / total_to_process) * 100
+                print(f"Converting sentence {i}/{total_sentences} ({progress_pct:.1f}%)")
+
+                # Convert sentence to audio
+                success = tts_manager.convert_sentence2audio(i, sentence)
+                if not success:
+                    print(f"[WORKER] Warning: Failed to convert sentence {i}")
+                    # Continue anyway - some sentences may fail
+
                 processed += 1
-                continue
 
-            sentence = all_sentences[i]
-            if not sentence or not sentence.strip():
-                # Empty sentence - create silence
-                skipped += 1
-                processed += 1
-                continue
+                # Log memory after first sentence
+                if processed == 1:
+                    log_memory("After first sentence TTS")
 
-            # Show progress (global sentence position)
-            progress_pct = (processed / total_to_process) * 100
-            print(f"Converting sentence {i}/{total_sentences} ({progress_pct:.1f}%)")
-
-            # Convert sentence to audio
-            success = tts_manager.convert_sentence2audio(i, sentence)
-            if not success:
-                print(f"[WORKER] Warning: Failed to convert sentence {i}")
-                # Continue anyway - some sentences may fail
-
-            processed += 1
-
-            # Log memory after first sentence
-            if processed == 1:
-                log_memory("After first sentence TTS")
-
-            # Periodic memory cleanup (every 10 sentences for MPS memory pressure)
-            memory_cleanup(processed, interval=10)
+                # Periodic memory cleanup (every 10 sentences for MPS memory pressure)
+                memory_cleanup(processed, interval=10)
 
         elapsed = time.time() - start_time
         actual_converted = processed - skipped

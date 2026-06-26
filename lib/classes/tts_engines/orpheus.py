@@ -88,6 +88,14 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
     TRANSFORMERS_MODEL = "unsloth/orpheus-3b-0.1-ft"
     SAMPLE_RATE = 24000
 
+    # Batched inference (vLLM): feed many prompts to ONE engine.generate() call.
+    # This is how vLLM is meant to be driven — it's faster (real batching) AND
+    # avoids the host-RAM creep from tens of thousands of single-prompt calls over
+    # a long book. The worker (worker_core) honors SUPPORTS_BATCH/BATCH_SIZE.
+    # Override the size with ORPHEUS_BATCH_SIZE.
+    SUPPORTS_BATCH = True
+    BATCH_SIZE = int(os.environ.get('ORPHEUS_BATCH_SIZE', '16'))
+
     # Special token IDs
     END_OF_AUDIO_TOKEN = 128258
 
@@ -583,138 +591,166 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
         audio_np = audio.squeeze().cpu().numpy()
         return audio_np
 
+    def _sentence_file(self, sentence_index: int) -> str:
+        return os.path.join(self.session['sentences_dir'], f'{sentence_index}.{default_audio_proc_format}')
+
+    def _clean_sentence_for_tts(self, sentence: str) -> str:
+        """Strip whitespace + the e2a SML tags Orpheus doesn't understand
+        ([break]/[pause]/[music]/[sfx]/[silence]); Orpheus has its own emotion tags."""
+        sentence = (sentence or '').strip()
+        sentence = re.sub(r'\[(?:break|pause|music|sfx|silence)(?::[^\]]+)?\]', '', sentence, flags=re.IGNORECASE)
+        return sentence.strip()
+
+    def _has_logical_pause(self, sentence: str) -> bool:
+        """True when the e2a text pipeline flagged a logical boundary (paragraph
+        break / heading) on this sentence with a [pause]/[break]/[silence] token.
+        Checked on the RAW sentence, before _clean_sentence_for_tts strips them."""
+        return bool(re.search(r'\[(?:pause|break|silence)(?::[^\]]+)?\]', sentence or '', flags=re.IGNORECASE))
+
+    def _write_silence(self, sentence_index: int) -> bool:
+        """Write a tiny silent clip for an empty sentence."""
+        silence = torch.zeros(1, int(self.params['samplerate'] * 0.1))
+        torchaudio.save(self._sentence_file(sentence_index), silence,
+                        self.params['samplerate'], format=default_audio_proc_format)
+        return True
+
+    def _save_audio(self, sentence_index: int, audio_np, has_logical_pause: bool = False) -> bool:
+        """Trim trailing silence, normalize, append an inter-sentence pause, and
+        write a decoded waveform to the sentence file. Shared by convert() and
+        convert_batch()."""
+        if audio_np is None or len(audio_np) == 0:
+            print(f"Orpheus returned no audio data for sentence {sentence_index}")
+            return False
+        final_sentence_file = self._sentence_file(sentence_index)
+        audio_tensor = torch.from_numpy(audio_np).float()
+        # Trim trailing silence (Orpheus tends to add long end pauses); keep 200ms buffer.
+        if audio_tensor.dim() == 1:
+            audio_tensor = trim_audio(audio_tensor, self.SAMPLE_RATE, silence_threshold=0.01, buffer_sec=0.20)
+            if len(audio_tensor) == 0:
+                audio_tensor = torch.zeros(int(self.SAMPLE_RATE * 0.1))
+        if audio_tensor.dim() == 1:
+            audio_tensor = audio_tensor.unsqueeze(0)
+        # Normalize to prevent clipping
+        max_val = audio_tensor.abs().max()
+        if max_val > 0:
+            if max_val > 1.0:
+                audio_tensor = audio_tensor / max_val * 0.95
+        else:
+            audio_tensor = torch.zeros(1, int(self.params['samplerate'] * 0.1))
+        # Inter-sentence pause so narration breathes instead of rushing. Adopt
+        # e2a's cross-engine standard: a randomized np.random.uniform(0.3, 0.6) gap
+        # (xtts/vits/bark/tacotron/fairseq all use this), and a longer 0.6-0.9s gap
+        # at logical boundaries the text pipeline flagged with [pause]/[break]
+        # (paragraph ends, headings). Env overrides force a fixed value (0 disables).
+        _base_env = os.environ.get('ORPHEUS_SENTENCE_GAP')
+        _para_env = os.environ.get('ORPHEUS_PARAGRAPH_GAP')
+        if has_logical_pause:
+            gap_sec = float(_para_env) if _para_env is not None else int(np.random.uniform(0.6, 0.9) * 100) / 100
+        else:
+            gap_sec = float(_base_env) if _base_env is not None else int(np.random.uniform(0.3, 0.6) * 100) / 100
+        if gap_sec > 0:
+            audio_tensor = audio_tensor.cpu()
+            pad = torch.zeros(1, int(self.params['samplerate'] * gap_sec))
+            audio_tensor = torch.cat([audio_tensor, pad], dim=1)
+        torchaudio.save(final_sentence_file, audio_tensor.cpu(),
+                        self.params['samplerate'], format=default_audio_proc_format)
+        del audio_tensor
+        if os.path.exists(final_sentence_file):
+            return True
+        print(f"Failed to create {final_sentence_file}")
+        return False
+
     def convert(self, sentence_index: int, sentence: str) -> bool:
         try:
             if not self.engine:
-                error = "Orpheus TTS engine not loaded!"
-                print(error)
+                print("Orpheus TTS engine not loaded!")
                 return False
 
-            final_sentence_file = os.path.join(
-                self.session['sentences_dir'],
-                f'{sentence_index}.{default_audio_proc_format}'
-            )
-
-            # Clean up the sentence for TTS
-            sentence = sentence.strip()
-
-            # The e2a text pipeline marks logical boundaries — paragraph breaks
-            # (\n\n) and headings/divs — with [pause]/[break] tokens. Capture that
-            # BEFORE stripping so we can lengthen the trailing pause there (Orpheus
-            # has no SML; it uses its own emotion tags, so the tokens are removed).
-            has_logical_pause = bool(
-                re.search(r'\[(?:pause|break|silence)(?::[^\]]+)?\]', sentence, flags=re.IGNORECASE)
-            )
-            sentence = re.sub(r'\[(?:break|pause|music|sfx|silence)(?::[^\]]+)?\]', '', sentence, flags=re.IGNORECASE)
-            sentence = sentence.strip()
-
-            if not sentence:
-                # Create a tiny silent audio file for empty sentences
-                silence = torch.zeros(1, int(self.params['samplerate'] * 0.1))
-                torchaudio.save(
-                    final_sentence_file,
-                    silence,
-                    self.params['samplerate'],
-                    format=default_audio_proc_format
-                )
-                return True
+            has_pause = self._has_logical_pause(sentence)
+            clean = self._clean_sentence_for_tts(sentence)
+            if not clean:
+                return self._write_silence(sentence_index)
 
             try:
-                # Generate audio based on backend
                 if self.backend == 'mlx':
-                    # MLX handles everything internally
-                    audio_np = self._generate_mlx(sentence)
+                    audio_np = self._generate_mlx(clean)
+                elif self.backend == 'vllm':
+                    audio_np = self._tokens_to_audio(self._generate_tokens_vllm(clean))
                 else:
-                    # vLLM and transformers use token generation + SNAC decoding
-                    if self.backend == 'vllm':
-                        # vLLM needs special token formatting
-                        tokens = self._generate_tokens_vllm(sentence)
-                    else:
-                        # Transformers uses simple prompt format
-                        prompt = f"{self.voice}: {sentence}"
-                        tokens = self._generate_tokens_transformers(prompt)
-
-                    audio_np = self._tokens_to_audio(tokens)
-
-                if audio_np is not None and len(audio_np) > 0:
-                    # Convert to tensor format for saving
-                    audio_tensor = torch.from_numpy(audio_np).float()
-
-                    # Trim trailing silence (Orpheus tends to add long pauses at end)
-                    # Use moderate threshold to catch obvious silence
-                    # Keep 200ms buffer for natural inter-sentence pauses
-                    if audio_tensor.dim() == 1:
-                        audio_tensor = trim_audio(audio_tensor, self.SAMPLE_RATE, silence_threshold=0.01, buffer_sec=0.20)
-                        if len(audio_tensor) == 0:
-                            # If trimming removed everything, use minimal silence
-                            audio_tensor = torch.zeros(int(self.SAMPLE_RATE * 0.1))
-
-                    # Ensure proper shape (1, samples) for torchaudio
-                    if audio_tensor.dim() == 1:
-                        audio_tensor = audio_tensor.unsqueeze(0)
-
-                    # Normalize audio to prevent clipping
-                    max_val = audio_tensor.abs().max()
-                    if max_val > 0:
-                        if max_val > 1.0:
-                            audio_tensor = audio_tensor / max_val * 0.95
-                    else:
-                        # Audio is all zeros, create minimal silence
-                        audio_tensor = torch.zeros(1, int(self.params['samplerate'] * 0.1))
-
-                    # Inter-sentence pause. Adopt e2a's cross-engine standard: the
-                    # same randomized np.random.uniform(0.3, 0.6) gap that xtts/vits/
-                    # bark/tacotron/fairseq insert after a sentence (randomized so the
-                    # cadence isn't mechanical). A longer gap at logical boundaries the
-                    # text pipeline flagged with [pause]/[break] (paragraph ends,
-                    # headings). Env overrides force a fixed value (0 disables).
-                    _base_env = os.environ.get('ORPHEUS_SENTENCE_GAP')
-                    _para_env = os.environ.get('ORPHEUS_PARAGRAPH_GAP')
-                    if has_logical_pause:
-                        gap_sec = float(_para_env) if _para_env is not None else int(np.random.uniform(0.6, 0.9) * 100) / 100
-                    else:
-                        gap_sec = float(_base_env) if _base_env is not None else int(np.random.uniform(0.3, 0.6) * 100) / 100
-                    if gap_sec > 0:
-                        audio_tensor = audio_tensor.cpu()
-                        pad = torch.zeros(1, int(self.params['samplerate'] * gap_sec))
-                        audio_tensor = torch.cat([audio_tensor, pad], dim=1)
-
-                    # Save the audio file
-                    torchaudio.save(
-                        final_sentence_file,
-                        audio_tensor.cpu(),
-                        self.params['samplerate'],
-                        format=default_audio_proc_format
+                    audio_np = self._tokens_to_audio(
+                        self._generate_tokens_transformers(f"{self.voice}: {clean}")
                     )
-
-                    # Cleanup
-                    del audio_tensor
-                    self._cleanup_memory()
-
-                    if os.path.exists(final_sentence_file):
-                        return True
-                    else:
-                        error = f"Failed to create {final_sentence_file}"
-                        print(error)
-                        return False
-                else:
-                    error = f"Orpheus returned no audio data for sentence {sentence_index}"
-                    print(error)
-                    return False
-
+                ok = self._save_audio(sentence_index, audio_np, has_pause)
+                self._cleanup_memory()
+                return ok
             except Exception as gen_error:
-                error = f"Orpheus generation error for sentence {sentence_index}: {gen_error}"
-                print(error)
+                print(f"Orpheus generation error for sentence {sentence_index}: {gen_error}")
                 import traceback
                 traceback.print_exc()
                 return False
 
         except Exception as e:
-            error = f'Orpheus.convert() error: {e}'
-            print(error)
+            print(f'Orpheus.convert() error: {e}')
             import traceback
             traceback.print_exc()
             return False
+
+    def convert_batch(self, items: list) -> list:
+        """Convert many sentences in ONE vLLM generate() call.
+
+        items: list of (sentence_index, sentence). Returns list[bool] aligned to items.
+
+        vLLM is built to run many prompts at once: batching is faster (real
+        concurrency) AND collapses tens of thousands of single-prompt calls into
+        ~len(book)/BATCH_SIZE calls, which avoids the steady host-RAM growth the
+        per-call path caused over a long book. Non-vLLM backends (MLX/transformers)
+        fall back to per-item convert().
+        """
+        if self.backend != 'vllm' or not self.engine:
+            return [self.convert(idx, s) for idx, s in items]
+        try:
+            from vllm import SamplingParams
+
+            results = {}
+            gen = []  # (idx, formatted_prompt, has_logical_pause) for non-empty sentences
+            for idx, sentence in items:
+                has_pause = self._has_logical_pause(sentence)
+                clean = self._clean_sentence_for_tts(sentence)
+                if not clean:
+                    results[idx] = self._write_silence(idx)
+                else:
+                    gen.append((idx, self._format_prompt_with_special_tokens(clean), has_pause))
+
+            if gen:
+                sampling_params = SamplingParams(
+                    temperature=0.6, top_p=0.8, repetition_penalty=1.1,
+                    max_tokens=2048, stop_token_ids=[self.END_OF_AUDIO_TOKEN]
+                )
+                prompts = [fp for _, fp, _ in gen]
+                # use_tqdm=False: a per-call progress bar adds overhead and noise.
+                try:
+                    outputs = self.engine.generate(prompts, sampling_params, use_tqdm=False)
+                except TypeError:
+                    outputs = self.engine.generate(prompts, sampling_params)
+                # vLLM returns outputs in the same order as prompts.
+                for (idx, _, has_pause), out in zip(gen, outputs):
+                    try:
+                        tokens = list(out.outputs[0].token_ids)
+                        if self.END_OF_AUDIO_TOKEN in tokens:
+                            tokens = tokens[:tokens.index(self.END_OF_AUDIO_TOKEN)]
+                        results[idx] = self._save_audio(idx, self._tokens_to_audio(tokens), has_pause)
+                    except Exception as decode_err:
+                        print(f"Orpheus batch decode error for sentence {idx}: {decode_err}")
+                        results[idx] = False
+
+            self._cleanup_memory()
+            return [results.get(idx, False) for idx, _ in items]
+        except Exception as e:
+            print(f'Orpheus.convert_batch() error: {e}')
+            import traceback
+            traceback.print_exc()
+            # A batch-level failure shouldn't lose the whole chunk — retry per item.
+            return [self.convert(idx, s) for idx, s in items]
 
     def create_vtt(self, all_sentences: list) -> bool:
         """Generate VTT subtitle file from sentences."""
