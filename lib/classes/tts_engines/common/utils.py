@@ -237,13 +237,31 @@ class TTSUtils:
                             print('XTTS: DeepSpeed inference ENABLED')
                         except Exception as ds_err:
                             print(f'XTTS: DeepSpeed requested but unavailable ({ds_err}); using standard inference')
-                    engine.load_checkpoint(
-                        config,
-                        checkpoint_path = checkpoint_path,
-                        vocab_path = vocab_path,
-                        use_deepspeed = use_deepspeed,
-                        eval = True
-                    )
+                    try:
+                        engine.load_checkpoint(
+                            config,
+                            checkpoint_path = checkpoint_path,
+                            vocab_path = vocab_path,
+                            use_deepspeed = use_deepspeed,
+                            eval = True
+                        )
+                    except Exception as ds_load_err:
+                        if not use_deepspeed:
+                            raise
+                        # DeepSpeed imported but failed at load time — most often the
+                        # prebuilt transformer_inference CUDA op isn't compatible with
+                        # this GPU's compute arch. Only USE DeepSpeed when the system is
+                        # actually compatible: fall back to standard XTTS on a fresh
+                        # engine rather than failing the whole render.
+                        print(f'XTTS: DeepSpeed load failed ({ds_load_err}); falling back to standard inference')
+                        engine = Xtts.init_from_config(config)
+                        engine.load_checkpoint(
+                            config,
+                            checkpoint_path = checkpoint_path,
+                            vocab_path = vocab_path,
+                            use_deepspeed = False,
+                            eval = True
+                        )
                 if engine:
                     vram_dict = VRAMDetector().detect_vram(self.session['device'], self.session['script_mode'])
                     self.session['free_vram_gb'] = vram_dict.get('free_vram_gb', 0)
