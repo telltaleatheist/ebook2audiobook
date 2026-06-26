@@ -223,10 +223,25 @@ class TTSUtils:
                     config.models_dir = os.path.join('models','tts')
                     config.load_json(config_path)
                     engine = Xtts.init_from_config(config)
+                    # Optional DeepSpeed-Inference acceleration of XTTS's autoregressive
+                    # GPT decoder (the slow part). Opt-in via XTTS_USE_DEEPSPEED=1 — it is
+                    # NOT quantization (runs fp16 with fused kernels, same math) but needs
+                    # deepspeed installed + buildable CUDA ops. Default off, and we degrade
+                    # gracefully to standard inference if deepspeed is missing/unbuildable
+                    # so a bad env never breaks XTTS.
+                    use_deepspeed = False
+                    if os.environ.get('XTTS_USE_DEEPSPEED', '0') == '1':
+                        try:
+                            import deepspeed  # noqa: F401
+                            use_deepspeed = True
+                            print('XTTS: DeepSpeed inference ENABLED')
+                        except Exception as ds_err:
+                            print(f'XTTS: DeepSpeed requested but unavailable ({ds_err}); using standard inference')
                     engine.load_checkpoint(
                         config,
                         checkpoint_path = checkpoint_path,
                         vocab_path = vocab_path,
+                        use_deepspeed = use_deepspeed,
                         eval = True
                     )
                 if engine:
