@@ -463,6 +463,67 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
 
         return audio_np
 
+    def _generate_mlx_batch_audio(self, texts: list) -> list:
+        """Batch-generate raw audio for many (already-cleaned) sentences in ONE
+        MLX BatchGenerator pass — continuous batching, ~3.6x the per-sentence
+        throughput. Returns float32 waveforms aligned to `texts` (None for an
+        empty/failed item).
+
+        In-memory sibling of _convert_mlx_batch's core (which writes WAVs): the
+        streaming server uses this to generate a whole paragraph's sentences in
+        parallel so MLX stays ahead of playback instead of dribbling one slow
+        sentence at a time. MLX backend only.
+        """
+        import numpy as np
+        import mlx.core as mx
+        from mlx_lm.generate import BatchGenerator
+        from mlx_lm.sample_utils import make_sampler, make_logits_processors
+        from mlx_audio.tts.models.llama.llama import decode_audio_from_codes
+
+        results = [None] * len(texts)
+        gen = []  # (index, prompt_tokens) for non-empty sentences
+        for i, t in enumerate(texts):
+            clean = (t or '').strip()
+            if clean:
+                ptoks = self.mlx_model.prepare_input_ids(clean, self.voice)[0].tolist()
+                gen.append((i, ptoks))
+
+        if not gen:
+            return results
+        try:
+            bg = BatchGenerator(
+                self.mlx_model,
+                max_tokens=2048,
+                stop_tokens={self.END_OF_AUDIO_TOKEN},
+                sampler=make_sampler(0.6, top_p=0.9),
+                logits_processors=make_logits_processors(None, 1.1, 20),
+                completion_batch_size=len(gen),
+                prefill_batch_size=len(gen),
+            )
+            uids = bg.insert([list(p) for _, p in gen])
+            out = {u: [] for u in uids}
+            while responses := bg.next():
+                for r in responses:
+                    if r.finish_reason != 'stop':  # stop token (128258) is dropped
+                        out[r.uid].append(r.token)
+            bg.close()
+            for (i, ptoks), uid in zip(gen, uids):
+                try:
+                    ids = mx.array([ptoks + out[uid]])
+                    code_lists = self.mlx_model.parse_output(ids)
+                    if code_lists and len(code_lists[0]) > 0:
+                        results[i] = np.array(
+                            decode_audio_from_codes(code_lists[0])[0], dtype=np.float32
+                        )
+                except Exception as decode_err:
+                    print(f"Orpheus _generate_mlx_batch_audio decode error [{i}]: {decode_err}")
+            mx.clear_cache()
+        except Exception as e:
+            print(f"Orpheus._generate_mlx_batch_audio() error: {e}")
+            import traceback
+            traceback.print_exc()
+        return results
+
     def _format_prompt_with_special_tokens(self, text: str) -> str:
         """Format prompt with Orpheus special tokens for audio generation.
 
