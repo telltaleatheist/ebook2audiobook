@@ -611,11 +611,62 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
         sentence = re.sub(r'\[(?:break|pause|music|sfx|silence)(?::[^\]]+)?\]', '', sentence, flags=re.IGNORECASE)
         return sentence.strip()
 
-    def _has_logical_pause(self, sentence: str) -> bool:
-        """True when the e2a text pipeline flagged a logical boundary (paragraph
-        break / heading) on this sentence with a [pause]/[break]/[silence] token.
-        Checked on the RAW sentence, before _clean_sentence_for_tts strips them."""
-        return bool(re.search(r'\[(?:pause|break|silence)(?::[^\]]+)?\]', sentence or '', flags=re.IGNORECASE))
+    def _classify_gap(self, sentence: str):
+        """Decide the inter-clip silence for this sentence from the e2a SML tokens
+        it carries, matching the cross-engine standard in common/utils.py
+        (_convert_sml). Returns (gap_seconds, position):
+
+          [pause] / [pause:X]  -> SECTION gap: explicit X, else 1.0-1.6s. Marks
+                                  blank-line / heading / <div> boundaries.
+          [break] / [silence]  -> PARAGRAPH gap: 0.5-0.7s. Marks <p>/<br> ends.
+          (no token)           -> SENTENCE gap: ~0.30s, so Orpheus breathes
+                                  instead of rushing.
+
+        Why three tiers and not the old binary [break]==[pause]: the standard
+        treats [break] as a SHORT gap and [pause] as the LONG one. Lumping them
+        meant every <p>/<br>/<span> [break] got a long 0.6-0.9s gap — long pauses
+        in odd places. Now [break] is a modest paragraph gap and only [pause]
+        (rare, real section breaks) is long.
+
+        position is 'lead' when the boundary token sits at the START of the
+        sentence (the gap belongs BEFORE this clip — e.g. the first sentence of a
+        new paragraph) or 'trail' otherwise (gap AFTER this clip). Checked on the
+        RAW sentence, before _clean_sentence_for_tts strips the tokens.
+        Env overrides (a fixed value, 0 disables): ORPHEUS_SENTENCE_GAP,
+        ORPHEUS_PARAGRAPH_GAP, ORPHEUS_SECTION_GAP.
+        """
+        raw = (sentence or '').strip()
+        lowered = raw.lower()
+
+        def _env(name):
+            v = os.environ.get(name)
+            return float(v) if v is not None else None
+
+        # Section pause ([pause] / [pause:X]) — the strong, long boundary.
+        m = re.search(r'\[pause(?::([0-9.]+))?\]', raw, flags=re.IGNORECASE)
+        if m:
+            override = _env('ORPHEUS_SECTION_GAP')
+            if override is not None:
+                gap = override
+            elif m.group(1):
+                gap = float(m.group(1))               # honor an explicit [pause:1.4]
+            else:
+                gap = int(np.random.uniform(1.0, 1.6) * 100) / 100
+            pos = 'lead' if lowered.startswith('[pause') else 'trail'
+            return gap, pos
+
+        # Paragraph break ([break] / [silence]) — modest gap.
+        m = re.search(r'\[(?:break|silence)(?::[^\]]+)?\]', raw, flags=re.IGNORECASE)
+        if m:
+            override = _env('ORPHEUS_PARAGRAPH_GAP')
+            gap = override if override is not None else int(np.random.uniform(0.5, 0.7) * 100) / 100
+            pos = 'lead' if re.match(r'\[(?:break|silence)', lowered) else 'trail'
+            return gap, pos
+
+        # Plain sentence end — short breathing gap.
+        override = _env('ORPHEUS_SENTENCE_GAP')
+        gap = override if override is not None else int(np.random.uniform(0.25, 0.35) * 100) / 100
+        return gap, 'trail'
 
     def _write_silence(self, sentence_index: int) -> bool:
         """Write a tiny silent clip for an empty sentence."""
@@ -624,10 +675,12 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
                         self.params['samplerate'], format=default_audio_proc_format)
         return True
 
-    def _save_audio(self, sentence_index: int, audio_np, has_logical_pause: bool = False) -> bool:
-        """Trim trailing silence, normalize, append an inter-sentence pause, and
-        write a decoded waveform to the sentence file. Shared by convert() and
-        convert_batch()."""
+    def _save_audio(self, sentence_index: int, audio_np, gap_sec: float = 0.3, gap_pos: str = 'trail') -> bool:
+        """Trim trailing silence, normalize, add the inter-clip pause, and write a
+        decoded waveform to the sentence file. Shared by convert() and
+        convert_batch(). gap_sec/gap_pos come from _classify_gap(): a 'trail' gap
+        is appended after the speech, a 'lead' gap is prepended before it (so a
+        boundary at the start of a new paragraph lands at the right place)."""
         if audio_np is None or len(audio_np) == 0:
             print(f"Orpheus returned no audio data for sentence {sentence_index}")
             return False
@@ -647,21 +700,14 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
                 audio_tensor = audio_tensor / max_val * 0.95
         else:
             audio_tensor = torch.zeros(1, int(self.params['samplerate'] * 0.1))
-        # Inter-sentence pause so narration breathes instead of rushing. Adopt
-        # e2a's cross-engine standard: a randomized np.random.uniform(0.3, 0.6) gap
-        # (xtts/vits/bark/tacotron/fairseq all use this), and a longer 0.6-0.9s gap
-        # at logical boundaries the text pipeline flagged with [pause]/[break]
-        # (paragraph ends, headings). Env overrides force a fixed value (0 disables).
-        _base_env = os.environ.get('ORPHEUS_SENTENCE_GAP')
-        _para_env = os.environ.get('ORPHEUS_PARAGRAPH_GAP')
-        if has_logical_pause:
-            gap_sec = float(_para_env) if _para_env is not None else int(np.random.uniform(0.6, 0.9) * 100) / 100
-        else:
-            gap_sec = float(_base_env) if _base_env is not None else int(np.random.uniform(0.3, 0.6) * 100) / 100
-        if gap_sec > 0:
+        # Inter-clip silence (tier + duration decided by _classify_gap, matching
+        # e2a's standard SML semantics). 'lead' prepends it before the speech so a
+        # boundary opening a new paragraph isn't placed one sentence too late.
+        if gap_sec and gap_sec > 0:
             audio_tensor = audio_tensor.cpu()
             pad = torch.zeros(1, int(self.params['samplerate'] * gap_sec))
-            audio_tensor = torch.cat([audio_tensor, pad], dim=1)
+            audio_tensor = torch.cat([pad, audio_tensor], dim=1) if gap_pos == 'lead' \
+                else torch.cat([audio_tensor, pad], dim=1)
         torchaudio.save(final_sentence_file, audio_tensor.cpu(),
                         self.params['samplerate'], format=default_audio_proc_format)
         del audio_tensor
@@ -676,7 +722,7 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
                 print("Orpheus TTS engine not loaded!")
                 return False
 
-            has_pause = self._has_logical_pause(sentence)
+            gap_sec, gap_pos = self._classify_gap(sentence)
             clean = self._clean_sentence_for_tts(sentence)
             if not clean:
                 return self._write_silence(sentence_index)
@@ -690,7 +736,7 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
                     audio_np = self._tokens_to_audio(
                         self._generate_tokens_transformers(f"{self.voice}: {clean}")
                     )
-                ok = self._save_audio(sentence_index, audio_np, has_pause)
+                ok = self._save_audio(sentence_index, audio_np, gap_sec, gap_pos)
                 self._cleanup_memory()
                 return ok
             except Exception as gen_error:
@@ -724,14 +770,14 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
             from vllm import SamplingParams
 
             results = {}
-            gen = []  # (idx, formatted_prompt, has_logical_pause) for non-empty sentences
+            gen = []  # (idx, formatted_prompt, (gap_sec, gap_pos)) for non-empty sentences
             for idx, sentence in items:
-                has_pause = self._has_logical_pause(sentence)
+                gap = self._classify_gap(sentence)
                 clean = self._clean_sentence_for_tts(sentence)
                 if not clean:
                     results[idx] = self._write_silence(idx)
                 else:
-                    gen.append((idx, self._format_prompt_with_special_tokens(clean), has_pause))
+                    gen.append((idx, self._format_prompt_with_special_tokens(clean), gap))
 
             if gen:
                 sampling_params = SamplingParams(
@@ -745,12 +791,12 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
                 except TypeError:
                     outputs = self.engine.generate(prompts, sampling_params)
                 # vLLM returns outputs in the same order as prompts.
-                for (idx, _, has_pause), out in zip(gen, outputs):
+                for (idx, _, gap), out in zip(gen, outputs):
                     try:
                         tokens = list(out.outputs[0].token_ids)
                         if self.END_OF_AUDIO_TOKEN in tokens:
                             tokens = tokens[:tokens.index(self.END_OF_AUDIO_TOKEN)]
-                        results[idx] = self._save_audio(idx, self._tokens_to_audio(tokens), has_pause)
+                        results[idx] = self._save_audio(idx, self._tokens_to_audio(tokens), gap[0], gap[1])
                     except Exception as decode_err:
                         print(f"Orpheus batch decode error for sentence {idx}: {decode_err}")
                         results[idx] = False
@@ -769,7 +815,7 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
 
         items: list of (sentence_index, sentence). Returns list[bool] aligned to items.
 
-        Mirrors the vLLM batch path — same per-item clean / _has_logical_pause /
+        Mirrors the vLLM batch path — same per-item clean / _classify_gap /
         _write_silence handling and _save_audio finalize (so inter-sentence and
         paragraph pauses are preserved) — but drives ONE continuous-batching
         generate over the whole chunk instead of len(chunk) single-prompt calls.
@@ -794,9 +840,9 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
             from mlx_audio.tts.models.llama.llama import decode_audio_from_codes
 
             results = {}
-            gen = []  # (idx, prompt_tokens, has_logical_pause) for non-empty sentences
+            gen = []  # (idx, prompt_tokens, (gap_sec, gap_pos)) for non-empty sentences
             for idx, sentence in items:
-                has_pause = self._has_logical_pause(sentence)
+                gap = self._classify_gap(sentence)
                 clean = self._clean_sentence_for_tts(sentence)
                 if not clean:
                     results[idx] = self._write_silence(idx)
@@ -804,7 +850,7 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
                     # prepare_input_ids prepends "voice: " itself; pass voice, not a
                     # pre-formatted string. Single-string call returns a [1, T] array.
                     ptoks = self.mlx_model.prepare_input_ids(clean, self.voice)[0].tolist()
-                    gen.append((idx, ptoks, has_pause))
+                    gen.append((idx, ptoks, gap))
 
             if gen:
                 bg = BatchGenerator(
@@ -824,7 +870,7 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
                             out[r.uid].append(r.token)
                 bg.close()
                 # uids come back in insert order == gen order.
-                for (idx, ptoks, has_pause), uid in zip(gen, uids):
+                for (idx, ptoks, gap), uid in zip(gen, uids):
                     try:
                         ids = mx.array([ptoks + out[uid]])
                         code_lists = self.mlx_model.parse_output(ids)
@@ -834,7 +880,7 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
                             )
                         else:
                             audio = np.zeros(int(self.SAMPLE_RATE * 0.1), dtype=np.float32)
-                        results[idx] = self._save_audio(idx, audio, has_pause)
+                        results[idx] = self._save_audio(idx, audio, gap[0], gap[1])
                     except Exception as decode_err:
                         print(f"Orpheus MLX batch decode error for sentence {idx}: {decode_err}")
                         results[idx] = False
