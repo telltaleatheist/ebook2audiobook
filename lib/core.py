@@ -937,11 +937,22 @@ def filter_chapter(idx:int, doc:EpubHtml, session_id:str, stanza_nlp:Pipeline, i
                 return None
             msg = f'Parsing xhtml markers…'
             print(msg)
+            # Tolerant title normalization for dedup: lowercase, collapse
+            # whitespace, drop trailing sentence/colon punctuation, and fold
+            # common smart punctuation so near-identical titles still match.
+            def _norm_title(s):
+                s = (s or '').strip()
+                s = (s.replace('’', "'").replace('‘', "'")
+                       .replace('“', '"').replace('”', '"')
+                       .replace('–', '-').replace('—', '-'))
+                s = re.sub(r'\s+', ' ', s)
+                s = re.sub(r'[.!?…:]+$', '', s)
+                return s.lower().strip()
             # Build set of normalized TOC titles for detecting chapter titles
             # that lost their heading tags (e.g. after AI cleanup converted <h2> to <p>)
             toc_titles_normalized = set()
             for t in session.get('chapter_titles', []):
-                ct = re.sub(r'[.!?…]+$', '', t.strip()).lower()
+                ct = _norm_title(t)
                 if ct:
                     toc_titles_normalized.add(ct)
             if toc_titles_normalized:
@@ -950,15 +961,25 @@ def filter_chapter(idx:int, doc:EpubHtml, session_id:str, stanza_nlp:Pipeline, i
             handled_tables = set()
             prev_typ = None
             last_heading_normalized = None  # Track last heading to deduplicate body text
+            chapter_title_normalized = None  # First heading of the chapter — suppress later echoes anywhere
             for typ, payload in tuples_list:
                 if typ == 'heading':
                     if not session.get('skip_headings', False):
                         title = payload.strip()
+                        norm = _norm_title(title)
+                        # Skip a heading that just repeats one we already voiced
+                        # (e.g. two consecutive heading tags with the same text).
+                        if norm and norm == last_heading_normalized:
+                            print(f'[HEADING] Skipping duplicate heading: "{title}"')
+                            prev_typ = typ
+                            continue
                         # Add period to chapter titles so TTS pauses after them
                         if title and title[-1] not in '.!?…':
                             title += '.'
                         text_list.append(title)
-                        last_heading_normalized = re.sub(r'[.!?…]+$', '', title).lower()
+                        last_heading_normalized = norm
+                        if chapter_title_normalized is None:
+                            chapter_title_normalized = norm
                 elif typ in ('break', 'pause'):
                     if prev_typ != typ:
                         text_list.append(sml_token(typ))
@@ -988,9 +1009,11 @@ def filter_chapter(idx:int, doc:EpubHtml, session_id:str, stanza_nlp:Pipeline, i
                 else:
                     text = payload.strip()
                     if text:
-                        text_check = re.sub(r'[.!?…]+$', '', text).lower()
-                        # Deduplicate: if body text matches the heading we just added, skip it
-                        if last_heading_normalized and text_check == last_heading_normalized:
+                        text_check = _norm_title(text)
+                        # Deduplicate: skip body text that repeats the heading we
+                        # just added OR the chapter title (catches a non-adjacent
+                        # echo, e.g. a styled title paragraph after a blank line).
+                        if text_check and (text_check == last_heading_normalized or text_check == chapter_title_normalized):
                             print(f'[HEADING] Skipping duplicate body text: "{text}"')
                             last_heading_normalized = None
                             prev_typ = typ
