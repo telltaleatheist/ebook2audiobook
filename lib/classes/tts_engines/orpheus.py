@@ -77,8 +77,9 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
     Emotion tags: <laugh>, <chuckle>, <sigh>, <cough>, <sniffle>, <groan>, <yawn>, <gasp>
     """
 
-    # Valid Orpheus voices (leah has best quality, tara has echo artifacts)
-    VALID_VOICES = {'tara', 'leah', 'jess', 'leo', 'dan', 'mia', 'zac', 'zoe'}
+    # Valid Orpheus voices (leah has best quality, tara has echo artifacts).
+    # 'owen' is a custom fine-tune (see CUSTOM_VOICE_MODELS) and loads its own model.
+    VALID_VOICES = {'tara', 'leah', 'jess', 'leo', 'dan', 'mia', 'zac', 'zoe', 'owen'}
     DEFAULT_VOICE = 'leah'
 
     # Model configuration
@@ -87,6 +88,16 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
     MLX_MODEL = "mlx-community/orpheus-3b-0.1-ft-bf16"
     TRANSFORMERS_MODEL = "unsloth/orpheus-3b-0.1-ft"
     SAMPLE_RATE = 24000
+
+    # Custom per-voice merged models. A voice listed here loads its OWN fine-tuned
+    # model (a standard Llama-arch checkpoint) instead of the stock Orpheus weights;
+    # every other voice keeps TRANSFORMERS_MODEL. The prompt format is unchanged
+    # ("<voice>: <text>") — the source name baked in at training time is the voice id.
+    # On this machine 'owen' is the local merged checkpoint; override the path (or
+    # point it at the HF repo on another machine) via ORPHEUS_OWEN_MODEL.
+    CUSTOM_VOICE_MODELS = {
+        'owen': os.environ.get('ORPHEUS_OWEN_MODEL', '/home/telltale/xtts_ft/orpheus_owen_merged'),
+    }
 
     # Batched inference (vLLM): feed many prompts to ONE engine.generate() call.
     # This is how vLLM is meant to be driven — it's faster (real batching) AND
@@ -140,6 +151,14 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
 
             self.voice = voice_lower
             print(f"[ORPHEUS] Using voice: '{self.voice}'")
+
+            # A custom-fine-tuned voice loads its own merged model. Override the
+            # instance attribute so every downstream load (vLLM / transformers)
+            # picks up the right weights; stock voices keep the class default.
+            if self.voice in self.CUSTOM_VOICE_MODELS:
+                self.TRANSFORMERS_MODEL = self.CUSTOM_VOICE_MODELS[self.voice]
+                print(f"[ORPHEUS] Custom voice model for '{self.voice}': {self.TRANSFORMERS_MODEL}")
+
             self.engine = None
             self.engine = self.load_engine()
 

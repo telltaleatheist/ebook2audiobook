@@ -191,7 +191,8 @@ default_engine_settings = {
             "zoe": "Zoe (Female)",
             "leo": "Leo (Male)",
             "dan": "Dan (Male)",
-            "zac": "Zac (Male)"
+            "zac": "Zac (Male)",
+            "owen": "Owen Morgan (Custom)"
         },
         "emotion_tags": ["<laugh>", "<chuckle>", "<sigh>", "<cough>", "<sniffle>", "<groan>", "<yawn>", "<gasp>"],
         "rating": {"VRAM": 8, "CPU": 2, "RAM": 8, "Realism": 6}  # Higher realism than XTTS

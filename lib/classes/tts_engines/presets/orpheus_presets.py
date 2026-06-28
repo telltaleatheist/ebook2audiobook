@@ -67,5 +67,14 @@ models = {
         "description": "Zac - Male",
         "gender": "male",
         "samplerate": default_engine_settings[TTS_ENGINES['ORPHEUS']]['samplerate']
+    },
+    # Custom fine-tune (not a built-in voice). Loads its own merged model via
+    # CUSTOM_VOICE_MODELS in orpheus.py; prompt/source name is 'owen'.
+    "owen": {
+        "lang": "eng",
+        "voice": "owen",
+        "description": "Owen Morgan - custom fine-tuned voice",
+        "gender": "male",
+        "samplerate": default_engine_settings[TTS_ENGINES['ORPHEUS']]['samplerate']
     }
 }
