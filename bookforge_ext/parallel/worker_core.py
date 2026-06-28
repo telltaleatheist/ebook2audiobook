@@ -194,6 +194,9 @@ def create_worker_session(state: dict, args: dict) -> dict:
         'custom_model': args.get('custom_model') or state.get('custom_model'),
         'custom_model_dir': (args.get('custom_model_dir') or state.get('custom_model_dir')
                              or os.path.join(state['process_dir'], 'models')),
+        # Folder-discovered custom Orpheus model: absolute path to the model dir,
+        # folder name = voice token. None → built-in Orpheus model.
+        'orpheus_model_dir': args.get('orpheus_model_dir') or state.get('orpheus_model_dir'),
         'audiobooks_dir': args.get('output_dir') or state.get('audiobooks_dir'),
         'session_dir': state['session_dir'],
         'process_dir': state['process_dir'],

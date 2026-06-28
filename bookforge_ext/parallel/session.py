@@ -61,6 +61,7 @@ def save_session_state(session_id: str, args: dict, prep_result: dict, core_modu
             'fine_tuned': session.get('fine_tuned'),
             'custom_model': session.get('custom_model'),
             'custom_model_dir': session.get('custom_model_dir'),
+            'orpheus_model_dir': session.get('orpheus_model_dir'),
             'tts_engine': session.get('tts_engine'),
             'device': args.get('device', default_device),
             'output_format': args.get('output_format', default_output_format),
@@ -374,6 +375,8 @@ def prep_ebook_info(args: dict, core_module) -> dict | None:
         # the checkpoint files are loaded in place by the engine. fine_tuned stays a
         # valid preset key (used for samplerate); the custom checkpoint overrides it.
         session['custom_model'] = args.get('custom_model')
+        # Folder-discovered custom Orpheus model (folder name = voice token).
+        session['orpheus_model_dir'] = args.get('orpheus_model_dir')
         session['output_format'] = args.get('output_format', default_output_format)
 
         # XTTS settings - save to session-state.json so workers use them instead of defaults

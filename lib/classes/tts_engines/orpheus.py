@@ -78,8 +78,9 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
     """
 
     # Valid Orpheus voices (leah has best quality, tara has echo artifacts).
-    # 'owen' is a custom fine-tune (see CUSTOM_VOICE_MODELS) and loads its own model.
-    VALID_VOICES = {'tara', 'leah', 'jess', 'leo', 'dan', 'mia', 'zac', 'zoe', 'owen'}
+    # Custom finetunes are NOT listed here — they arrive via a folder-discovered
+    # model dir (session['orpheus_model_dir']) and bypass this allowlist.
+    VALID_VOICES = {'tara', 'leah', 'jess', 'leo', 'dan', 'mia', 'zac', 'zoe'}
     DEFAULT_VOICE = 'leah'
 
     # Model configuration
@@ -88,16 +89,6 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
     MLX_MODEL = "mlx-community/orpheus-3b-0.1-ft-bf16"
     TRANSFORMERS_MODEL = "unsloth/orpheus-3b-0.1-ft"
     SAMPLE_RATE = 24000
-
-    # Custom per-voice merged models. A voice listed here loads its OWN fine-tuned
-    # model (a standard Llama-arch checkpoint) instead of the stock Orpheus weights;
-    # every other voice keeps TRANSFORMERS_MODEL. The prompt format is unchanged
-    # ("<voice>: <text>") — the source name baked in at training time is the voice id.
-    # On this machine 'owen' is the local merged checkpoint; override the path (or
-    # point it at the HF repo on another machine) via ORPHEUS_OWEN_MODEL.
-    CUSTOM_VOICE_MODELS = {
-        'owen': os.environ.get('ORPHEUS_OWEN_MODEL', '/home/telltale/xtts_ft/orpheus_owen_merged'),
-    }
 
     # Batched inference (vLLM): feed many prompts to ONE engine.generate() call.
     # This is how vLLM is meant to be driven — it's faster (real batching) AND
@@ -133,31 +124,40 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
             self.params = {}
             self.params['samplerate'] = self.SAMPLE_RATE
 
+            # Custom Orpheus model (BookForge folder-discovered voices).
+            # orpheus_model_dir is an absolute path to a HF/MLX model folder whose
+            # FOLDER NAME is the voice token it was fine-tuned on (e.g. .../owen →
+            # token "owen"). When present, point every backend at the local dir and
+            # use the token verbatim — these single-speaker finetunes are NOT in the
+            # built-in allowlist, so the usual validation would wrongly drop them to
+            # the default voice (the leah fallback bug).
+            self.custom_model_dir = self.session.get('orpheus_model_dir')
+
             # Get voice from session or preset
             voice = self.session.get('fine_tuned', self.DEFAULT_VOICE)
             print(f"[ORPHEUS] Session fine_tuned value: '{voice}'")
 
-            # Handle preset lookups
-            if voice in self.models:
-                voice = self.models[voice].get('voice', voice)
+            if self.custom_model_dir:
+                self.MLX_MODEL = self.custom_model_dir
+                self.TRANSFORMERS_MODEL = self.custom_model_dir
+                self.voice = (voice or '').strip().lower() or self.DEFAULT_VOICE
+                print(f"[ORPHEUS] Custom model dir: {self.custom_model_dir}")
+                print(f"[ORPHEUS] Using custom voice token: '{self.voice}'")
+            else:
+                # Handle preset lookups
+                if voice in self.models:
+                    voice = self.models[voice].get('voice', voice)
 
-            # Normalize to lowercase for comparison
-            voice_lower = voice.lower() if voice else self.DEFAULT_VOICE
+                # Normalize to lowercase for comparison
+                voice_lower = voice.lower() if voice else self.DEFAULT_VOICE
 
-            # Validate voice
-            if voice_lower not in self.VALID_VOICES:
-                print(f"Warning: Unknown Orpheus voice '{voice}', defaulting to '{self.DEFAULT_VOICE}'")
-                voice_lower = self.DEFAULT_VOICE
+                # Validate voice
+                if voice_lower not in self.VALID_VOICES:
+                    print(f"Warning: Unknown Orpheus voice '{voice}', defaulting to '{self.DEFAULT_VOICE}'")
+                    voice_lower = self.DEFAULT_VOICE
 
-            self.voice = voice_lower
-            print(f"[ORPHEUS] Using voice: '{self.voice}'")
-
-            # A custom-fine-tuned voice loads its own merged model. Override the
-            # instance attribute so every downstream load (vLLM / transformers)
-            # picks up the right weights; stock voices keep the class default.
-            if self.voice in self.CUSTOM_VOICE_MODELS:
-                self.TRANSFORMERS_MODEL = self.CUSTOM_VOICE_MODELS[self.voice]
-                print(f"[ORPHEUS] Custom voice model for '{self.voice}': {self.TRANSFORMERS_MODEL}")
+                self.voice = voice_lower
+                print(f"[ORPHEUS] Using voice: '{self.voice}'")
 
             self.engine = None
             self.engine = self.load_engine()

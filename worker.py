@@ -70,6 +70,9 @@ def main():
                        help='Custom model NAME for a pre-staged user voice (default: from session state)')
     parser.add_argument('--custom_model_dir', type=str, default=None,
                        help='Staging root for a pre-staged custom model (default: from session state)')
+    parser.add_argument('--orpheus_model_dir', type=str, default=None,
+                       help='Absolute path to a folder-discovered custom Orpheus model; '
+                            'its folder name is the voice token (default: from session state)')
 
     args = parser.parse_args()
 
@@ -102,6 +105,7 @@ def main():
         'speed': args.speed,
         'custom_model': args.custom_model,
         'custom_model_dir': args.custom_model_dir,
+        'orpheus_model_dir': args.orpheus_model_dir,
     }
 
     # Run TTS conversion
