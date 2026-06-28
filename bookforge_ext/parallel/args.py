@@ -12,7 +12,7 @@ PARALLEL_OPTIONS = [
     '--resume_session', '--list_sessions', '--no_split', '--chapters', '--skip_deps',
     '--bilingual', '--bilingual_pause', '--bilingual_gap', '--skip_assembly',
     '--sentence_per_paragraph', '--skip_headings', '--session_dir', '--custom_model_dir',
-    '--sentences_dir'
+    '--sentences_dir', '--orpheus_model_dir'
 ]
 
 
@@ -154,4 +154,14 @@ def add_arguments(parser):
              'When set, --custom_model is treated as the model NAME and no zip '
              'extraction is performed — the files are loaded in place. Used for '
              'user-added fine-tuned XTTS voices in full audiobook generation.'
+    )
+
+    parallel_group.add_argument(
+        '--orpheus_model_dir', type=str, default=None,
+        help='(BookForge) Absolute path to a folder-discovered custom Orpheus voice '
+             'model (HF or MLX format). The folder name is the voice token the model '
+             'was fine-tuned on. When set, --fine_tuned carries that token and the '
+             'Orpheus engine points every backend at this dir, bypassing the built-in '
+             'voice allowlist. Stored in session-state so workers reuse it. Mirrors '
+             'the same flag on worker.py.'
     )
