@@ -169,6 +169,19 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
             error = f'Orpheus.__init__() error: {e}'
             raise ValueError(error)
 
+    @staticmethod
+    def _evict_global_cache():
+        """Drop the process-global Orpheus model cache so the next load fetches a
+        fresh model. Used when switching to a different orpheus_model_dir and on
+        cleanup, so a custom voice's weights actually free instead of being reused."""
+        for k in ('orpheus', 'orpheus_mlx_model', 'orpheus_snac', 'orpheus_tokenizer',
+                  'orpheus_backend', 'orpheus_device', 'orpheus_model_dir'):
+            if k in loaded_tts:
+                try:
+                    del loaded_tts[k]
+                except Exception:
+                    loaded_tts[k] = None
+
     def cleanup(self):
         """Explicitly release all resources (CUDA, vLLM, etc.)"""
         try:
@@ -186,6 +199,16 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
             if hasattr(self, 'tokenizer') and self.tokenizer is not None:
                 del self.tokenizer
                 self.tokenizer = None
+
+            # If the process-global cache holds THIS instance's model, evict it too so
+            # the weights actually free and the next load reloads. Guarded by model_dir
+            # so a stale instance's __del__ can't clobber a newer, different model.
+            try:
+                if loaded_tts.get('orpheus_model_dir', '\0') == getattr(self, 'custom_model_dir', None):
+                    self._evict_global_cache()
+            except Exception:
+                pass
+            self.mlx_model = None
 
             # Clear CUDA cache
             self._cleanup_memory()
@@ -408,17 +431,29 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
             print(msg)
             self._cleanup_memory()
 
-            # Check if already loaded
+            # Check if already loaded — but ONLY reuse the process-global cache when
+            # it holds the SAME model. The cache is keyed by engine name ('orpheus'),
+            # so without a model-dir check a custom single-speaker finetune
+            # (orpheus_model_dir) would be served from a cache populated by a DIFFERENT
+            # model. The voice of a finetune is its WEIGHTS, not just the prompt token,
+            # so reusing the wrong weights makes voice switching in the streaming worker
+            # silently keep the first-loaded voice. Reload whenever the dir differs.
             engine_key = 'orpheus'
             engine = loaded_tts.get(engine_key, False)
-            if engine:
+            cached_dir = loaded_tts.get('orpheus_model_dir', None)
+            if engine and cached_dir == self.custom_model_dir:
                 self.backend = loaded_tts.get('orpheus_backend', 'transformers')
                 self.snac_model = loaded_tts.get('orpheus_snac', None)
                 self.tokenizer = loaded_tts.get('orpheus_tokenizer', None)
                 self._device = loaded_tts.get('orpheus_device', 'cpu')
                 self.mlx_model = loaded_tts.get('orpheus_mlx_model', None)
-                print(f"Orpheus already loaded (backend: {self.backend})")
+                print(f"Orpheus already loaded (backend: {self.backend}, model_dir: {cached_dir})")
                 return engine
+            if engine:
+                # A different model is cached (switching custom voices, or custom<->stock).
+                # Evict it so its weights free before we load the new one.
+                print(f"Orpheus model changed (cached={cached_dir!r} -> want={self.custom_model_dir!r}); reloading")
+                self._evict_global_cache()
 
             # Detect and load appropriate backend
             self.backend = self._detect_backend()
@@ -440,6 +475,7 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
             loaded_tts['orpheus_tokenizer'] = self.tokenizer
             loaded_tts['orpheus_device'] = self._device
             loaded_tts['orpheus_mlx_model'] = self.mlx_model
+            loaded_tts['orpheus_model_dir'] = self.custom_model_dir
 
             print('Orpheus TTS Loaded!')
             return engine
