@@ -105,12 +105,13 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
     # audio is never clipped. Override with ORPHEUS_MAX_TOKENS.
     MAX_AUDIO_TOKENS = int(os.environ.get('ORPHEUS_MAX_TOKENS', '3700'))
 
-    # Sampling params. Lowered temperature 0.6 -> 0.5: at 0.6 Orpheus hallucinated a
-    # spurious voiced onset (a stray leading syllable) on ~20% of sentences; a slightly
-    # cooler sample suppresses that without flattening prosody much. top_p / rep-penalty
-    # kept at the Orpheus reference values. All three override via env so they can be
-    # A/B-tuned live (ORPHEUS_TEMPERATURE / ORPHEUS_TOP_P / ORPHEUS_REP_PENALTY).
-    TEMPERATURE = float(os.environ.get('ORPHEUS_TEMPERATURE', '0.5'))
+    # Sampling params at the Orpheus reference values. (Cooling temperature to 0.5
+    # was tried to suppress the spurious leading-syllable artifact and made it WORSE:
+    # it didn't remove the onset and it flattened prosody. The artifact tracks chunk
+    # boundaries, not sampling — see the ~250-char single-sentence chunking in core.py.)
+    # All three override via env so they can be A/B-tuned live
+    # (ORPHEUS_TEMPERATURE / ORPHEUS_TOP_P / ORPHEUS_REP_PENALTY).
+    TEMPERATURE = float(os.environ.get('ORPHEUS_TEMPERATURE', '0.6'))
     TOP_P = float(os.environ.get('ORPHEUS_TOP_P', '0.8'))
     REP_PENALTY = float(os.environ.get('ORPHEUS_REP_PENALTY', '1.1'))
 

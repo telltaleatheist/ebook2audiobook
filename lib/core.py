@@ -1028,18 +1028,18 @@ def filter_chapter(idx:int, doc:EpubHtml, session_id:str, stanza_nlp:Pipeline, i
                 prev_typ = typ
             msg = f'Flattening as raw text…'
             print(msg)
-            # Both Voxtral and Orpheus benefit from longer, multi-sentence chunks:
-            # rendering one short sentence per generation makes every sentence an
-            # independent "take" with inconsistent prosody. Group whole sentences into
-            # larger chunks (the grouper below always breaks at sentence boundaries) so
-            # prosody stays coherent across sentences. Orpheus: ~450 chars (~2-3
-            # sentences) stays under its 4096-token model context; a chunk that would
-            # exceed the audio-token cap is re-rendered split at sentences in orpheus.py
-            # (_generate_audio_vllm_safe), so audio is never clipped.
+            # Voxtral is a long-form model and benefits from larger multi-sentence
+            # chunks. Orpheus is the opposite: it is a SENTENCE-level model, and
+            # packing 2-3 sentences into one generation (~450 chars, tried earlier)
+            # made prosody drift AND glitched at the internal sentence transitions —
+            # heard as a stray syllable/gibberish at the start of sentences. Keep
+            # Orpheus at ~one sentence per generation (~250 chars for English); the
+            # token-cap re-split in orpheus.py (_generate_audio_vllm_safe) still
+            # guards the rare over-long sentence so audio is never clipped.
             if tts_engine == 'voxtral':
                 max_chars = language_mapping[lang]['max_chars'] * 2  # ~500 chars
             elif tts_engine == 'orpheus':
-                max_chars = int(language_mapping[lang]['max_chars'] * 1.8)  # ~450 chars for English
+                max_chars = language_mapping[lang]['max_chars']  # ~250 chars for English (one sentence)
             else:
                 max_chars = int(language_mapping[lang]['max_chars'] / 1.5)
             clean_list = []
