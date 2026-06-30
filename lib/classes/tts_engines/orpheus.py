@@ -786,7 +786,7 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
           [pause] / [pause:X]  -> SECTION gap: explicit X, else 1.0-1.6s. Marks
                                   blank-line / heading / <div> boundaries.
           [break] / [silence]  -> PARAGRAPH gap: 0.5-0.7s. Marks <p>/<br> ends.
-          (no token)           -> SENTENCE gap: ~0.40-0.55s, so Orpheus breathes
+          (no token)           -> SENTENCE gap: ~0.55-0.75s, so Orpheus breathes
                                   instead of rushing.
 
         Why three tiers and not the old binary [break]==[pause]: the standard
@@ -830,11 +830,12 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
             pos = 'lead' if re.match(r'\[(?:break|silence)', lowered) else 'trail'
             return gap, pos
 
-        # Plain sentence end — short breathing gap. Bumped from 0.25-0.35 to
-        # 0.40-0.55: at the lower value sentences ran together (esp. the
-        # deathstalker voice, which clips its own trailing breath short).
+        # Plain sentence end — short breathing gap. Widened in steps (0.25-0.35 ->
+        # 0.40-0.55 -> 0.55-0.75): the model's intra-sentence pacing is good, but
+        # back-to-back sentences still ran too packed together (esp. the deathstalker
+        # voice, which clips its own trailing breath short).
         override = _env('ORPHEUS_SENTENCE_GAP')
-        gap = override if override is not None else int(np.random.uniform(0.40, 0.55) * 100) / 100
+        gap = override if override is not None else int(np.random.uniform(0.55, 0.75) * 100) / 100
         return gap, 'trail'
 
     def _write_silence(self, sentence_index: int) -> bool:
