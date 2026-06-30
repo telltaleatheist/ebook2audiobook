@@ -98,6 +98,22 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
     SUPPORTS_BATCH = True
     BATCH_SIZE = int(os.environ.get('ORPHEUS_BATCH_SIZE', '16'))
 
+    # Max audio tokens per generation. ~8 audio tokens/char, so ~3700 covers the
+    # ~450-char multi-sentence chunks core.py now feeds Orpheus while staying under
+    # the 4096 model context (prompt + audio). A chunk that would exceed this is
+    # re-rendered split at sentence boundaries (see _generate_audio_vllm_safe) so the
+    # audio is never clipped. Override with ORPHEUS_MAX_TOKENS.
+    MAX_AUDIO_TOKENS = int(os.environ.get('ORPHEUS_MAX_TOKENS', '3700'))
+
+    # Sampling params. Lowered temperature 0.6 -> 0.5: at 0.6 Orpheus hallucinated a
+    # spurious voiced onset (a stray leading syllable) on ~20% of sentences; a slightly
+    # cooler sample suppresses that without flattening prosody much. top_p / rep-penalty
+    # kept at the Orpheus reference values. All three override via env so they can be
+    # A/B-tuned live (ORPHEUS_TEMPERATURE / ORPHEUS_TOP_P / ORPHEUS_REP_PENALTY).
+    TEMPERATURE = float(os.environ.get('ORPHEUS_TEMPERATURE', '0.5'))
+    TOP_P = float(os.environ.get('ORPHEUS_TOP_P', '0.8'))
+    REP_PENALTY = float(os.environ.get('ORPHEUS_REP_PENALTY', '1.1'))
+
     # Special token IDs
     END_OF_AUDIO_TOKEN = 128258
 
@@ -498,9 +514,9 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
         for result in self.mlx_model.generate(
             text,
             voice=self.voice,
-            temperature=0.6,
-            top_p=0.9,
-            repetition_penalty=1.1,
+            temperature=self.TEMPERATURE,
+            top_p=self.TOP_P,
+            repetition_penalty=self.REP_PENALTY,
             max_tokens=max_tokens
         ):
             audio_data = result.audio
@@ -550,8 +566,8 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
                 self.mlx_model,
                 max_tokens=2048,
                 stop_tokens={self.END_OF_AUDIO_TOKEN},
-                sampler=make_sampler(0.6, top_p=0.9),
-                logits_processors=make_logits_processors(None, 1.1, 20),
+                sampler=make_sampler(self.TEMPERATURE, top_p=self.TOP_P),
+                logits_processors=make_logits_processors(None, self.REP_PENALTY, 20),
                 completion_batch_size=len(gen),
                 prefill_batch_size=len(gen),
             )
@@ -601,17 +617,19 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
         prompt_string = self.tokenizer.decode(all_input_ids[0])
         return prompt_string
 
-    def _generate_tokens_vllm(self, prompt: str, max_tokens: int = 2048) -> list:
+    def _generate_tokens_vllm(self, prompt: str, max_tokens: int = None) -> list:
         """Generate audio tokens using vLLM backend."""
         from vllm import SamplingParams
+        if max_tokens is None:
+            max_tokens = self.MAX_AUDIO_TOKENS
 
         # Format prompt with special tokens
         formatted_prompt = self._format_prompt_with_special_tokens(prompt)
 
         sampling_params = SamplingParams(
-            temperature=0.6,
-            top_p=0.8,
-            repetition_penalty=1.1,
+            temperature=self.TEMPERATURE,
+            top_p=self.TOP_P,
+            repetition_penalty=self.REP_PENALTY,
             max_tokens=max_tokens,
             stop_token_ids=[self.END_OF_AUDIO_TOKEN]
         )
@@ -626,8 +644,40 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
 
         return tokens
 
-    def _generate_tokens_transformers(self, prompt: str, max_tokens: int = 2048) -> list:
+    def _generate_audio_vllm_safe(self, clean: str, depth: int = 0):
+        """Render audio for `clean`; if the model hits the token cap before emitting the
+        end-of-audio token (the chunk is too long to finish), split it at the nearest
+        sentence/space boundary and render each half, concatenating the audio. Recurses
+        up to a small depth so even an unusually dense chunk produces complete,
+        un-clipped audio. Returns a numpy waveform (same as _tokens_to_audio).
+        """
+        from vllm import SamplingParams
+        import numpy as np
+        sampling_params = SamplingParams(
+            temperature=self.TEMPERATURE, top_p=self.TOP_P, repetition_penalty=self.REP_PENALTY,
+            max_tokens=self.MAX_AUDIO_TOKENS, stop_token_ids=[self.END_OF_AUDIO_TOKEN]
+        )
+        formatted = self._format_prompt_with_special_tokens(clean)
+        try:
+            outputs = self.engine.generate([formatted], sampling_params, use_tqdm=False)
+        except TypeError:
+            outputs = self.engine.generate([formatted], sampling_params)
+        tokens = list(outputs[0].outputs[0].token_ids)
+        finished = self.END_OF_AUDIO_TOKEN in tokens
+        if finished:
+            tokens = tokens[:tokens.index(self.END_OF_AUDIO_TOKEN)]
+        # Accept what we have once it fits, can't be split sensibly, or we've recursed enough.
+        if finished or depth >= 3 or len(clean) < 80:
+            return self._tokens_to_audio(tokens)
+        parts = self._split_long_text(clean, max_length=max(60, len(clean) // 2))
+        if len(parts) < 2:
+            return self._tokens_to_audio(tokens)
+        return np.concatenate([self._generate_audio_vllm_safe(p, depth + 1) for p in parts])
+
+    def _generate_tokens_transformers(self, prompt: str, max_tokens: int = None) -> list:
         """Generate audio tokens using transformers backend."""
+        if max_tokens is None:
+            max_tokens = self.MAX_AUDIO_TOKENS
         # Encode prompt
         inputs = self.tokenizer(prompt, return_tensors="pt")
         input_ids = inputs.input_ids.to(self.engine.device)
@@ -637,9 +687,9 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
             outputs = self.engine.generate(
                 input_ids,
                 max_new_tokens=max_tokens,
-                temperature=0.6,
-                top_p=0.9,
-                repetition_penalty=1.1,
+                temperature=self.TEMPERATURE,
+                top_p=self.TOP_P,
+                repetition_penalty=self.REP_PENALTY,
                 do_sample=True,
                 pad_token_id=self.tokenizer.pad_token_id or self.tokenizer.eos_token_id,
                 eos_token_id=self.END_OF_AUDIO_TOKEN
@@ -735,7 +785,7 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
           [pause] / [pause:X]  -> SECTION gap: explicit X, else 1.0-1.6s. Marks
                                   blank-line / heading / <div> boundaries.
           [break] / [silence]  -> PARAGRAPH gap: 0.5-0.7s. Marks <p>/<br> ends.
-          (no token)           -> SENTENCE gap: ~0.30s, so Orpheus breathes
+          (no token)           -> SENTENCE gap: ~0.40-0.55s, so Orpheus breathes
                                   instead of rushing.
 
         Why three tiers and not the old binary [break]==[pause]: the standard
@@ -779,9 +829,11 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
             pos = 'lead' if re.match(r'\[(?:break|silence)', lowered) else 'trail'
             return gap, pos
 
-        # Plain sentence end — short breathing gap.
+        # Plain sentence end — short breathing gap. Bumped from 0.25-0.35 to
+        # 0.40-0.55: at the lower value sentences ran together (esp. the
+        # deathstalker voice, which clips its own trailing breath short).
         override = _env('ORPHEUS_SENTENCE_GAP')
-        gap = override if override is not None else int(np.random.uniform(0.25, 0.35) * 100) / 100
+        gap = override if override is not None else int(np.random.uniform(0.40, 0.55) * 100) / 100
         return gap, 'trail'
 
     def _write_silence(self, sentence_index: int) -> bool:
@@ -886,33 +938,41 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
             from vllm import SamplingParams
 
             results = {}
-            gen = []  # (idx, formatted_prompt, (gap_sec, gap_pos)) for non-empty sentences
+            gen = []  # (idx, clean_text, formatted_prompt, (gap_sec, gap_pos)) for non-empty sentences
             for idx, sentence in items:
                 gap = self._classify_gap(sentence)
                 clean = self._clean_sentence_for_tts(sentence)
                 if not clean:
                     results[idx] = self._write_silence(idx)
                 else:
-                    gen.append((idx, self._format_prompt_with_special_tokens(clean), gap))
+                    gen.append((idx, clean, self._format_prompt_with_special_tokens(clean), gap))
 
             if gen:
                 sampling_params = SamplingParams(
-                    temperature=0.6, top_p=0.8, repetition_penalty=1.1,
-                    max_tokens=2048, stop_token_ids=[self.END_OF_AUDIO_TOKEN]
+                    temperature=self.TEMPERATURE, top_p=self.TOP_P, repetition_penalty=self.REP_PENALTY,
+                    max_tokens=self.MAX_AUDIO_TOKENS, stop_token_ids=[self.END_OF_AUDIO_TOKEN]
                 )
-                prompts = [fp for _, fp, _ in gen]
+                prompts = [fp for _, _, fp, _ in gen]
                 # use_tqdm=False: a per-call progress bar adds overhead and noise.
                 try:
                     outputs = self.engine.generate(prompts, sampling_params, use_tqdm=False)
                 except TypeError:
                     outputs = self.engine.generate(prompts, sampling_params)
                 # vLLM returns outputs in the same order as prompts.
-                for (idx, _, gap), out in zip(gen, outputs):
+                for (idx, clean, _, gap), out in zip(gen, outputs):
                     try:
                         tokens = list(out.outputs[0].token_ids)
                         if self.END_OF_AUDIO_TOKEN in tokens:
+                            # Finished cleanly: decode up to the end-of-audio token.
                             tokens = tokens[:tokens.index(self.END_OF_AUDIO_TOKEN)]
-                        results[idx] = self._save_audio(idx, self._tokens_to_audio(tokens), gap[0], gap[1])
+                            audio_np = self._tokens_to_audio(tokens)
+                        else:
+                            # Hit the token cap without finishing → the chunk was too long
+                            # and the audio would be clipped. Re-render it split at sentence
+                            # boundaries so nothing is cut off.
+                            print(f"Orpheus: sentence {idx} hit the audio-token cap; re-rendering split at sentence boundaries")
+                            audio_np = self._generate_audio_vllm_safe(clean)
+                        results[idx] = self._save_audio(idx, audio_np, gap[0], gap[1])
                     except Exception as decode_err:
                         print(f"Orpheus batch decode error for sentence {idx}: {decode_err}")
                         results[idx] = False
@@ -973,8 +1033,8 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
                     self.mlx_model,
                     max_tokens=2048,
                     stop_tokens={self.END_OF_AUDIO_TOKEN},
-                    sampler=make_sampler(0.6, top_p=0.9),
-                    logits_processors=make_logits_processors(None, 1.1, 20),
+                    sampler=make_sampler(self.TEMPERATURE, top_p=self.TOP_P),
+                    logits_processors=make_logits_processors(None, self.REP_PENALTY, 20),
                     completion_batch_size=len(gen),
                     prefill_batch_size=len(gen),
                 )
