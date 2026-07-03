@@ -16,6 +16,7 @@ and processes only the assigned sentence/chapter range.
 
 import argparse
 import json
+import signal
 import sys
 import os
 
@@ -24,6 +25,27 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 # Import configuration (lightweight, no heavy deps)
 from lib.conf import devices, default_device
+
+
+def _graceful_exit(signum, frame):
+    """Cooperative shutdown: SIGTERM/SIGINT → SystemExit(143).
+
+    Without this handler Python's default SIGTERM disposition kills the process
+    WITHOUT running atexit hooks, so torch/vLLM never release the GPU — the zombie
+    then collides with the next job, and force-killing a process stuck in a WSL dxg
+    GPU wait is what kernel-wedges the whole WSL VM. Raising SystemExit instead
+    unwinds through the sentence loop (worker_core drops any half-written in-flight
+    outputs), runs finally/atexit blocks (orpheus.py's CUDA cleanup), and exits 143 —
+    the GPU is released from INSIDE the process, no force-kill needed.
+    """
+    print(f"[WORKER] Signal {signum} received — shutting down cleanly (releasing GPU)...", flush=True)
+    raise SystemExit(143)
+
+
+# Installed at import time so even a TERM during the heavy imports/model load exits
+# cleanly. (On native Windows taskkill bypasses signals — this is for POSIX/WSL.)
+signal.signal(signal.SIGTERM, _graceful_exit)
+signal.signal(signal.SIGINT, _graceful_exit)
 
 
 def main():

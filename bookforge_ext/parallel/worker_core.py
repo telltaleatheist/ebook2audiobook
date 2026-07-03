@@ -269,6 +269,12 @@ def run_worker_tts(
     Returns:
         dict with success status and details
     """
+    # Sentence indices whose output file may be half-written right now. A cooperative
+    # stop (SIGTERM → SystemExit, see worker.py) can land mid-conversion; the except
+    # below deletes these so resume re-renders them instead of keeping a truncated
+    # file that passes the >1KB resume check.
+    in_flight: list[int] = []
+    sentences_dir_for_cleanup: str | None = None
     try:
         # Load session state — use override path if provided (for cached sessions
         # that aren't in the default e2a tmp dir)
@@ -291,6 +297,7 @@ def run_worker_tts(
 
         # Ensure sentences directory exists
         os.makedirs(session['sentences_dir'], exist_ok=True)
+        sentences_dir_for_cleanup = session['sentences_dir']
 
         # Flatten chapter_sentences to get all sentences
         all_sentences = []
@@ -362,7 +369,9 @@ def run_worker_tts(
                 nonlocal processed, first_logged
                 if not pending:
                     return
+                in_flight[:] = [idx for idx, _ in pending]
                 results = tts_manager.convert_sentences_batch(pending)
+                in_flight.clear()
                 for (idx, _), ok in zip(pending, results):
                     if not ok:
                         print(f"[WORKER] Warning: Failed to convert sentence {idx}")
@@ -412,7 +421,9 @@ def run_worker_tts(
                 print(f"Converting sentence {i}/{total_sentences} ({progress_pct:.1f}%)")
 
                 # Convert sentence to audio
+                in_flight[:] = [i]
                 success = tts_manager.convert_sentence2audio(i, sentence)
+                in_flight.clear()
                 if not success:
                     print(f"[WORKER] Warning: Failed to convert sentence {i}")
                     # Continue anyway - some sentences may fail
@@ -442,6 +453,23 @@ def run_worker_tts(
             'sentence_end': sentence_end,
             'elapsed_seconds': elapsed
         }
+
+    except (KeyboardInterrupt, SystemExit):
+        # Cooperative stop (SIGTERM → SystemExit from worker.py's handler): delete any
+        # half-written in-flight outputs so resume re-renders them, then RE-RAISE so
+        # the interpreter exits normally — finally/atexit blocks run (orpheus.py's
+        # CUDA cleanup) and the GPU is released from inside the process.
+        if sentences_dir_for_cleanup and in_flight:
+            for idx in in_flight:
+                p = os.path.join(sentences_dir_for_cleanup, f'{idx}.{default_audio_proc_format}')
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+            print(f"[WORKER] Stop requested — dropped {len(in_flight)} in-flight output(s); exiting cleanly")
+        else:
+            print("[WORKER] Stop requested — exiting cleanly")
+        raise
 
     except Exception as e:
         import traceback
