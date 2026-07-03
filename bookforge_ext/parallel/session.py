@@ -542,8 +542,9 @@ def worker_only(args: dict, core_module) -> dict:
         if not sentence_mode and not chapter_mode:
             return {'success': False, 'error': 'Must specify sentence or chapter range'}
 
-        # Load session state
-        session_dir = os.path.join(tmp_dir, f"ebook-{session_id}")
+        # Load session state — honor an explicit --session_dir (BookForge points this
+        # at the durable project cache; the tmp session may be gone/relocated on WSL).
+        session_dir = args.get('session_dir') or os.path.join(tmp_dir, f"ebook-{session_id}")
         if not os.path.exists(session_dir):
             return {'success': False, 'error': f"Session directory not found: {session_dir}"}
 
@@ -565,7 +566,10 @@ def worker_only(args: dict, core_module) -> dict:
         session['session_dir'] = state['session_dir']
         session['process_dir'] = state['process_dir']
         session['chapters_dir'] = state.get('chapters_dir') or os.path.join(state['process_dir'], 'chapters')
-        session['sentences_dir'] = state.get('chapters_dir_sentences') or os.path.join(state['process_dir'], 'chapters', 'sentences')
+        # --sentences_dir (BookForge) is the single authoritative sentence store: new
+        # sentences are written here and existing ones are skipped (resume). Explicit
+        # override wins over the (possibly stale) session-state path.
+        session['sentences_dir'] = args.get('sentences_dir') or state.get('chapters_dir_sentences') or os.path.join(state['process_dir'], 'chapters', 'sentences')
         session['epub_path'] = state.get('epub_path_internal')
         session['filename_noext'] = state.get('filename_noext')
         session['cover'] = state.get('cover')

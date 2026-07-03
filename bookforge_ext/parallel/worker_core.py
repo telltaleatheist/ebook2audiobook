@@ -201,7 +201,11 @@ def create_worker_session(state: dict, args: dict) -> dict:
         'session_dir': state['session_dir'],
         'process_dir': state['process_dir'],
         'chapters_dir': state.get('chapters_dir') or os.path.join(state['process_dir'], 'chapters'),
-        'sentences_dir': state.get('chapters_dir_sentences') or os.path.join(state['process_dir'], 'chapters', 'sentences'),
+        # --sentences_dir (BookForge) is the single authoritative sentence store: the
+        # worker writes new sentences here AND skips ones already present here (resume).
+        # Explicit override wins over the session-state path (which may be a stale tmp
+        # location from a different machine/WSL). Precedence, not a bug-hiding fallback.
+        'sentences_dir': args.get('sentences_dir') or state.get('chapters_dir_sentences') or os.path.join(state['process_dir'], 'chapters', 'sentences'),
         'epub_path': state.get('epub_path_internal'),
         'filename_noext': state.get('filename_noext'),
         'final_name': state.get('final_name'),

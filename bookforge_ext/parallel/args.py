@@ -140,11 +140,13 @@ def add_arguments(parser):
 
     parallel_group.add_argument(
         '--sentences_dir', type=str, default=None,
-        help='(assemble_only) Override ONLY the sentence-audio source folder, while '
-             'keeping chapter mapping / metadata / VTT from the session state. The '
-             'folder must contain sentence files named {i}.<ext> matching the session. '
-             'Used by BookForge to assemble a post-processed sentence set (e.g. RVC '
-             'voice-enhanced renders) without disturbing the cached original sentences.'
+        help='Override the sentence-audio folder for BOTH generation and assembly, '
+             'while keeping chapter mapping / metadata / VTT from the session state. '
+             'In worker_mode this is the single authoritative sentence store: new '
+             'sentences are written here and existing {i}.<ext> files are skipped '
+             '(resume). In assemble_only it selects the sentence source (e.g. an RVC '
+             'voice-enhanced set) without disturbing the cached originals. Used by '
+             'BookForge to point e2a at the durable project sentence cache.'
     )
 
     parallel_group.add_argument(
