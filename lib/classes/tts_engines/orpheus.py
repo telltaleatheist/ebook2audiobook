@@ -751,7 +751,20 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
         return codes
 
     def _tokens_to_audio(self, tokens: list) -> np.ndarray:
-        """Convert Orpheus tokens to audio using SNAC decoder."""
+        """Convert Orpheus tokens to audio using SNAC decoder.
+
+        OOM-resilient: a CUDA OOM here used to fail the whole sentence, which the
+        batch path then re-generated through vLLM — wasted GPU-minutes for an
+        audio-decode hiccup. Seen in production as tiny (32–88 MiB) allocations
+        failing with ~11 GiB reported free: allocator/VA fragmentation in the
+        long-lived WSL worker, not real memory pressure. Recovery ladder:
+          (1) torch.cuda.empty_cache() and retry on the GPU;
+          (2) decode THIS sentence on CPU (SNAC is a small convnet — one CPU
+              decode is cheap) and move the model back to the GPU after;
+          (3) if it can't move back, leave SNAC on CPU permanently — decodes
+              keep working (slightly slower) instead of failing the run.
+        Every step logs loudly so a degraded run is visible, never silent.
+        """
         if not tokens:
             return np.zeros(int(self.SAMPLE_RATE * 0.1), dtype=np.float32)
 
@@ -760,9 +773,32 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
         if codes is None:
             return np.zeros(int(self.SAMPLE_RATE * 0.1), dtype=np.float32)
 
-        # Decode with SNAC
-        with torch.no_grad():
-            audio = self.snac_model.decode(codes)
+        # Decode on whatever device SNAC currently lives on (it may have been
+        # stranded on the CPU by a previous OOM — see the ladder below).
+        snac_device = next(self.snac_model.parameters()).device
+        codes = [c.to(snac_device) for c in codes]
+
+        try:
+            with torch.no_grad():
+                audio = self.snac_model.decode(codes)
+        except torch.cuda.OutOfMemoryError:
+            print("Orpheus SNAC decode hit CUDA OOM; freeing the allocator cache and retrying on GPU")
+            torch.cuda.empty_cache()
+            try:
+                with torch.no_grad():
+                    audio = self.snac_model.decode(codes)
+            except torch.cuda.OutOfMemoryError:
+                print("Orpheus SNAC decode OOM persists; decoding this sentence on the CPU")
+                cpu_codes = [c.cpu() for c in codes]
+                self.snac_model.to('cpu')
+                with torch.no_grad():
+                    audio = self.snac_model.decode(cpu_codes)
+                try:
+                    self.snac_model.to(self._device)
+                except torch.cuda.OutOfMemoryError:
+                    # Stay on CPU: future decodes follow snac_device above, so the
+                    # run keeps producing audio instead of dying. Loud, not silent.
+                    print("Orpheus SNAC could not return to the GPU; leaving the decoder on CPU for the rest of this run")
 
         # Convert to numpy
         audio_np = audio.squeeze().cpu().numpy()
@@ -979,7 +1015,15 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
                         print(f"Orpheus batch decode error for sentence {idx}: {decode_err}")
                         results[idx] = False
 
-            self._cleanup_memory()
+            # NO _cleanup_memory() here: it empty_cache()s the CUDA allocator, and at
+            # one flush per batch (~113 per book) every subsequent batch re-allocates
+            # from the raw driver — through WSL's paravirtual (dxg) path that is both
+            # slow and a VA-fragmentation source (the very OOMs the decode ladder
+            # above recovers from). The caching allocator is bounded by vLLM's
+            # reservation regardless; host-side garbage is handled by refcounting and
+            # the periodic cleanup the worker does between chunks.
+            import gc
+            gc.collect()
             return [results.get(idx, False) for idx, _ in items]
         except Exception as e:
             print(f'Orpheus.convert_batch() error: {e}')
