@@ -98,6 +98,12 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
     SUPPORTS_BATCH = True
     BATCH_SIZE = int(os.environ.get('ORPHEUS_BATCH_SIZE', '16'))
 
+    # Max audio tokens per MLX batched generation. Rows that hit this cap without
+    # emitting the end-of-audio token would ship CLIPPED audio; the batch paths
+    # detect that and re-render the row split at sentence boundaries
+    # (_generate_mlx_safe), mirroring the vLLM ladder below.
+    MLX_MAX_TOKENS = int(os.environ.get('ORPHEUS_MLX_MAX_TOKENS', '2048'))
+
     # Max audio tokens per generation. ~8 audio tokens/char, so ~3700 covers the
     # ~450-char multi-sentence chunks core.py now feeds Orpheus while staying under
     # the 4096 model context (prompt + audio). A chunk that would exceed this is
@@ -298,7 +304,21 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
 
     def _load_mlx_engine(self):
         """Load model using MLX backend (Mac only, fastest)."""
+        import mlx.core as mx
         from mlx_audio.tts.utils import load_model
+
+        # Bound the MLX buffer cache. Without a limit the allocator's cache of
+        # freed buffers grows to ~46 GB over a single batched chunk (measured,
+        # M1 Ultra: SNAC decode + per-step generation buffers come in many
+        # distinct sizes, so freed buffers pile up per size-bucket) — that's the
+        # memory-pressure spike, NOT the active weights+KV (~22 GB at batch 96).
+        # A bounded cache also beats the old per-chunk mx.clear_cache() flush:
+        # buffers still get reused (a full flush forces cold Metal re-allocation
+        # every chunk) and the footprint stays flat for the whole run.
+        # Measured at batch 96: 8 GB limit = 28.1 sent/min vs 27.2 flush-per-chunk.
+        cache_gb = float(os.environ.get('ORPHEUS_MLX_CACHE_LIMIT_GB', '8'))
+        mx.set_cache_limit(int(cache_gb * 1e9))
+        print(f"Orpheus MLX buffer cache limited to {cache_gb:g} GB")
 
         print(f"Loading Orpheus model with MLX: {self.MLX_MODEL}")
         model = load_model(self.MLX_MODEL)
@@ -535,6 +555,21 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
 
         return audio_np
 
+    def _generate_mlx_safe(self, clean: str, depth: int = 0) -> np.ndarray:
+        """Render a sentence whose batched MLX generation hit the token cap:
+        split at sentence/space boundaries and render each part on its own,
+        concatenating the audio so nothing is clipped — the MLX sibling of
+        _generate_audio_vllm_safe. Recurses a couple of levels for unusually
+        dense text; a part that still can't finish is accepted as-is (same
+        bottom rung as the vLLM ladder)."""
+        import numpy as np
+        if depth >= 3 or len(clean) < 80:
+            return self._generate_mlx(clean, max_tokens=self.MLX_MAX_TOKENS)
+        parts = self._split_long_text(clean, max_length=max(60, len(clean) // 2))
+        if len(parts) < 2:
+            return self._generate_mlx(clean, max_tokens=self.MLX_MAX_TOKENS)
+        return np.concatenate([self._generate_mlx_safe(p, depth + 1) for p in parts])
+
     def _generate_mlx_batch_audio(self, texts: list) -> list:
         """Batch-generate raw audio for many (already-cleaned) sentences in ONE
         MLX BatchGenerator pass — continuous batching, ~3.6x the per-sentence
@@ -553,34 +588,40 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
         from mlx_audio.tts.models.llama.llama import decode_audio_from_codes
 
         results = [None] * len(texts)
-        gen = []  # (index, prompt_tokens) for non-empty sentences
+        gen = []  # (index, clean_text, prompt_tokens) for non-empty sentences
         for i, t in enumerate(texts):
             clean = (t or '').strip()
             if clean:
                 ptoks = self.mlx_model.prepare_input_ids(clean, self.voice)[0].tolist()
-                gen.append((i, ptoks))
+                gen.append((i, clean, ptoks))
 
         if not gen:
             return results
         try:
             bg = BatchGenerator(
                 self.mlx_model,
-                max_tokens=2048,
+                max_tokens=self.MLX_MAX_TOKENS,
                 stop_tokens={self.END_OF_AUDIO_TOKEN},
                 sampler=make_sampler(self.TEMPERATURE, top_p=self.TOP_P),
                 logits_processors=make_logits_processors(None, self.REP_PENALTY, 20),
                 completion_batch_size=len(gen),
                 prefill_batch_size=len(gen),
             )
-            uids = bg.insert([list(p) for _, p in gen])
+            uids = bg.insert([list(p) for _, _, p in gen])
             out = {u: [] for u in uids}
             while responses := bg.next():
                 for r in responses:
                     if r.finish_reason != 'stop':  # stop token (128258) is dropped
                         out[r.uid].append(r.token)
             bg.close()
-            for (i, ptoks), uid in zip(gen, uids):
+            for (i, clean, ptoks), uid in zip(gen, uids):
                 try:
+                    if len(out[uid]) >= self.MLX_MAX_TOKENS:
+                        # Cap hit without finishing — re-render split so the
+                        # played audio is never clipped mid-sentence.
+                        print(f"Orpheus: stream sentence [{i}] hit the MLX audio-token cap; re-rendering split")
+                        results[i] = self._generate_mlx_safe(clean)
+                        continue
                     ids = mx.array([ptoks + out[uid]])
                     code_lists = self.mlx_model.parse_output(ids)
                     if code_lists and len(code_lists[0]) > 0:
@@ -589,7 +630,8 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
                         )
                 except Exception as decode_err:
                     print(f"Orpheus _generate_mlx_batch_audio decode error [{i}]: {decode_err}")
-            mx.clear_cache()
+            # No mx.clear_cache(): the cache is bounded at load (set_cache_limit),
+            # and flushing per read-ahead batch just forces cold re-allocation.
         except Exception as e:
             print(f"Orpheus._generate_mlx_batch_audio() error: {e}")
             import traceback
@@ -1048,11 +1090,14 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
         reconstructed per row exactly as llama.py generate() does for the
         non-streaming path: parse_output(prompt+generated) -> decode_audio_from_codes.
 
-        Memory stays bounded: the bf16 weights (~6 GB) dominate, so the batched
-        KV cache + activations add little — peak RSS is roughly flat across batch
-        sizes (measured ~10 GB at B=16 on M1 Ultra, ~3.6x throughput vs per-item).
-        Sampling matches the single-seq MLX path (_generate_mlx): temp 0.6,
-        top_p 0.9, repetition_penalty 1.1.
+        Memory (measured on M1 Ultra 64 GB, Jul 2026): peak ACTIVE memory is
+        weights ~6.9 GB + ~0.153 GB per batch slot (KV + activations) — 12.8 GB
+        at B=16, 21.5 GB at B=96. On top of that the allocator's buffer CACHE
+        would grow unbounded (~46 GB over one chunk) if not limited — bounded
+        once at load via mx.set_cache_limit (_load_mlx_engine), NOT by per-chunk
+        flushes. Throughput: 12.4 sent/min at B=16 → 27-28 at B=96 (the knee;
+        B=128 is slower). Sampling matches the single-seq MLX path
+        (_generate_mlx): temp 0.6, top_p 0.8, repetition_penalty 1.1.
         """
         try:
             import numpy as np
@@ -1062,7 +1107,7 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
             from mlx_audio.tts.models.llama.llama import decode_audio_from_codes
 
             results = {}
-            gen = []  # (idx, prompt_tokens, (gap_sec, gap_pos)) for non-empty sentences
+            gen = []  # (idx, clean_text, prompt_tokens, (gap_sec, gap_pos)) for non-empty sentences
             for idx, sentence in items:
                 gap = self._classify_gap(sentence)
                 clean = self._clean_sentence_for_tts(sentence)
@@ -1072,19 +1117,19 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
                     # prepare_input_ids prepends "voice: " itself; pass voice, not a
                     # pre-formatted string. Single-string call returns a [1, T] array.
                     ptoks = self.mlx_model.prepare_input_ids(clean, self.voice)[0].tolist()
-                    gen.append((idx, ptoks, gap))
+                    gen.append((idx, clean, ptoks, gap))
 
             if gen:
                 bg = BatchGenerator(
                     self.mlx_model,
-                    max_tokens=2048,
+                    max_tokens=self.MLX_MAX_TOKENS,
                     stop_tokens={self.END_OF_AUDIO_TOKEN},
                     sampler=make_sampler(self.TEMPERATURE, top_p=self.TOP_P),
                     logits_processors=make_logits_processors(None, self.REP_PENALTY, 20),
                     completion_batch_size=len(gen),
                     prefill_batch_size=len(gen),
                 )
-                uids = bg.insert([list(p) for _, p, _ in gen])
+                uids = bg.insert([list(p) for _, _, p, _ in gen])
                 out = {u: [] for u in uids}
                 while responses := bg.next():
                     for r in responses:
@@ -1092,8 +1137,15 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
                             out[r.uid].append(r.token)
                 bg.close()
                 # uids come back in insert order == gen order.
-                for (idx, ptoks, gap), uid in zip(gen, uids):
+                for (idx, clean, ptoks, gap), uid in zip(gen, uids):
                     try:
+                        if len(out[uid]) >= self.MLX_MAX_TOKENS:
+                            # Hit the token cap without finishing → the audio would be
+                            # clipped. Re-render split at sentence boundaries instead.
+                            print(f"Orpheus: sentence {idx} hit the MLX audio-token cap; re-rendering split at sentence boundaries")
+                            audio = self._generate_mlx_safe(clean)
+                            results[idx] = self._save_audio(idx, audio, gap[0], gap[1])
+                            continue
                         ids = mx.array([ptoks + out[uid]])
                         code_lists = self.mlx_model.parse_output(ids)
                         if code_lists and len(code_lists[0]) > 0:
@@ -1107,12 +1159,12 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
                         print(f"Orpheus MLX batch decode error for sentence {idx}: {decode_err}")
                         results[idx] = False
 
-            # Bound MLX's reclaimable scratch pool between chunks (mlx_audio's own
-            # generate() does this per segment). Active memory is already flat —
-            # the weights dominate — but this keeps the cache pool from sitting
-            # large on a machine running other apps.
-            mx.clear_cache()
-            self._cleanup_memory()
+            # NO mx.clear_cache() / _cleanup_memory() here. The buffer cache is
+            # bounded once at load (_load_mlx_engine sets mx.set_cache_limit), so
+            # the footprint stays flat without flushing; a per-chunk flush forces
+            # every next chunk to re-allocate cold from Metal (measured ~3% slower
+            # at batch 96, and it HID the real problem: the cache ballooned to
+            # ~46 GB DURING each chunk, between the flushes).
             return [results.get(idx, False) for idx, _ in items]
         except Exception as e:
             print(f'Orpheus._convert_mlx_batch() error: {e}')
