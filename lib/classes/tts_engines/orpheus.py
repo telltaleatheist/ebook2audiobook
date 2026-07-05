@@ -15,6 +15,34 @@ import weakref
 # Track active Orpheus instances for cleanup on exit
 _active_instances = weakref.WeakSet()
 
+
+class TokenStreamMisaligned(ValueError):
+    """The model emitted an audio-token stream whose codes don't fit their
+    positional slots (see _redistribute_codes). Sampling is stochastic, so a
+    single re-render usually fixes it — but the malformed codes must NEVER
+    reach the GPU, where they trigger a device-side assert that poisons the
+    CUDA context for the rest of the process."""
+
+
+# Error-message markers that mean the CUDA context is dead for THIS PROCESS —
+# every subsequent CUDA call will fail instantly, so continuing sentence-by-
+# sentence just burns the rest of the book in a fast error loop (2026-07-05:
+# 1034 sentences "failed" in seconds after one device-side assert). The only
+# recovery is a fresh process; callers must re-raise, letting the worker die
+# so BookForge's retry machinery respawns it and resumes from files on disk.
+_FATAL_CUDA_MARKERS = (
+    'device-side assert',
+    'illegal memory access',
+    'unspecified launch failure',
+    'context is destroyed',
+)
+
+
+def is_fatal_cuda_error(err: BaseException) -> bool:
+    """True if `err` indicates a poisoned CUDA context (unrecoverable in-process)."""
+    msg = str(err)
+    return any(marker in msg for marker in _FATAL_CUDA_MARKERS)
+
 # Platform-specific vLLM configuration
 if platform.system() == 'Windows':
     # Required for vLLM on Windows
@@ -756,6 +784,17 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
         - Layer 1: 1 code per frame
         - Layer 2: 2 codes per frame
         - Layer 3: 4 codes per frame
+
+        Raises TokenStreamMisaligned if any token lands outside its positional
+        slot. Each of the 7 positions in a frame must fall in ITS OWN 4096-wide
+        sub-range (position p in [p*4096, (p+1)*4096)); the global-range filter
+        below silently drops any interleaved non-audio token, which SHIFTS every
+        later token one position over and makes the offset subtraction produce
+        negative/oversized codes. Those used to go straight into SNAC's codebook
+        index_select on the GPU → `srcIndex < srcSelectDimSize` device-side
+        assert → the CUDA context is poisoned and EVERY later sentence in the
+        run fails instantly (2026-07-05: one bad sentence burned 1200). Failing
+        Python-side keeps it a one-sentence problem the caller can re-render.
         """
         # Filter to valid audio tokens (128266 to 128266+4096*7)
         audio_tokens = [t for t in tokens if 128266 <= t < 128266 + 4096 * 7]
@@ -772,6 +811,16 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
 
         # Subtract base offset
         code_list = [t - 128266 for t in audio_tokens]
+
+        # Every code must sit in its positional slot BEFORE the per-layer offset
+        # subtraction — see the docstring for why an out-of-slot code is fatal.
+        for i in range(len(code_list) // 7):
+            for pos in range(7):
+                code = code_list[7 * i + pos]
+                if not (pos * 4096 <= code < (pos + 1) * 4096):
+                    raise TokenStreamMisaligned(
+                        f"frame {i} slot {pos}: code {code} outside [{pos * 4096}, {(pos + 1) * 4096})"
+                    )
 
         # Distribute across 3 layers with offset subtraction
         layer_1, layer_2, layer_3 = [], [], []
@@ -979,7 +1028,13 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
                 if self.backend == 'mlx':
                     audio_np = self._generate_mlx(clean)
                 elif self.backend == 'vllm':
-                    audio_np = self._tokens_to_audio(self._generate_tokens_vllm(clean))
+                    try:
+                        audio_np = self._tokens_to_audio(self._generate_tokens_vllm(clean))
+                    except TokenStreamMisaligned as align_err:
+                        # Stochastic sampling glitch — one re-render (fresh tokens)
+                        # almost always fixes it. If it misaligns again, let it fail.
+                        print(f"Orpheus: sentence {sentence_index} token stream misaligned ({align_err}); re-rendering once")
+                        audio_np = self._generate_audio_vllm_safe(clean)
                 else:
                     audio_np = self._tokens_to_audio(
                         self._generate_tokens_transformers(f"{self.voice}: {clean}")
@@ -991,9 +1046,15 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
                 print(f"Orpheus generation error for sentence {sentence_index}: {gen_error}")
                 import traceback
                 traceback.print_exc()
+                if is_fatal_cuda_error(gen_error):
+                    # Poisoned CUDA context: nothing else in this process can
+                    # succeed. Die loudly so the worker respawns fresh.
+                    raise
                 return False
 
         except Exception as e:
+            if is_fatal_cuda_error(e):
+                raise
             print(f'Orpheus.convert() error: {e}')
             import traceback
             traceback.print_exc()
@@ -1045,7 +1106,14 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
                         if self.END_OF_AUDIO_TOKEN in tokens:
                             # Finished cleanly: decode up to the end-of-audio token.
                             tokens = tokens[:tokens.index(self.END_OF_AUDIO_TOKEN)]
-                            audio_np = self._tokens_to_audio(tokens)
+                            try:
+                                audio_np = self._tokens_to_audio(tokens)
+                            except TokenStreamMisaligned as align_err:
+                                # Stochastic sampling glitch — one re-render (fresh
+                                # tokens) almost always fixes it. If it misaligns
+                                # again, the outer except fails just this sentence.
+                                print(f"Orpheus: sentence {idx} token stream misaligned ({align_err}); re-rendering once")
+                                audio_np = self._generate_audio_vllm_safe(clean)
                         else:
                             # Hit the token cap without finishing → the chunk was too long
                             # and the audio would be clipped. Re-render it split at sentence
@@ -1055,6 +1123,11 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
                         results[idx] = self._save_audio(idx, audio_np, gap[0], gap[1])
                     except Exception as decode_err:
                         print(f"Orpheus batch decode error for sentence {idx}: {decode_err}")
+                        if is_fatal_cuda_error(decode_err):
+                            # Poisoned CUDA context: every remaining sentence would
+                            # fail instantly too. Die loudly; the worker respawns and
+                            # resumes from the sentence files already on disk.
+                            raise
                         results[idx] = False
 
             # NO _cleanup_memory() here: it empty_cache()s the CUDA allocator, and at
@@ -1071,6 +1144,11 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
             print(f'Orpheus.convert_batch() error: {e}')
             import traceback
             traceback.print_exc()
+            if is_fatal_cuda_error(e):
+                # Do NOT fall through to the per-item retry: with a poisoned CUDA
+                # context each convert() would fail in microseconds and the run
+                # would churn through the whole book marking sentences failed.
+                raise
             # A batch-level failure shouldn't lose the whole chunk — retry per item.
             return [self.convert(idx, s) for idx, s in items]
 
