@@ -13,10 +13,23 @@ Functions are extracted from lib/core.py to isolate BookForge customizations.
 import hashlib
 import json
 import os
+import re
 import shutil
 import uuid
 from datetime import datetime
 from pathlib import Path
+
+# A "sentence" in the parallel pipeline is a GENERATION CHUNK, which for Orpheus/Voxtral
+# packs 2-3 real sentences per chunk (see lib/core.py get_sentences PASS 5). To report a
+# true sentences/min rate for analytics — while the pipeline keeps scheduling by chunk —
+# count the real sentence boundaries inside each chunk: terminal .!?… (optionally wrapped
+# by closing quotes/brackets) followed by whitespace or end-of-string. A chunk with no
+# terminal punctuation (e.g. a heading) still counts as one sentence.
+_SENTENCE_END_RE = re.compile(r'[.!?…]+["\'”’)\]]*(?:\s|$)')
+
+
+def count_real_sentences(chunk: str) -> int:
+    return max(1, len(_SENTENCE_END_RE.findall(chunk or '')))
 
 from lib.conf import (
     tmp_dir,
@@ -462,7 +475,13 @@ def prep_ebook_info(args: dict, core_module) -> dict | None:
                 session['chapters'] = get_chapters(session_id, epubBook)
                 if session['chapters']:
                     total_chapters = len(session['chapters'])
+                    # total_sentences is the number of GENERATION CHUNKS (scheduling unit).
+                    # total_raw_sentences is the REAL sentence count inside those chunks —
+                    # for a true sentences/min analytics rate; the pipeline is unchanged.
                     total_sentences = sum(len(chapter) for chapter in session['chapters'])
+                    total_raw_sentences = sum(
+                        count_real_sentences(c) for chapter in session['chapters'] for c in chapter
+                    )
 
                     # Build chapter info
                     chapter_info = []
@@ -471,6 +490,7 @@ def prep_ebook_info(args: dict, core_module) -> dict | None:
                         chapter_info.append({
                             'chapter_num': i + 1,
                             'sentence_count': len(chapter),
+                            'raw_sentence_count': sum(count_real_sentences(c) for c in chapter),
                             'sentence_start': sentence_offset,
                             'sentence_end': sentence_offset + len(chapter) - 1
                         })
@@ -484,6 +504,7 @@ def prep_ebook_info(args: dict, core_module) -> dict | None:
                         'chapters_dir_sentences': session['sentences_dir'],
                         'total_chapters': total_chapters,
                         'total_sentences': total_sentences,
+                        'total_raw_sentences': total_raw_sentences,
                         'chapters': chapter_info,
                         'chapter_sentences': list(session['chapters']),
                         'metadata': {
