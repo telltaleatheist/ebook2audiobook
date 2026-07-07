@@ -351,9 +351,45 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
 
         print(f"Loading Orpheus model with MLX: {self.MLX_MODEL}")
         model = load_model(self.MLX_MODEL)
+        # Fine-tuned Orpheus voices were TRAINED with the prompt ending in
+        # [128261, 128257] (START_OF_AI, START_OF_SPEECH) immediately before the audio
+        # codes (orpheus_owen.py build_dataset; mirrored by _format_prompt_ids). But
+        # mlx_audio's prepare_input_ids stops at [128009, 128260] (END_OF_TEXT,
+        # END_OF_HUMAN) and relies on the BASE model to free-generate SOA/SOS — which is
+        # out-of-distribution for our fine-tunes, so they vocalize the voice token /
+        # stray syllables at chunk starts. The vLLM/transformers backends frame this
+        # correctly via _format_prompt_ids; MLX bypasses that helper, so patch the
+        # library's framing at load to restore the exact training frame.
+        self._patch_mlx_prompt_framing(model)
         self._device = 'mlx'  # MLX manages its own device
         print("Orpheus MLX model loaded!")
         return model
+
+    def _patch_mlx_prompt_framing(self, model):
+        """Make mlx_audio frame fine-tuned voices exactly like training: append
+        [START_OF_AI, START_OF_SPEECH] to the plain-voice prompt. Wrapping
+        prepare_input_ids (which model.generate() also calls, llama.py:396) covers
+        EVERY MLX path in one place — single (_generate_mlx), batch/streaming
+        (_generate_mlx_batch_audio) and audiobook (_convert_mlx_batch). Voice-cloning
+        calls (ref_audio/ref_text -> tuple return) are left untouched."""
+        import mlx.core as mx
+        orig = model.prepare_input_ids
+        AI_SPEECH = mx.array([[128261, 128257]], dtype=mx.int64)  # START_OF_AI, START_OF_SPEECH
+
+        def prepare_input_ids(prompt, voice=None, zeroprompt=None, ref_audio=None,
+                              ref_text=None, *args, **kwargs):
+            ids = orig(prompt, voice, zeroprompt, ref_audio, ref_text, *args, **kwargs)
+            plain = (voice is not None and zeroprompt is None
+                     and ref_audio is None and ref_text is None)
+            # Only the plain fine-tuned-voice frame ([SOH]..[EOT EOH]) is missing the
+            # SOA/SOS suffix; guard on the exact tail so nothing else is altered.
+            if plain and not isinstance(ids, tuple) and ids.shape[0] == 1 \
+                    and ids[0].tolist()[-2:] == [128009, 128260]:
+                ids = mx.concatenate([ids, AI_SPEECH], axis=1)
+            return ids
+
+        model.prepare_input_ids = prepare_input_ids
+        print("Orpheus MLX prompt framing patched for fine-tuned voices (SOA+SOS suffix)")
 
     def _load_snac(self):
         """Load the SNAC audio decoder (not needed for MLX - it handles decoding internally)."""
