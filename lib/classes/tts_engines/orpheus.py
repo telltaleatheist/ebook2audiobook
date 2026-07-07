@@ -666,36 +666,33 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
             traceback.print_exc()
         return results
 
-    def _format_prompt_with_special_tokens(self, text: str) -> str:
-        """Format prompt with Orpheus special tokens for audio generation.
+    def _format_prompt_ids(self, text: str) -> list:
+        """Return the exact Orpheus input token IDs for `text`.
 
-        Orpheus requires specific tokens to trigger audio generation:
-        - Start token: 128259 (<custom_token_3>)
-        - End tokens: [128009, 128260, 128261, 128257]
+        Framing (MUST match training in orpheus_owen.py's build_dataset):
+          [128259]                        START_OF_HUMAN
+          + tokenizer("voice: text")      (leading BOS 128000 + text tokens)
+          + [128009, 128260, 128261, 128257]   END_OF_TEXT, END_OF_HUMAN,
+                                                START_OF_AI, START_OF_SPEECH
+
+        These IDs are fed straight to vLLM via TokensPrompt. The OLD code decoded
+        this sequence back to a STRING and let vLLM re-tokenize it, which prepended
+        a STRAY second BOS (128000) — an out-of-distribution prompt that made the
+        model vocalize the voice token at chunk starts (the "rohan"/"deathstalker"
+        leak). Feeding IDs directly makes the runtime prompt byte-identical to the
+        one the model was trained on, so the voice token is consumed silently.
         """
-        import torch
-
-        # Format: "voice: text"
-        adapted_prompt = f"{self.voice}: {text}"
-        prompt_tokens = self.tokenizer(adapted_prompt, return_tensors="pt")
-
-        # Add special tokens
-        start_token = torch.tensor([[128259]], dtype=torch.int64)
-        end_tokens = torch.tensor([[128009, 128260, 128261, 128257]], dtype=torch.int64)
-        all_input_ids = torch.cat([start_token, prompt_tokens.input_ids, end_tokens], dim=1)
-
-        # Decode back to string for vLLM
-        prompt_string = self.tokenizer.decode(all_input_ids[0])
-        return prompt_string
+        body = self.tokenizer(f"{self.voice}: {text}").input_ids   # includes leading BOS
+        return [128259] + list(body) + [128009, 128260, 128261, 128257]
 
     def _generate_tokens_vllm(self, prompt: str, max_tokens: int = None) -> list:
         """Generate audio tokens using vLLM backend."""
-        from vllm import SamplingParams
+        from vllm import SamplingParams, TokensPrompt
         if max_tokens is None:
             max_tokens = self.MAX_AUDIO_TOKENS
 
-        # Format prompt with special tokens
-        formatted_prompt = self._format_prompt_with_special_tokens(prompt)
+        # Feed token IDs directly (no decode->re-tokenize round-trip; see _format_prompt_ids)
+        prompt_ids = self._format_prompt_ids(prompt)
 
         sampling_params = SamplingParams(
             temperature=self.TEMPERATURE,
@@ -705,7 +702,7 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
             stop_token_ids=[self.END_OF_AUDIO_TOKEN]
         )
 
-        outputs = self.engine.generate([formatted_prompt], sampling_params)
+        outputs = self.engine.generate([TokensPrompt(prompt_token_ids=prompt_ids)], sampling_params)
         tokens = list(outputs[0].outputs[0].token_ids)
 
         # Truncate at end-of-audio token if present
@@ -722,17 +719,17 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
         up to a small depth so even an unusually dense chunk produces complete,
         un-clipped audio. Returns a numpy waveform (same as _tokens_to_audio).
         """
-        from vllm import SamplingParams
+        from vllm import SamplingParams, TokensPrompt
         import numpy as np
         sampling_params = SamplingParams(
             temperature=self.TEMPERATURE, top_p=self.TOP_P, repetition_penalty=self.REP_PENALTY,
             max_tokens=self.MAX_AUDIO_TOKENS, stop_token_ids=[self.END_OF_AUDIO_TOKEN]
         )
-        formatted = self._format_prompt_with_special_tokens(clean)
+        prompt = TokensPrompt(prompt_token_ids=self._format_prompt_ids(clean))
         try:
-            outputs = self.engine.generate([formatted], sampling_params, use_tqdm=False)
+            outputs = self.engine.generate([prompt], sampling_params, use_tqdm=False)
         except TypeError:
-            outputs = self.engine.generate([formatted], sampling_params)
+            outputs = self.engine.generate([prompt], sampling_params)
         tokens = list(outputs[0].outputs[0].token_ids)
         finished = self.END_OF_AUDIO_TOKEN in tokens
         if finished:
@@ -749,9 +746,12 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
         """Generate audio tokens using transformers backend."""
         if max_tokens is None:
             max_tokens = self.MAX_AUDIO_TOKENS
-        # Encode prompt
-        inputs = self.tokenizer(prompt, return_tensors="pt")
-        input_ids = inputs.input_ids.to(self.engine.device)
+        # Apply the SAME framing as the vLLM path (_format_prompt_ids): SOH + BOS+text
+        # + EOT,EOH,SOA,SOS. Without it the model gets an un-framed prompt and vocalizes
+        # the voice token at chunk starts. `prompt` arrives pre-joined as "voice: text".
+        body = self.tokenizer(prompt).input_ids
+        framed = [128259] + list(body) + [128009, 128260, 128261, 128257]
+        input_ids = torch.tensor([framed], dtype=torch.long).to(self.engine.device)
 
         # Generate with repetition penalty to avoid garbage loops
         with torch.no_grad():
@@ -1076,24 +1076,24 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
         if self.backend != 'vllm' or not self.engine:
             return [self.convert(idx, s) for idx, s in items]
         try:
-            from vllm import SamplingParams
+            from vllm import SamplingParams, TokensPrompt
 
             results = {}
-            gen = []  # (idx, clean_text, formatted_prompt, (gap_sec, gap_pos)) for non-empty sentences
+            gen = []  # (idx, clean_text, prompt_ids, (gap_sec, gap_pos)) for non-empty sentences
             for idx, sentence in items:
                 gap = self._classify_gap(sentence)
                 clean = self._clean_sentence_for_tts(sentence)
                 if not clean:
                     results[idx] = self._write_silence(idx)
                 else:
-                    gen.append((idx, clean, self._format_prompt_with_special_tokens(clean), gap))
+                    gen.append((idx, clean, self._format_prompt_ids(clean), gap))
 
             if gen:
                 sampling_params = SamplingParams(
                     temperature=self.TEMPERATURE, top_p=self.TOP_P, repetition_penalty=self.REP_PENALTY,
                     max_tokens=self.MAX_AUDIO_TOKENS, stop_token_ids=[self.END_OF_AUDIO_TOKEN]
                 )
-                prompts = [fp for _, _, fp, _ in gen]
+                prompts = [TokensPrompt(prompt_token_ids=fp) for _, _, fp, _ in gen]
                 # use_tqdm=False: a per-call progress bar adds overhead and noise.
                 try:
                     outputs = self.engine.generate(prompts, sampling_params, use_tqdm=False)
