@@ -139,10 +139,11 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
     # audio is never clipped. Override with ORPHEUS_MAX_TOKENS.
     MAX_AUDIO_TOKENS = int(os.environ.get('ORPHEUS_MAX_TOKENS', '3700'))
 
-    # Sampling params at the Orpheus reference values. (Cooling temperature to 0.5
-    # was tried to suppress the spurious leading-syllable artifact and made it WORSE:
-    # it didn't remove the onset and it flattened prosody. The artifact tracks chunk
-    # boundaries, not sampling — see the ~250-char single-sentence chunking in core.py.)
+    # Sampling params at the Orpheus reference values. The spurious leading-syllable
+    # artifact once chased here (cooling temperature to 0.5 only flattened prosody and
+    # didn't remove it) was a prompt-framing bug — a stray BOS in the vLLM prompt,
+    # fixed in _format_prompt_ids — NOT sampling or chunk size. With the framing correct
+    # core.py packs 2-3 sentences per chunk (~450 chars); temp 0.6 is the reference.
     # All three override via env so they can be A/B-tuned live
     # (ORPHEUS_TEMPERATURE / ORPHEUS_TOP_P / ORPHEUS_REP_PENALTY).
     TEMPERATURE = float(os.environ.get('ORPHEUS_TEMPERATURE', '0.6'))

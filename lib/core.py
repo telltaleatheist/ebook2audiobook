@@ -1028,18 +1028,19 @@ def filter_chapter(idx:int, doc:EpubHtml, session_id:str, stanza_nlp:Pipeline, i
                 prev_typ = typ
             msg = f'Flattening as raw text…'
             print(msg)
-            # Voxtral is a long-form model and benefits from larger multi-sentence
-            # chunks. Orpheus is the opposite: it is a SENTENCE-level model, and
-            # packing 2-3 sentences into one generation (~450 chars, tried earlier)
-            # made prosody drift AND glitched at the internal sentence transitions —
-            # heard as a stray syllable/gibberish at the start of sentences. Keep
-            # Orpheus at ~one sentence per generation (~250 chars for English); the
-            # token-cap re-split in orpheus.py (_generate_audio_vllm_safe) still
-            # guards the rare over-long sentence so audio is never clipped.
+            # Voxtral and Orpheus both read better multi-sentence: packing 2-3
+            # sentences per generation keeps timbre/prosody coherent across a passage
+            # instead of making every sentence an independent "take". (The stray
+            # syllable/gibberish at sentence starts once blamed on Orpheus
+            # multi-sentence packing was actually a prompt-framing bug — a stray BOS
+            # in the vLLM prompt — since fixed in orpheus.py _format_prompt_ids.
+            # Packing is safe again.) Orpheus caps a touch below Voxtral to stay
+            # inside its ~3700 audio-token budget (orpheus.py MAX_AUDIO_TOKENS); the
+            # token-cap re-split there still guards any over-long chunk from clipping.
             if tts_engine == 'voxtral':
                 max_chars = language_mapping[lang]['max_chars'] * 2  # ~500 chars
             elif tts_engine == 'orpheus':
-                max_chars = language_mapping[lang]['max_chars']  # ~250 chars for English (one sentence)
+                max_chars = int(language_mapping[lang]['max_chars'] * 1.8)  # ~450 chars (2-3 sentences)
             else:
                 max_chars = int(language_mapping[lang]['max_chars'] / 1.5)
             clean_list = []
@@ -1296,13 +1297,17 @@ def get_sentences(text:str, session_id:str)->list|None:
         if not session:
             return None
         lang, tts_engine = session['language'], session['tts_engine']
-        # Use full max_chars (~250 for English) - splits at soft punctuation only if needed
-        # This produces better prosody by keeping full sentences together.
-        # Voxtral is a long-form model — double the chunk size (~500 chars, its design
-        # point) so multiple sentences render together and prosody stays consistent.
+        # Base chunk size splits at soft punctuation only if needed, keeping full
+        # sentences together for better prosody. Voxtral (long-form) doubles it
+        # (~500 chars); Orpheus packs 2-3 sentences per generation (~450 chars,
+        # capped to its ~3700 audio-token budget — see orpheus.py MAX_AUDIO_TOKENS)
+        # now that the sentence-start artifact (a prompt-framing/stray-BOS bug) is
+        # fixed. Both then greedily pack adjacent sentences below (PASS 5).
         max_chars = language_mapping[lang]['max_chars']
         if tts_engine == 'voxtral':
             max_chars *= 2
+        elif tts_engine == 'orpheus':
+            max_chars = int(max_chars * 1.8)
 
         assert not SML_TAG_PATTERN.search(text)
 
@@ -1457,6 +1462,33 @@ def get_sentences(text:str, session_id:str)->list|None:
                     if not s:
                         continue
                     if packed and clean_len(packed[-1]) + 1 + clean_len(s) <= max_chars:
+                        packed[-1] = packed[-1].rstrip() + ' ' + s.lstrip()
+                    else:
+                        packed.append(s)
+                return packed
+            if tts_engine == 'orpheus':
+                # PASS 5 (Orpheus) — greedily pack adjacent sentences up to max_chars so
+                # each generation spans 2-3 sentences: coherent timbre/prosody across a
+                # passage instead of a per-sentence "take". (Re-enabled once the
+                # sentence-start artifact was traced to a prompt-framing/stray-BOS bug
+                # in orpheus.py, not the packing itself.)
+                #
+                # BOUNDARY-AWARE, unlike Voxtral: a sentence carrying an SML token
+                # ([break]/[pause]/…) is NEVER merged. orpheus.py inserts inter-clip
+                # silence per returned item via _classify_gap and strips those tokens
+                # before TTS (_clean_sentence_for_tts), so merging across one would
+                # SILENTLY DROP that paragraph/section pause. A sentence has SML when
+                # its escaped form is shorter than its raw form (strip_escaped_sml drops
+                # the escaped tag chars). Only plain-prose runs pack; every pause is kept.
+                def _plain(s:str)->bool:
+                    return clean_len(s) == len(s)
+                packed = []
+                for s in final_list:
+                    s = s.strip()
+                    if not s:
+                        continue
+                    if (packed and _plain(packed[-1]) and _plain(s)
+                            and clean_len(packed[-1]) + 1 + clean_len(s) <= max_chars):
                         packed[-1] = packed[-1].rstrip() + ' ' + s.lstrip()
                     else:
                         packed.append(s)
