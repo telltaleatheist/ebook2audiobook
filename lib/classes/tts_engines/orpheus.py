@@ -1054,12 +1054,14 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
             pos = 'lead' if re.match(r'\[(?:break|silence)', lowered) else 'trail'
             return gap, pos
 
-        # Plain sentence end — short breathing gap. Widened in steps (0.25-0.35 ->
-        # 0.40-0.55 -> 0.55-0.75): the model's intra-sentence pacing is good, but
-        # back-to-back sentences still ran too packed together (esp. the deathstalker
-        # voice, which clips its own trailing breath short).
+        # Plain sentence end — the gap BETWEEN chunks (each packed chunk of 2-3
+        # sentences ends here). Was a random 0.55-0.75; the random short end left
+        # some chunk-to-chunk transitions too tight while the long end sounded
+        # right, so this is now a FIXED 0.75 for consistent chunk spacing. (Pauses
+        # WITHIN a chunk are the model's own and are unaffected.) Override with
+        # ORPHEUS_SENTENCE_GAP to retune without a code change.
         override = _env('ORPHEUS_SENTENCE_GAP')
-        gap = override if override is not None else int(np.random.uniform(0.55, 0.75) * 100) / 100
+        gap = override if override is not None else 0.75
         return gap, 'trail'
 
     def _write_silence(self, sentence_index: int) -> bool:
