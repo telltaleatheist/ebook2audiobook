@@ -130,7 +130,15 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
     # emitting the end-of-audio token would ship CLIPPED audio; the batch paths
     # detect that and re-render the row split at sentence boundaries
     # (_generate_mlx_safe), mirroring the vLLM ladder below.
-    MLX_MAX_TOKENS = int(os.environ.get('ORPHEUS_MLX_MAX_TOKENS', '2048'))
+    #
+    # 3700 matches MAX_AUDIO_TOKENS (the vLLM cap): ~8 audio tokens/char means the
+    # ~450-char packed chunks need ~2500-3400 tokens, so the old 2048 default made
+    # nearly EVERY prose chunk overflow into the split ladder — and those split
+    # boundaries were a measured junk source. Validated 2026-07-08 on the 13-chunk
+    # real-book set (M1 Ultra): 2048 → 11 cap-hits, 12.1% WER, 1 catastrophic row,
+    # ~310s; 3700 → 0 cap-hits, 3.5% WER (Whisper noise floor), 0 catastrophic,
+    # ~105s (2.8x faster), peak memory ~13.7 GB (vs ~14.2 at 2048).
+    MLX_MAX_TOKENS = int(os.environ.get('ORPHEUS_MLX_MAX_TOKENS', '3700'))
 
     # Max prompt-length spread (longest/shortest TOKEN count) allowed inside a
     # single MLX BatchGenerator prefill. Mixed-length prompts get heavily left-
