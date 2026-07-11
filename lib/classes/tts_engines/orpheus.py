@@ -809,15 +809,28 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
 
         return tokens
 
-    def _generate_audio_vllm_safe(self, clean: str, depth: int = 0):
+    def _generate_audio_vllm_safe(self, clean: str, depth: int = 0, force_split: bool = False):
         """Render audio for `clean`; if the model hits the token cap before emitting the
         end-of-audio token (the chunk is too long to finish), split it at the nearest
         sentence/space boundary and render each half, concatenating the audio. Recurses
         up to a small depth so even an unusually dense chunk produces complete,
         un-clipped audio. Returns a numpy waveform (same as _tokens_to_audio).
+
+        force_split=True skips the whole-chunk render and splits IMMEDIATELY. The
+        truncation _guard_truncation detects is a CLEAN early EOS — a whole-chunk
+        re-render would very likely EOS cleanly (and truncated) again, and the
+        `finished` accept below would return it without ever splitting: a re-roll,
+        not a fix. Forcing the split renders half-length parts well inside the
+        reliable zone. Parts recurse WITHOUT force_split (the normal cap logic
+        applies to them); text that can't be split (parts < 2) falls through to a
+        normal render.
         """
         from vllm import SamplingParams, TokensPrompt
         import numpy as np
+        if force_split:
+            parts = self._split_long_text(clean, max_length=max(60, len(clean) // 2))
+            if len(parts) >= 2:
+                return np.concatenate([self._generate_audio_vllm_safe(p, depth + 1) for p in parts])
         sampling_params = SamplingParams(
             temperature=self.TEMPERATURE, top_p=self.TOP_P, repetition_penalty=self.REP_PENALTY,
             max_tokens=self.MAX_AUDIO_TOKENS, stop_token_ids=[self.END_OF_AUDIO_TOKEN]
@@ -1111,9 +1124,14 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
     def _guard_truncation(self, sentence_index: int, clean: str, audio_np, resplit):
         """Backstop for silent early-EOS truncation (see _speech_rate). If the
         rendered clip is too short for the text, re-render it split at sentence
-        boundaries via `resplit` (the backend's _generate_*_safe ladder, the same
-        recovery the token-cap branch uses). `resplit` takes the clean text and
-        returns a numpy waveform.
+        boundaries via `resplit` (the backend's _generate_*_safe ladder). `resplit`
+        takes the clean text and returns a numpy waveform — and it must ACTUALLY
+        split, not merely re-render: the failure detected here is a CLEAN early
+        EOS, so a whole-chunk re-render would most likely clean-EOS (truncated)
+        again. The vLLM callers therefore pass _generate_audio_vllm_safe with
+        force_split=True (its plain form accepts any clean EOS unsplit — that's
+        correct for its token-cap callers, useless here); _generate_mlx_safe
+        splits eagerly before rendering, so the MLX callers pass it as-is.
 
         Guard applies only when clean length > 150 chars (short chunks' rates are
         noisy) and ORPHEUS_MAX_CHARS_PER_SEC > 0 (default 19.0; set 0 to disable).
@@ -1205,7 +1223,12 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
                         print(f"Orpheus: sentence {sentence_index} token stream misaligned ({align_err}); re-rendering once")
                         audio_np = self._generate_audio_vllm_safe(clean)
                     # Backstop a silent early-EOS truncation (audio too short for text).
-                    audio_np = self._guard_truncation(sentence_index, clean, audio_np, self._generate_audio_vllm_safe)
+                    # force_split: a whole-chunk re-render would just clean-EOS
+                    # (truncated) again — the resplit must actually split.
+                    audio_np = self._guard_truncation(
+                        sentence_index, clean, audio_np,
+                        lambda c: self._generate_audio_vllm_safe(c, force_split=True)
+                    )
                 else:
                     audio_np = self._tokens_to_audio(
                         self._generate_tokens_transformers(f"{self.voice}: {clean}")
@@ -1293,7 +1316,12 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
                             audio_np = self._generate_audio_vllm_safe(clean)
                         # Backstop a silent early-EOS truncation (clean EOS, audio too
                         # short for the text) that the cap check above can't catch.
-                        audio_np = self._guard_truncation(idx, clean, audio_np, self._generate_audio_vllm_safe)
+                        # force_split: a whole-chunk re-render would just clean-EOS
+                        # (truncated) again — the resplit must actually split.
+                        audio_np = self._guard_truncation(
+                            idx, clean, audio_np,
+                            lambda c: self._generate_audio_vllm_safe(c, force_split=True)
+                        )
                         results[idx] = self._save_audio(idx, audio_np, gap[0], gap[1])
                     except Exception as decode_err:
                         print(f"Orpheus batch decode error for sentence {idx}: {decode_err}")
