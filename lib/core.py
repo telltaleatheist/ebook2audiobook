@@ -1034,13 +1034,18 @@ def filter_chapter(idx:int, doc:EpubHtml, session_id:str, stanza_nlp:Pipeline, i
             # syllable/gibberish at sentence starts once blamed on Orpheus
             # multi-sentence packing was actually a prompt-framing bug — a stray BOS
             # in the vLLM prompt — since fixed in orpheus.py _format_prompt_ids.
-            # Packing is safe again.) Orpheus caps a touch below Voxtral to stay
-            # inside its ~3700 audio-token budget (orpheus.py MAX_AUDIO_TOKENS); the
-            # token-cap re-split there still guards any over-long chunk from clipping.
+            # Packing is safe again.) Orpheus caps WELL below Voxtral: fine-tuned
+            # voices are trained on short clips and start emitting the end-of-audio
+            # token EARLY once a chunk runs past ~300 chars / ~20s of audio, silently
+            # dropping the trailing text (measured on a real book: the p90 speaking
+            # rate blows up to an impossible ~21 ch/s at 400-449 chars — the model
+            # finished with a clean EOS well under MAX_AUDIO_TOKENS, so the token-cap
+            # re-split never fired). ~300 chars keeps chunks inside the reliable zone;
+            # orpheus.py's duration-vs-text guard catches any that still truncate.
             if tts_engine == 'voxtral':
                 max_chars = language_mapping[lang]['max_chars'] * 2  # ~500 chars
             elif tts_engine == 'orpheus':
-                max_chars = int(language_mapping[lang]['max_chars'] * 1.8)  # ~450 chars (2-3 sentences)
+                max_chars = int(language_mapping[lang]['max_chars'] * 1.2)  # ~300 chars (2-3 short sentences)
             else:
                 max_chars = int(language_mapping[lang]['max_chars'] / 1.5)
             clean_list = []
@@ -1218,6 +1223,15 @@ def get_sentences(text:str, session_id:str)->list|None:
     def clean_len(s:str)->int:
         return len(strip_escaped_sml(s))
 
+    def _plain(s:str)->bool:
+        # A row is "plain prose" only when it carries NO escaped SML token: the
+        # escaped tag chars have ord >= sml_escape_tag, so strip_escaped_sml
+        # shortens the string exactly when a token is present. Used to refuse
+        # merging/packing across a [break]/[pause]/… (PASS 4 and PASS 5) — merging
+        # over one silently discards that paragraph/section pause (orpheus.py
+        # strips the token before TTS, so the only record of it is the row split).
+        return clean_len(s) == len(s)
+
     def is_latin_only(s:str)->bool:
         s = strip_escaped_sml(s)
         s = re.sub(r'[^\w\s]', '', s, flags=re.UNICODE)
@@ -1299,15 +1313,18 @@ def get_sentences(text:str, session_id:str)->list|None:
         lang, tts_engine = session['language'], session['tts_engine']
         # Base chunk size splits at soft punctuation only if needed, keeping full
         # sentences together for better prosody. Voxtral (long-form) doubles it
-        # (~500 chars); Orpheus packs 2-3 sentences per generation (~450 chars,
-        # capped to its ~3700 audio-token budget — see orpheus.py MAX_AUDIO_TOKENS)
-        # now that the sentence-start artifact (a prompt-framing/stray-BOS bug) is
-        # fixed. Both then greedily pack adjacent sentences below (PASS 5).
+        # (~500 chars); Orpheus packs 2-3 SHORT sentences per generation (~300 chars).
+        # Orpheus is capped well below Voxtral because fine-tuned voices (trained on
+        # short clips) emit end-of-audio EARLY past ~300 chars / ~20s, silently
+        # dropping trailing text — a clean EOS under MAX_AUDIO_TOKENS, so the
+        # token-cap re-split can't see it (measured p90 speaking-rate blowup to
+        # ~21 ch/s at 400+ chars). orpheus.py's duration-vs-text guard is the
+        # backstop. Both then greedily pack adjacent sentences below (PASS 5).
         max_chars = language_mapping[lang]['max_chars']
         if tts_engine == 'voxtral':
             max_chars *= 2
         elif tts_engine == 'orpheus':
-            max_chars = int(max_chars * 1.8)
+            max_chars = int(max_chars * 1.2)
 
         assert not SML_TAG_PATTERN.search(text)
 
@@ -1387,7 +1404,14 @@ def get_sentences(text:str, session_id:str)->list|None:
                 last_list.append(left)
                 rest = right
 
-        # PASS 4 — merge very short rows
+        # PASS 4 — merge very short rows.
+        # BOUNDARY-AWARE (like PASS 5): a row carrying an SML token is NEVER merged
+        # in either direction. This pass used to merge purely on length, which
+        # produced chunks with a mid-chunk [break] (e.g. "…replaced it with myth.
+        # [break]Fiction soon bled…") — orpheus.py strips that token before TTS, so
+        # the paragraph pause was SILENTLY discarded. Refuse any merge where either
+        # side isn't _plain (no escaped SML); a short token-carrying row stays its
+        # own row, which is exactly what preserves the pause.
         final_list = []
         merge_max_chars = int((max_chars / 2) / 3)
         i = 0
@@ -1402,14 +1426,14 @@ def get_sentences(text:str, session_id:str)->list|None:
                 i += 1
                 continue
             cur_len = clean_len(cur)
-            if cur_len <= merge_max_chars:
+            if cur_len <= merge_max_chars and _plain(cur):
                 j = i + 1
                 while j < n:
                     nxt = last_list[j].strip()
                     if not nxt:
                         j += 1
                         continue
-                    if cur_len + clean_len(nxt) <= max_chars:
+                    if _plain(nxt) and cur_len + clean_len(nxt) <= max_chars:
                         cur = cur.rstrip() + ' ' + nxt.lstrip()
                         cur_len = clean_len(cur)
                         j += 1
@@ -1417,7 +1441,7 @@ def get_sentences(text:str, session_id:str)->list|None:
                     break
                 if final_list:
                     prev = final_list[-1]
-                    if clean_len(prev) + cur_len <= max_chars:
+                    if _plain(prev) and clean_len(prev) + cur_len <= max_chars:
                         final_list[-1] = prev.rstrip() + ' ' + cur.lstrip()
                         i = j
                         continue
@@ -1480,8 +1504,7 @@ def get_sentences(text:str, session_id:str)->list|None:
                 # SILENTLY DROP that paragraph/section pause. A sentence has SML when
                 # its escaped form is shorter than its raw form (strip_escaped_sml drops
                 # the escaped tag chars). Only plain-prose runs pack; every pause is kept.
-                def _plain(s:str)->bool:
-                    return clean_len(s) == len(s)
+                # (_plain is defined once up top and shared with PASS 4.)
                 packed = []
                 for s in final_list:
                     s = s.strip()

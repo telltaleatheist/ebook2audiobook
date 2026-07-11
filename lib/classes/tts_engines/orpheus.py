@@ -1005,24 +1005,36 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
     def _classify_gap(self, sentence: str):
         """Decide the inter-clip silence for this sentence from the e2a SML tokens
         it carries, matching the cross-engine standard in common/utils.py
-        (_convert_sml). Returns (gap_seconds, position):
+        (_convert_sml). Returns (lead_gap_sec, trail_gap_sec):
 
           [pause] / [pause:X]  -> SECTION gap: explicit X, else 1.0-1.6s. Marks
                                   blank-line / heading / <div> boundaries.
           [break] / [silence]  -> PARAGRAPH gap: 0.5-0.7s. Marks <p>/<br> ends.
-          (no token)           -> SENTENCE gap: ~0.55-0.75s, so Orpheus breathes
+          (no token)           -> SENTENCE gap: fixed 0.75s so Orpheus breathes
                                   instead of rushing.
+
+        INVARIANT: a chunk's tail is NEVER bare. Every chunk gets at least the
+        sentence gap on its trailing edge; a boundary token at the chunk START
+        adds its (longer) paragraph/section gap as a LEADING pad ON TOP. This
+        replaces the old one-gap-either-side design, where a chunk that STARTED
+        with [break]/[pause] got the whole gap prepended and its tail got nothing
+        but the 0.20s trim buffer — ~25% of chunks (the lead chunks) so joined the
+        NEXT chunk almost instantly, verified in the rendered flac. Now:
+
+          lead_gap  = the classified paragraph/section gap IF a token opens the
+                      chunk, else 0.
+          trail_gap = the sentence gap, EXCEPT a token that sits at the chunk end
+                      raises the tail to max(token gap, sentence gap) — a [break]'s
+                      0.5-0.7 must never yield a SHORTER tail than plain prose's
+                      0.75. Checked on the RAW sentence, before
+                      _clean_sentence_for_tts strips the tokens.
 
         Why three tiers and not the old binary [break]==[pause]: the standard
         treats [break] as a SHORT gap and [pause] as the LONG one. Lumping them
-        meant every <p>/<br>/<span> [break] got a long 0.6-0.9s gap — long pauses
-        in odd places. Now [break] is a modest paragraph gap and only [pause]
-        (rare, real section breaks) is long.
+        meant every <p>/<br>/<span> [break] got a long gap — long pauses in odd
+        places. Now [break] is a modest paragraph gap and only [pause] (rare, real
+        section breaks) is long.
 
-        position is 'lead' when the boundary token sits at the START of the
-        sentence (the gap belongs BEFORE this clip — e.g. the first sentence of a
-        new paragraph) or 'trail' otherwise (gap AFTER this clip). Checked on the
-        RAW sentence, before _clean_sentence_for_tts strips the tokens.
         Env overrides (a fixed value, 0 disables): ORPHEUS_SENTENCE_GAP,
         ORPHEUS_PARAGRAPH_GAP, ORPHEUS_SECTION_GAP.
         """
@@ -1033,36 +1045,40 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
             v = os.environ.get(name)
             return float(v) if v is not None else None
 
+        # The sentence gap is the tail FLOOR: every chunk ends with at least this
+        # so a chunk-to-chunk join is never bare. Was a random 0.55-0.75; the short
+        # end left some transitions too tight while the long end sounded right, so
+        # it's a FIXED 0.75. Override with ORPHEUS_SENTENCE_GAP.
+        sentence_gap = _env('ORPHEUS_SENTENCE_GAP')
+        if sentence_gap is None:
+            sentence_gap = 0.75
+
         # Section pause ([pause] / [pause:X]) — the strong, long boundary.
         m = re.search(r'\[pause(?::([0-9.]+))?\]', raw, flags=re.IGNORECASE)
         if m:
             override = _env('ORPHEUS_SECTION_GAP')
             if override is not None:
-                gap = override
+                token_gap = override
             elif m.group(1):
-                gap = float(m.group(1))               # honor an explicit [pause:1.4]
+                token_gap = float(m.group(1))               # honor an explicit [pause:1.4]
             else:
-                gap = int(np.random.uniform(1.0, 1.6) * 100) / 100
-            pos = 'lead' if lowered.startswith('[pause') else 'trail'
-            return gap, pos
+                token_gap = int(np.random.uniform(1.0, 1.6) * 100) / 100
+            if lowered.startswith('[pause'):
+                return token_gap, sentence_gap               # long lead + normal sentence tail
+            return 0.0, max(token_gap, sentence_gap)          # token at end → tail at least the floor
 
         # Paragraph break ([break] / [silence]) — modest gap.
         m = re.search(r'\[(?:break|silence)(?::[^\]]+)?\]', raw, flags=re.IGNORECASE)
         if m:
             override = _env('ORPHEUS_PARAGRAPH_GAP')
-            gap = override if override is not None else int(np.random.uniform(0.5, 0.7) * 100) / 100
-            pos = 'lead' if re.match(r'\[(?:break|silence)', lowered) else 'trail'
-            return gap, pos
+            token_gap = override if override is not None else int(np.random.uniform(0.5, 0.7) * 100) / 100
+            if re.match(r'\[(?:break|silence)', lowered):
+                return token_gap, sentence_gap
+            return 0.0, max(token_gap, sentence_gap)
 
         # Plain sentence end — the gap BETWEEN chunks (each packed chunk of 2-3
-        # sentences ends here). Was a random 0.55-0.75; the random short end left
-        # some chunk-to-chunk transitions too tight while the long end sounded
-        # right, so this is now a FIXED 0.75 for consistent chunk spacing. (Pauses
-        # WITHIN a chunk are the model's own and are unaffected.) Override with
-        # ORPHEUS_SENTENCE_GAP to retune without a code change.
-        override = _env('ORPHEUS_SENTENCE_GAP')
-        gap = override if override is not None else 0.75
-        return gap, 'trail'
+        # sentences ends here). Pauses WITHIN a chunk are the model's own.
+        return 0.0, sentence_gap
 
     def _write_silence(self, sentence_index: int) -> bool:
         """Write a tiny silent clip for an empty sentence."""
@@ -1071,12 +1087,61 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
                         self.params['samplerate'], format=default_audio_proc_format)
         return True
 
-    def _save_audio(self, sentence_index: int, audio_np, gap_sec: float = 0.3, gap_pos: str = 'trail') -> bool:
-        """Trim trailing silence, normalize, add the inter-clip pause, and write a
-        decoded waveform to the sentence file. Shared by convert() and
-        convert_batch(). gap_sec/gap_pos come from _classify_gap(): a 'trail' gap
-        is appended after the speech, a 'lead' gap is prepended before it (so a
-        boundary at the start of a new paragraph lands at the right place)."""
+    def _speech_rate(self, clean: str, audio_np):
+        """chars-per-second of the SML-stripped text over the audio's speech-only
+        duration — trailing/leading silence trimmed EXACTLY as _save_audio does
+        (trim_audio, silence_threshold=0.01, buffer_sec=0.20), and BEFORE any
+        inter-clip gap pad is appended. Returns None when the metric can't apply
+        (no audio). This is how a silent early-EOS truncation is caught: a
+        fine-tuned voice trained on short clips tends to emit end-of-audio EARLY
+        past ~300 chars, dropping trailing text. The clip then FINISHES cleanly
+        (no token-cap hit — the existing cap re-split can't see it) but is far too
+        short for the words, i.e. an impossibly high chars/sec (healthy prose is
+        ~15 ch/s, p90 ~17; a truncated 400+ char chunk measured ~21)."""
+        if audio_np is None or len(audio_np) == 0:
+            return None
+        audio_tensor = torch.from_numpy(np.asarray(audio_np)).float()
+        if audio_tensor.dim() == 1:
+            audio_tensor = trim_audio(audio_tensor, self.SAMPLE_RATE, silence_threshold=0.01, buffer_sec=0.20)
+        seconds = len(audio_tensor) / self.SAMPLE_RATE
+        if seconds <= 0:
+            return None
+        return len(clean) / seconds
+
+    def _guard_truncation(self, sentence_index: int, clean: str, audio_np, resplit):
+        """Backstop for silent early-EOS truncation (see _speech_rate). If the
+        rendered clip is too short for the text, re-render it split at sentence
+        boundaries via `resplit` (the backend's _generate_*_safe ladder, the same
+        recovery the token-cap branch uses). `resplit` takes the clean text and
+        returns a numpy waveform.
+
+        Guard applies only when clean length > 150 chars (short chunks' rates are
+        noisy) and ORPHEUS_MAX_CHARS_PER_SEC > 0 (default 19.0; set 0 to disable).
+        If the re-render STILL trips the guard we accept it and warn — no infinite
+        loop; the _generate_*_safe ladders already carry their own depth guard."""
+        max_rate = float(os.environ.get('ORPHEUS_MAX_CHARS_PER_SEC', '19.0'))
+        if max_rate <= 0 or len(clean) <= 150:
+            return audio_np
+        rate = self._speech_rate(clean, audio_np)
+        if rate is None or rate <= max_rate:
+            return audio_np
+        print(f"Orpheus: sentence {sentence_index} audio too short for text "
+              f"({rate:.1f} ch/s > {max_rate:.1f}) — re-rendering split at sentence boundaries")
+        audio_np = resplit(clean)
+        rate2 = self._speech_rate(clean, audio_np)
+        if rate2 is not None and rate2 > max_rate:
+            print(f"Orpheus: sentence {sentence_index} still short after re-render "
+                  f"({rate2:.1f} ch/s > {max_rate:.1f}); accepting")
+        return audio_np
+
+    def _save_audio(self, sentence_index: int, audio_np, lead_gap: float = 0.0, trail_gap: float = 0.0) -> bool:
+        """Trim trailing silence, normalize, add the inter-clip pauses, and write a
+        decoded waveform to the sentence file. Shared by convert(), convert_batch()
+        and _convert_mlx_batch(). (lead_gap, trail_gap) come from _classify_gap():
+        the trailing gap is appended after the speech, the leading gap prepended
+        before it. Both can be non-zero — a chunk opened by a boundary token gets a
+        long lead AND still gets its sentence-gap tail, so a chunk's tail is never
+        bare (the invariant _classify_gap now guarantees)."""
         if audio_np is None or len(audio_np) == 0:
             print(f"Orpheus returned no audio data for sentence {sentence_index}")
             return False
@@ -1096,14 +1161,18 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
                 audio_tensor = audio_tensor / max_val * 0.95
         else:
             audio_tensor = torch.zeros(1, int(self.params['samplerate'] * 0.1))
-        # Inter-clip silence (tier + duration decided by _classify_gap, matching
-        # e2a's standard SML semantics). 'lead' prepends it before the speech so a
-        # boundary opening a new paragraph isn't placed one sentence too late.
-        if gap_sec and gap_sec > 0:
+        # Inter-clip silence (tiers + durations decided by _classify_gap, matching
+        # e2a's standard SML semantics). The leading pad is prepended (a boundary
+        # opening a new paragraph isn't placed one sentence too late) and the
+        # trailing pad appended — BOTH can apply so the tail is never bare.
+        if (lead_gap and lead_gap > 0) or (trail_gap and trail_gap > 0):
             audio_tensor = audio_tensor.cpu()
-            pad = torch.zeros(1, int(self.params['samplerate'] * gap_sec))
-            audio_tensor = torch.cat([pad, audio_tensor], dim=1) if gap_pos == 'lead' \
-                else torch.cat([audio_tensor, pad], dim=1)
+            if lead_gap and lead_gap > 0:
+                lead_pad = torch.zeros(1, int(self.params['samplerate'] * lead_gap))
+                audio_tensor = torch.cat([lead_pad, audio_tensor], dim=1)
+            if trail_gap and trail_gap > 0:
+                trail_pad = torch.zeros(1, int(self.params['samplerate'] * trail_gap))
+                audio_tensor = torch.cat([audio_tensor, trail_pad], dim=1)
         torchaudio.save(final_sentence_file, audio_tensor.cpu(),
                         self.params['samplerate'], format=default_audio_proc_format)
         del audio_tensor
@@ -1118,7 +1187,7 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
                 print("Orpheus TTS engine not loaded!")
                 return False
 
-            gap_sec, gap_pos = self._classify_gap(sentence)
+            lead_gap, trail_gap = self._classify_gap(sentence)
             clean = self._clean_sentence_for_tts(sentence)
             if not clean:
                 return self._write_silence(sentence_index)
@@ -1126,6 +1195,7 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
             try:
                 if self.backend == 'mlx':
                     audio_np = self._generate_mlx(clean)
+                    audio_np = self._guard_truncation(sentence_index, clean, audio_np, self._generate_mlx_safe)
                 elif self.backend == 'vllm':
                     try:
                         audio_np = self._tokens_to_audio(self._generate_tokens_vllm(clean))
@@ -1134,11 +1204,13 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
                         # almost always fixes it. If it misaligns again, let it fail.
                         print(f"Orpheus: sentence {sentence_index} token stream misaligned ({align_err}); re-rendering once")
                         audio_np = self._generate_audio_vllm_safe(clean)
+                    # Backstop a silent early-EOS truncation (audio too short for text).
+                    audio_np = self._guard_truncation(sentence_index, clean, audio_np, self._generate_audio_vllm_safe)
                 else:
                     audio_np = self._tokens_to_audio(
                         self._generate_tokens_transformers(f"{self.voice}: {clean}")
                     )
-                ok = self._save_audio(sentence_index, audio_np, gap_sec, gap_pos)
+                ok = self._save_audio(sentence_index, audio_np, lead_gap, trail_gap)
                 self._cleanup_memory()
                 return ok
             except Exception as gen_error:
@@ -1219,6 +1291,9 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
                             # boundaries so nothing is cut off.
                             print(f"Orpheus: sentence {idx} hit the audio-token cap; re-rendering split at sentence boundaries")
                             audio_np = self._generate_audio_vllm_safe(clean)
+                        # Backstop a silent early-EOS truncation (clean EOS, audio too
+                        # short for the text) that the cap check above can't catch.
+                        audio_np = self._guard_truncation(idx, clean, audio_np, self._generate_audio_vllm_safe)
                         results[idx] = self._save_audio(idx, audio_np, gap[0], gap[1])
                     except Exception as decode_err:
                         print(f"Orpheus batch decode error for sentence {idx}: {decode_err}")
@@ -1339,6 +1414,9 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
                                 )
                             else:
                                 audio = np.zeros(int(self.SAMPLE_RATE * 0.1), dtype=np.float32)
+                            # Backstop a silent early-EOS truncation (clean stop, audio
+                            # too short for the text) the token-cap check can't catch.
+                            audio = self._guard_truncation(idx, clean, audio, self._generate_mlx_safe)
                             results[idx] = self._save_audio(idx, audio, gap[0], gap[1])
                         except Exception as decode_err:
                             print(f"Orpheus MLX batch decode error for sentence {idx}: {decode_err}")
