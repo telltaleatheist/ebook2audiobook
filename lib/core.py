@@ -1051,16 +1051,20 @@ def filter_chapter(idx:int, doc:EpubHtml, session_id:str, stanza_nlp:Pipeline, i
             # in the vLLM prompt — since fixed in orpheus.py _format_prompt_ids.
             # Packing is safe again.) Orpheus caps WELL below Voxtral: fine-tuned
             # voices are trained on short clips and start emitting the end-of-audio
-            # token EARLY once a chunk runs past ~300 chars / ~20s of audio, silently
-            # dropping the trailing text (measured on a real book: the p90 speaking
-            # rate blows up to an impossible ~21 ch/s at 400-449 chars — the model
-            # finished with a clean EOS well under MAX_AUDIO_TOKENS, so the token-cap
-            # re-split never fired). ~300 chars keeps chunks inside the reliable zone;
-            # orpheus.py's duration-vs-text guard catches any that still truncate.
+            # token EARLY once a chunk runs well past ~300 chars / ~20s of audio,
+            # silently dropping the trailing text (measured on a real book: the p90
+            # speaking rate blows up to an impossible ~21 ch/s at 400-449 chars — the
+            # model finished with a clean EOS well under MAX_AUDIO_TOKENS, so the
+            # token-cap re-split never fired; 450-char packing failed whisper-diff on
+            # every model tested). The cap stays inside the reliable zone for EOS-safe
+            # (≤20s/2048-recipe) voices; orpheus.py's duration-vs-text guard catches
+            # any chunk that still truncates. Same ORPHEUS_MAX_CHARS env as the
+            # packing cap below so both passes agree; invalid value raises (NO FALLBACK).
             if tts_engine == 'voxtral':
                 max_chars = language_mapping[lang]['max_chars'] * 2  # ~500 chars
             elif tts_engine == 'orpheus':
-                max_chars = int(language_mapping[lang]['max_chars'] * 1.2)  # ~300 chars (2-3 short sentences)
+                _mc = os.environ.get('ORPHEUS_MAX_CHARS')
+                max_chars = int(_mc) if _mc else 350
             else:
                 max_chars = int(language_mapping[lang]['max_chars'] / 1.5)
             clean_list = []
@@ -1338,9 +1342,9 @@ def get_sentences(text:str, session_id:str)->list|None:
         lang, tts_engine = session['language'], session['tts_engine']
         # Base chunk size splits at soft punctuation only if needed, keeping full
         # sentences together for better prosody. Voxtral (long-form) doubles it
-        # (~500 chars); Orpheus packs 2-3 SHORT sentences per generation (~300 chars).
+        # (~500 chars); Orpheus packs a few sentences per generation (350 chars).
         # Orpheus is capped well below Voxtral because fine-tuned voices (trained on
-        # short clips) emit end-of-audio EARLY past ~300 chars / ~20s, silently
+        # short clips) emit end-of-audio EARLY well past ~300 chars / ~20s, silently
         # dropping trailing text — a clean EOS under MAX_AUDIO_TOKENS, so the
         # token-cap re-split can't see it (measured p90 speaking-rate blowup to
         # ~21 ch/s at 400+ chars). orpheus.py's duration-vs-text guard is the
@@ -1349,13 +1353,17 @@ def get_sentences(text:str, session_id:str)->list|None:
         if tts_engine == 'voxtral':
             max_chars *= 2
         elif tts_engine == 'orpheus':
-            # Orpheus packs to a SHORT cap. At the old ~300 chars this fine-tune ran away
-            # (no EOS) on ~half of packed chunks; 200 cut that to ~1/22 and made the batch
-            # path 3.2x faster with IDENTICAL audio (validated 2026-07-12, rohan on
-            # Deathstalker prose). ORPHEUS_MAX_CHARS overrides; invalid value raises (NO
+            # Orpheus packs to a cap of 350 chars (raised from 200 on 2026-07-12 for
+            # prosody). The 200-char era was calibrated against rohan-v2, later PROVEN
+            # to be a broken TRAINING recipe (38s clips / max_seq_length 4096 → 19%
+            # runaway); EOS-safe voices (≤20s/2048 — deathstalker_v3, owen, thirdreich)
+            # went 0/126 on the very chunks that broke it, and 300-char packing passed
+            # whisper-diff completeness on every ≤20s model. 450 fails everywhere —
+            # keep the cap ≤~350; the duration-vs-text + token-cap guards in orpheus.py
+            # catch stragglers. ORPHEUS_MAX_CHARS overrides; invalid value raises (NO
             # FALLBACK). The old language_mapping*1.2 formula is retired for Orpheus.
             _mc = os.environ.get('ORPHEUS_MAX_CHARS')
-            max_chars = int(_mc) if _mc else 200
+            max_chars = int(_mc) if _mc else 350
 
         assert not SML_TAG_PATTERN.search(text)
 
@@ -1536,17 +1544,20 @@ def get_sentences(text:str, session_id:str)->list|None:
                 # its escaped form is shorter than its raw form (strip_escaped_sml drops
                 # the escaped tag chars). Only plain-prose runs pack; every pause is kept.
                 # (_plain is defined once up top and shared with PASS 4.)
-                # SENTENCE-COUNT CAP (2026-07-12): packing is char-capped AND sentence-
-                # capped. A/B-proven (diag_packed.py, deathstalker/rohan): runaway (no
-                # EOS, silence attractor entered at an INTERNAL sentence boundary,
-                # dropping the remaining text) scales with the number of packed
-                # sentences — 1 sent: 0/26, 2: 0/3, 3: 4/9, 4: 4/6, 6: 3/3 — while the
-                # SAME text split singly is 0/20. Char length was NOT the driver (all
-                # 179-200 chars). Each internal boundary is a stochastic chance to
-                # enter the silence attractor, so cap chunks at 2 sentences.
-                # ORPHEUS_MAX_SENTENCES overrides; invalid value raises (NO FALLBACK).
+                # SENTENCE-COUNT CAP — OFF by default (2026-07-12). The cap was added
+                # the same day, A/B-calibrated against rohan-v2's per-internal-boundary
+                # silence attractor (3 sents: 4/9 runaways, 6: 3/3) — but rohan-v2 was
+                # later PROVEN a broken TRAINING recipe (38s/4096). EOS-safe voices
+                # (≤20s/2048) went 0/126 on those same multi-sentence chunks, so the
+                # char cap alone bounds chunks now. ORPHEUS_MAX_SENTENCES re-imposes a
+                # cap for a voice that trips the guards; invalid value raises (NO
+                # FALLBACK). When set, it's enforced BOTH ways: the merge won't pack
+                # past it, and _split_to_cap splits items that ARRIVE multi-sentence
+                # (PASS 4 merges short dialogue fragments upstream — a merge-only cap
+                # left 593/2516 chunks at 3-9 sentences). SML tokens stay inside their
+                # piece, so no pause is dropped.
                 _ms = os.environ.get('ORPHEUS_MAX_SENTENCES')
-                max_sents = int(_ms) if _ms else 2
+                max_sents = int(_ms) if _ms else None
                 def _nsent(t):
                     return max(1, len(re.findall(r'[.!?…]["\'”’)\]]*(?:\s|$)', t)))
                 packed = []
@@ -1556,17 +1567,13 @@ def get_sentences(text:str, session_id:str)->list|None:
                         continue
                     if (packed and _plain(packed[-1]) and _plain(s)
                             and clean_len(packed[-1]) + 1 + clean_len(s) <= max_chars
-                            and _nsent(packed[-1]) + _nsent(s) <= max_sents):
+                            and (max_sents is None
+                                 or _nsent(packed[-1]) + _nsent(s) <= max_sents)):
                         packed[-1] = packed[-1].rstrip() + ' ' + s.lstrip()
                     else:
                         packed.append(s)
-                # The merge cap alone is NOT enough: items ARRIVE here already multi-
-                # sentence (PASS 4 merges short dialogue fragments upstream), so a
-                # merge-only cap left 593/2516 chunks at 3-9 sentences in the first
-                # capped run — and the capped chunk indices matched those chunks almost
-                # 1:1. SPLIT any over-cap item at sentence boundaries and regroup into
-                # <=max_sents pieces. SML tokens stay inside their piece, so no pause
-                # is dropped; each piece gets its own sentence-gap tail (correct).
+                if max_sents is None:
+                    return packed
                 def _split_to_cap(t):
                     parts, last = [], 0
                     for m in re.finditer(r'[.!?…]["\'”’)\]]*\s+', t):
