@@ -270,6 +270,7 @@ def run_worker_tts(
         total_sentences = state['total_sentences']
         processed = 0
         skipped = 0
+        failed = []  # sentence indices whose conversion failed
         start_time = time.time()
 
         for i in range(sentence_start, sentence_end + 1):
@@ -282,7 +283,22 @@ def run_worker_tts(
 
             sentence = all_sentences[i]
             if not sentence or not sentence.strip():
-                # Empty sentence - create silence
+                # Empty sentence — WRITE a short silence clip at the expected path.
+                # Sentence indices are positional: assembly (combine_audio_sentences)
+                # and detect_completed_chapters require '{i}.<ext>' to EXIST for every
+                # index, so skipping without writing anything left a permanently
+                # un-assemblable hole. Writing silence matches the engines' own
+                # convention for text that renders to nothing (orpheus._write_silence,
+                # f5/voxtral empty-text handling): 0.1s of zeros at the engine's
+                # sample rate, saved via torchaudio in default_audio_proc_format.
+                # Note: a digital-silence FLAC is ~100 bytes, below the 1024-byte
+                # min_file_size used by scan_completed_sentences, so resume scans
+                # still list this index — the rewrite here is idempotent and cheap;
+                # assembly correctness only needs the file to exist.
+                import torchaudio
+                samplerate = tts_manager.engine.params['samplerate']
+                silence = torch.zeros(1, int(samplerate * 0.1))
+                torchaudio.save(output_file, silence, samplerate, format=default_audio_proc_format)
                 skipped += 1
                 processed += 1
                 continue
@@ -295,7 +311,10 @@ def run_worker_tts(
             success = tts_manager.convert_sentence2audio(i, sentence)
             if not success:
                 print(f"[WORKER] Warning: Failed to convert sentence {i}")
-                # Continue anyway - some sentences may fail
+                # Keep processing the remaining sentences, but record the failure —
+                # the final result must report success=False so the caller doesn't
+                # treat a run with holes as complete.
+                failed.append(i)
 
             processed += 1
 
@@ -306,17 +325,24 @@ def run_worker_tts(
         actual_converted = processed - skipped
 
         print(f"[WORKER] Completed: {actual_converted} converted, {skipped} skipped in {elapsed:.1f}s")
+        if failed:
+            print(f"[WORKER] ERROR: {len(failed)} sentence(s) failed to convert: {failed}")
 
-        return {
-            'success': True,
+        result = {
+            'success': not failed,
             'session_id': session_id,
             'sentences_processed': processed,
             'sentences_converted': actual_converted,
             'sentences_skipped': skipped,
+            'sentences_failed': len(failed),
+            'failed_indices': failed,
             'sentence_start': sentence_start,
             'sentence_end': sentence_end,
             'elapsed_seconds': elapsed
         }
+        if failed:
+            result['error'] = f"{len(failed)} sentence(s) failed to convert: {failed}"
+        return result
 
     except Exception as e:
         import traceback

@@ -110,23 +110,38 @@ def save_session_state(session_id: str, args: dict, prep_result: dict, core_modu
 def load_session_state(session_dir: str) -> dict | None:
     """
     Load session state from session-state.json.
-    """
-    try:
-        process_dirs = [d for d in os.listdir(session_dir)
-                       if os.path.isdir(os.path.join(session_dir, d))]
 
-        for process_dir_name in process_dirs:
-            state_path = os.path.join(session_dir, process_dir_name, 'session-state.json')
-            if os.path.exists(state_path):
+    Returns None ONLY when no session-state.json exists anywhere under
+    session_dir ("no session"). A state file that EXISTS but cannot be read or
+    parsed raises: treating a corrupt state as "no session" made callers start
+    fresh over an existing session's rendered files, silently discarding resume
+    state (and risking a new sentence split misaligned with old numbered audio).
+    """
+    # A session dir that doesn't exist is a legitimate "no session" (callers
+    # probe speculative locations) — only an EXISTING state file that fails to
+    # parse is an error.
+    if not os.path.isdir(session_dir):
+        return None
+
+    process_dirs = [d for d in os.listdir(session_dir)
+                   if os.path.isdir(os.path.join(session_dir, d))]
+
+    for process_dir_name in process_dirs:
+        state_path = os.path.join(session_dir, process_dir_name, 'session-state.json')
+        if os.path.exists(state_path):
+            try:
                 with open(state_path, 'r', encoding='utf-8') as f:
                     state = json.load(f)
-                state['process_dir'] = os.path.join(session_dir, process_dir_name)
-                state['session_dir'] = session_dir
-                return state
-        return None
-    except Exception as e:
-        print(f'Failed to load session state: {e}')
-        return None
+            except Exception as e:
+                raise RuntimeError(
+                    f'Session state exists at {state_path} but could not be read/parsed '
+                    f'({e}). Refusing to treat it as "no session" — that would silently '
+                    f'restart over the existing session. Fix or delete the file to proceed.'
+                ) from e
+            state['process_dir'] = os.path.join(session_dir, process_dir_name)
+            state['session_dir'] = session_dir
+            return state
+    return None
 
 
 # =============================================================================
@@ -376,8 +391,11 @@ def prep_ebook_info(args: dict, core_module) -> dict | None:
                     session['language_iso1'] = lang_dict.pt1
             if not session.get('language_iso1'):
                 session['language_iso1'] = session['language'][:2] if len(session['language']) >= 2 else 'en'
-        except Exception:
-            session['language_iso1'] = 'en'
+        except Exception as e:
+            # Never silently anglicize: an unresolvable language code is a hard error.
+            raise RuntimeError(
+                f"Could not resolve ISO-639-1 code for language '{session.get('language')}': {e}"
+            ) from e
 
         session['tts_engine'] = args.get('tts_engine') or get_compatible_tts_engines(session['language'])[0]
         session['audiobooks_dir'] = args.get('audiobooks_dir', audiobooks_cli_dir)
@@ -933,8 +951,11 @@ def assemble_audiobook(args: dict, core_module) -> dict:
                     session['language_iso1'] = lang_dict.pt1
             if not session.get('language_iso1'):
                 session['language_iso1'] = session['language'][:2] if len(session['language']) >= 2 else 'en'
-        except Exception:
-            session['language_iso1'] = 'en'
+        except Exception as e:
+            # Never silently anglicize: an unresolvable language code is a hard error.
+            raise RuntimeError(
+                f"Could not resolve ISO-639-1 code for language '{session.get('language')}': {e}"
+            ) from e
 
         # Load chapter data
         if state.get('chapter_sentences'):

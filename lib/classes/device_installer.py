@@ -731,9 +731,9 @@ class DeviceInstaller():
                         try:
                             installed_v = Version(short_version)
                         except InvalidVersion as e:
-                            error = f'install_device_packages() Version error: {e}'
+                            error = f'install_python_packages() Version error: {e}'
                             print(error)
-                            return 1 
+                            return False
                         req_match = re.search(r'(\d+\.\d+(?:\.\d+)?)', spec_str)
                         if req_match:
                             req_v = Version(req_match.group(1))

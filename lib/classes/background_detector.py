@@ -17,8 +17,10 @@ class BackgroundDetector:
 	def _get_duration(self) -> float:
 		try:
 			return float(librosa.get_duration(path=self.wav_file))
-		except Exception:
-			return 0.0
+		except Exception as e:
+			# A read failure must never become duration 0.0 (which detect()
+			# would turn into a confident background_detected=True verdict).
+			raise RuntimeError(f"_get_duration() failed to read duration of '{self.wav_file}': {e}") from e
 
 	def _load_waveform(self) -> tuple[torch.Tensor, int]:
 		y, sr = librosa.load(self.wav_file, sr=16000, mono=True)
@@ -46,6 +48,10 @@ class BackgroundDetector:
 			return pipeline
 
 	def detect(self, vad_ratio_thresh: float = 0.05) -> tuple[bool, dict[str, float | bool]]:
+		if self.total_duration <= 0:
+			raise RuntimeError(
+				f"detect(): audio duration is {self.total_duration}s for '{self.wav_file}'; refusing to produce a background verdict."
+			)
 		pipeline = self._get_pipeline()
 		waveform, sr = self._load_waveform()
 		file = {

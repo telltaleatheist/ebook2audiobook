@@ -20,6 +20,8 @@ def load_engine_presets(engine:str)->Dict[str, Any]:
             _presets_cache[engine] = module.models
             return module.models
     except Exception as e:
+        # Presets are required config: never return (or cache) an empty dict —
+        # let the failure propagate to the caller.
         error = f'load_engine_presets(): {e}'
         print(error)
-        return {}
+        raise

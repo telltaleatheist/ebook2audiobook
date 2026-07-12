@@ -14,7 +14,14 @@ class SubprocessPipe:
         self.progress_bar = False
         if self.is_gui_process:
             self.progress_bar = gr.Progress(track_tqdm=False)
-        self._run_process()
+        # Store the run result. Callers test `if proc_pipe:` — without __bool__
+        # below, a constructed object is ALWAYS truthy, so every ffmpeg failure
+        # (nonzero exit, exception, ffmpeg missing) read as success and assembly
+        # carried on with missing/corrupt output.
+        self.success = self._run_process()
+
+    def __bool__(self)->bool:
+        return self.success
         
     def _emit_progress(self, percent:float)->None:
         sys.stdout.write(f"\r{self.msg} - {percent:.1f}%")

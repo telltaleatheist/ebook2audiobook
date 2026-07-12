@@ -108,6 +108,10 @@ class VRAMDetector:
                         "reserved_vram_gb": self._ceil_gb(resv),
                     }
                     return json.dumps(info, indent=2) if as_json else info
+                else:
+                    raise RuntimeError(
+                        "detect_vram(): device 'cuda' was requested but torch.cuda.is_available() is False"
+                    )
 
             # ─────────────────────────── ROCm (AMD)
             elif hasattr(torch, 'hip') and torch.hip.is_available():
@@ -164,8 +168,13 @@ class VRAMDetector:
                 }
                 return json.dumps(info, indent=2) if as_json else info
 
-        except Exception:
-            pass
+        except Exception as e:
+            if device == 'cuda':
+                # The caller explicitly requested CUDA: never silently report
+                # system RAM as VRAM — surface the real failure instead.
+                print(f'detect_vram(): CUDA was requested but the GPU probe failed: {e}')
+                raise
+            print(f'detect_vram(): GPU probe failed ({e}); reporting CPU/system RAM instead.')
 
         # ─────────────────────────── CPU / Docker fallback
         if script_mode == FULL_DOCKER and in_docker:
@@ -195,12 +204,16 @@ class VRAMDetector:
         if as_json:
             return json.dumps(info, indent=2)
 
-        total_vram_bytes = info.get('total_bytes', 4096)
-        free_vram_bytes = info.get('free_bytes', 0)
+        # No defaults here: both branches above always set these keys.
+        # A missing key is a bug and must raise, not silently invent a size.
+        total_vram_bytes = info['total_bytes']
+        free_vram_bytes = info['free_bytes']
         info['total_vram_gb'] = info.get('total_vram_gb', self._ceil_gb(total_vram_bytes))
         info['free_vram_gb'] = info.get('free_vram_gb', self._ceil_gb(free_vram_bytes))
 
         return {
+            "device_type": info['device_type'],
+            "device_name": info['device_name'],
             "total_vram_gb": info['total_vram_gb'],
             "free_vram_gb": info['free_vram_gb']
         }

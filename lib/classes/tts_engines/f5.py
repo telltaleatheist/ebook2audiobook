@@ -247,14 +247,20 @@ class F5(TTSUtils, TTSRegistry, name='f5'):
                     audio_tensor = trim_audio(audio_tensor, self.SAMPLE_RATE,
                                               silence_threshold=0.01, buffer_sec=0.20)
                     if len(audio_tensor) == 0:
-                        audio_tensor = torch.zeros(int(self.SAMPLE_RATE * 0.1))
+                        # Non-empty text produced only silence — a failed render.
+                        # Fail loudly instead of saving silence as a valid sentence.
+                        print(f"F5 produced only silence for sentence {sentence_index} "
+                              f"(all audio below trim threshold)")
+                        return False
                     audio_tensor = audio_tensor.unsqueeze(0)
 
                 max_val = audio_tensor.abs().max()
                 if max_val > 1.0:
                     audio_tensor = audio_tensor / max_val * 0.95
                 elif max_val == 0:
-                    audio_tensor = torch.zeros(1, int(self.params['samplerate'] * 0.1))
+                    # All-zero audio for non-empty text = failed render, not silence.
+                    print(f"F5 produced all-zero audio for sentence {sentence_index}")
+                    return False
 
                 torchaudio.save(final_sentence_file, audio_tensor.cpu(),
                                 self.params['samplerate'], format=default_audio_proc_format)

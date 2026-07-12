@@ -143,7 +143,7 @@ def normalize_audio(input_file:str, output_file:str, samplerate:int, is_gui_proc
     if proc_pipe:
         return True
     else:
-        error = f"normalize_audio() error: {input_file}: {e}"
+        error = f"normalize_audio() error: ffmpeg failed for {input_file}"
         print(error)
         return False
 

@@ -352,7 +352,26 @@ def run_worker_tts(
         total_sentences = state['total_sentences']
         processed = 0
         skipped = 0
+        failed = []  # sentence indices whose conversion failed
         start_time = time.time()
+
+        def _write_empty_sentence_silence(output_file: str):
+            # Empty sentence — WRITE a short silence clip at the expected path.
+            # Sentence indices are positional: assembly (combine_audio_sentences)
+            # and detect_completed_chapters require '{i}.<ext>' to EXIST for every
+            # index, so skipping without writing anything left a permanently
+            # un-assemblable hole. Writing silence matches the engines' own
+            # convention for text that renders to nothing (orpheus._write_silence,
+            # f5/voxtral empty-text handling): 0.1s of zeros at the engine's
+            # sample rate, saved via torchaudio in default_audio_proc_format.
+            # Note: a digital-silence FLAC is ~100 bytes, below the 1024-byte
+            # min_file_size used by scan_completed_sentences, so resume scans
+            # still list this index — the rewrite here is idempotent and cheap;
+            # assembly correctness only needs the file to exist.
+            import torchaudio
+            samplerate = tts_manager.engine.params['samplerate']
+            silence = torch.zeros(1, int(samplerate * 0.1))
+            torchaudio.save(output_file, silence, samplerate, format=default_audio_proc_format)
 
         # Batched path: engines like Orpheus (vLLM) convert many sentences in one
         # call — faster, and it avoids the host-RAM creep of tens of thousands of
@@ -375,6 +394,10 @@ def run_worker_tts(
                 for (idx, _), ok in zip(pending, results):
                     if not ok:
                         print(f"[WORKER] Warning: Failed to convert sentence {idx}")
+                        # Keep processing remaining batches, but record the failure —
+                        # the final result must report success=False so the caller
+                        # doesn't treat a run with holes as complete.
+                        failed.append(idx)
                     processed += 1
                     progress_pct = (processed / total_to_process) * 100
                     print(f"Converting sentence {idx}/{total_sentences} ({progress_pct:.1f}%)")
@@ -393,6 +416,9 @@ def run_worker_tts(
                     continue
                 sentence = all_sentences[i]
                 if not sentence or not sentence.strip():
+                    # See _write_empty_sentence_silence: empties must still produce
+                    # a file at their index or the book is un-assemblable.
+                    _write_empty_sentence_silence(output_file)
                     skipped += 1
                     processed += 1
                     continue
@@ -411,7 +437,9 @@ def run_worker_tts(
 
                 sentence = all_sentences[i]
                 if not sentence or not sentence.strip():
-                    # Empty sentence - create silence
+                    # See _write_empty_sentence_silence: empties must still produce
+                    # a file at their index or the book is un-assemblable.
+                    _write_empty_sentence_silence(output_file)
                     skipped += 1
                     processed += 1
                     continue
@@ -426,7 +454,10 @@ def run_worker_tts(
                 in_flight.clear()
                 if not success:
                     print(f"[WORKER] Warning: Failed to convert sentence {i}")
-                    # Continue anyway - some sentences may fail
+                    # Keep processing the remaining sentences, but record the
+                    # failure — the final result must report success=False so the
+                    # caller doesn't treat a run with holes as complete.
+                    failed.append(i)
 
                 processed += 1
 
@@ -442,17 +473,24 @@ def run_worker_tts(
         log_memory("After all sentences processed")
 
         print(f"[WORKER] Completed: {actual_converted} converted, {skipped} skipped in {elapsed:.1f}s")
+        if failed:
+            print(f"[WORKER] ERROR: {len(failed)} sentence(s) failed to convert: {failed}")
 
-        return {
-            'success': True,
+        result = {
+            'success': not failed,
             'session_id': session_id,
             'sentences_processed': processed,
             'sentences_converted': actual_converted,
             'sentences_skipped': skipped,
+            'sentences_failed': len(failed),
+            'failed_indices': failed,
             'sentence_start': sentence_start,
             'sentence_end': sentence_end,
             'elapsed_seconds': elapsed
         }
+        if failed:
+            result['error'] = f"{len(failed)} sentence(s) failed to convert: {failed}"
+        return result
 
     except (KeyboardInterrupt, SystemExit):
         # Cooperative stop (SIGTERM → SystemExit from worker.py's handler): delete any

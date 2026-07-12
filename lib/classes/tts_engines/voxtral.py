@@ -252,7 +252,10 @@ class Voxtral(TTSUtils, TTSRegistry, name='voxtral'):
             if audio is not None:
                 chunks.append(np.asarray(audio, dtype=np.float32).reshape(-1))
         if not chunks:
-            return np.zeros(int(self.params['samplerate'] * 0.1), dtype=np.float32)
+            # No audio for non-empty text = generation FAILURE. Return empty so
+            # convert() reports the sentence as failed — never substitute silence.
+            print("[VOXTRAL] MLX generation yielded no audio chunks (generation failed)")
+            return np.array([], dtype=np.float32)
         audio = np.concatenate(chunks)
         # mlx-audio's voxtral_tts emits consistently low-amplitude audio (~0.1 peak)
         # — fully voiced, just quiet. e2a's convert() only attenuates (max>1.0), never
@@ -304,14 +307,20 @@ class Voxtral(TTSUtils, TTSRegistry, name='voxtral'):
                     audio_tensor = trim_audio(audio_tensor, self.SAMPLE_RATE,
                                               silence_threshold=0.002, buffer_sec=0.10)
                     if len(audio_tensor) == 0:
-                        audio_tensor = torch.zeros(int(self.SAMPLE_RATE * 0.1))
+                        # Non-empty text produced only silence — a failed render.
+                        # Fail loudly instead of saving silence as a valid sentence.
+                        print(f"Voxtral produced only silence for sentence {sentence_index} "
+                              f"(all audio below trim threshold)")
+                        return False
                     audio_tensor = audio_tensor.unsqueeze(0)
 
                 max_val = audio_tensor.abs().max()
                 if max_val > 1.0:
                     audio_tensor = audio_tensor / max_val * 0.95
                 elif max_val == 0:
-                    audio_tensor = torch.zeros(1, int(self.params['samplerate'] * 0.1))
+                    # All-zero audio for non-empty text = failed render, not silence.
+                    print(f"Voxtral produced all-zero audio for sentence {sentence_index}")
+                    return False
 
                 torchaudio.save(final_sentence_file, audio_tensor.cpu(),
                                 self.params['samplerate'], format=default_audio_proc_format)
