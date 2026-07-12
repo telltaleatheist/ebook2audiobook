@@ -629,25 +629,28 @@ def run_dual_voice_assembly(
         # Convert to M4B
         print("[BILINGUAL-ASSEMBLY] Converting to M4B...")
         ffmpeg = shutil.which('ffmpeg')
-        if ffmpeg:
-            cmd = [
-                ffmpeg, '-y',
-                '-i', audio_output,
-                '-c:a', 'aac',
-                '-b:a', '128k',
-                m4b_output
-            ]
-            result = subprocess.run(cmd, capture_output=True, text=True)
-            if result.returncode == 0:
-                print(f"[BILINGUAL-ASSEMBLY] Created M4B: {m4b_output}")
-                # Remove intermediate FLAC
-                try:
-                    os.remove(audio_output)
-                except:
-                    pass
-            else:
-                print(f"[BILINGUAL-ASSEMBLY] M4B conversion warning: {result.stderr}")
-                m4b_output = audio_output  # Fall back to FLAC
+        if not ffmpeg:
+            error = 'M4B conversion failed: ffmpeg not found on PATH'
+            print(f"[BILINGUAL-ASSEMBLY] {error}")
+            return {'success': False, 'error': error}
+        cmd = [
+            ffmpeg, '-y',
+            '-i', audio_output,
+            '-c:a', 'aac',
+            '-b:a', '128k',
+            m4b_output
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            error = f'M4B conversion failed (ffmpeg exit {result.returncode}): {result.stderr}'
+            print(f"[BILINGUAL-ASSEMBLY] {error}")
+            return {'success': False, 'error': error}
+        print(f"[BILINGUAL-ASSEMBLY] Created M4B: {m4b_output}")
+        # Remove intermediate FLAC
+        try:
+            os.remove(audio_output)
+        except Exception as e:
+            print(f"[BILINGUAL-ASSEMBLY] Failed to remove intermediate FLAC {audio_output}: {e}")
 
         print("[BILINGUAL-ASSEMBLY] Complete!")
         return {

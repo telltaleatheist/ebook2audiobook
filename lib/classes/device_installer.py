@@ -681,8 +681,11 @@ class DeviceInstaller():
                         if not marker.evaluate():
                             continue
                     except Exception as e:
-                        error = f'Warning: Could not evaluate marker {marker_part} for {pkg_part}: {e}'
+                        # A platform guard we cannot evaluate must NOT be treated as
+                        # passing — skip the package instead of installing it anyway.
+                        error = f'Warning: Could not evaluate marker {marker_part} for {pkg_part}: {e}. Skipping this package.'
                         print(error)
+                        continue
                     package = pkg_part.strip()
                 if 'git+' in package or '://' in package:
                     pkg_name_match = re.search(r'([\w\-]+)\s*@?\s*git\+', package)

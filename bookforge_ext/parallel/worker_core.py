@@ -168,8 +168,11 @@ def create_worker_session(state: dict, args: dict) -> dict:
     vram_info = vram_detector.detect_vram(device, NATIVE)
     free_vram_gb = vram_info.get('free_vram_gb', 4)
 
-    # Get TTS engine
-    tts_engine = args.get('tts_engine') or state.get('tts_engine') or get_compatible_tts_engines(state.get('language', 'eng'))[0]
+    # Get TTS engine — the session state (or CLI args) must name it explicitly;
+    # silently guessing an engine here would run the wrong model.
+    tts_engine = args.get('tts_engine') or state.get('tts_engine')
+    if not tts_engine:
+        raise ValueError('No tts_engine in session state or args — the session state must name its engine')
     fine_tuned = args.get('fine_tuned') or state.get('fine_tuned') or default_fine_tuned
 
     # Build model cache key
@@ -212,15 +215,19 @@ def create_worker_session(state: dict, args: dict) -> dict:
         'cover': state.get('cover'),
         'output_format': args.get('output_format') or state.get('output_format', 'm4b'),
         'cancellation_requested': False,
-        # TTS settings from state
-        'xtts_temperature': state.get('xtts_temperature') or default_engine_settings[TTS_ENGINES['XTTSv2']]['temperature'],
-        'xtts_length_penalty': state.get('xtts_length_penalty') or default_engine_settings[TTS_ENGINES['XTTSv2']]['length_penalty'],
-        'xtts_num_beams': state.get('xtts_num_beams') or default_engine_settings[TTS_ENGINES['XTTSv2']]['num_beams'],
-        'xtts_repetition_penalty': state.get('xtts_repetition_penalty') or default_engine_settings[TTS_ENGINES['XTTSv2']]['repetition_penalty'],
-        'xtts_top_k': state.get('xtts_top_k') or default_engine_settings[TTS_ENGINES['XTTSv2']]['top_k'],
-        'xtts_top_p': state.get('xtts_top_p') or default_engine_settings[TTS_ENGINES['XTTSv2']]['top_p'],
-        'xtts_speed': args.get('speed') or state.get('xtts_speed') or default_engine_settings[TTS_ENGINES['XTTSv2']]['speed'],
-        'xtts_enable_text_splitting': state.get('xtts_enable_text_splitting') or default_engine_settings[TTS_ENGINES['XTTSv2']]['enable_text_splitting'],
+        # TTS settings from state — default ONLY on absence (`.get(k, default)`),
+        # never on falsy values: `or default` would clobber legitimate settings
+        # like enable_text_splitting=False or temperature=0.
+        'xtts_temperature': state.get('xtts_temperature', default_engine_settings[TTS_ENGINES['XTTSv2']]['temperature']),
+        'xtts_length_penalty': state.get('xtts_length_penalty', default_engine_settings[TTS_ENGINES['XTTSv2']]['length_penalty']),
+        'xtts_num_beams': state.get('xtts_num_beams', default_engine_settings[TTS_ENGINES['XTTSv2']]['num_beams']),
+        'xtts_repetition_penalty': state.get('xtts_repetition_penalty', default_engine_settings[TTS_ENGINES['XTTSv2']]['repetition_penalty']),
+        'xtts_top_k': state.get('xtts_top_k', default_engine_settings[TTS_ENGINES['XTTSv2']]['top_k']),
+        'xtts_top_p': state.get('xtts_top_p', default_engine_settings[TTS_ENGINES['XTTSv2']]['top_p']),
+        # CLI --speed overrides the session state (explicit-arg precedence, not a fallback)
+        'xtts_speed': args.get('speed') if args.get('speed') is not None
+                      else state.get('xtts_speed', default_engine_settings[TTS_ENGINES['XTTSv2']]['speed']),
+        'xtts_enable_text_splitting': state.get('xtts_enable_text_splitting', default_engine_settings[TTS_ENGINES['XTTSv2']]['enable_text_splitting']),
     }
 
     return session

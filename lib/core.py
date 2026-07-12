@@ -1125,6 +1125,12 @@ def filter_chapter(idx:int, doc:EpubHtml, session_id:str, stanza_nlp:Pipeline, i
                 text = unicodedata.normalize('NFKC', text).replace('\u00A0', ' ')
                 if re_num.search(text) and re_ordinal.search(text):
                     date_spans = get_date_entities(text, stanza_nlp)
+                    if date_spans is None:
+                        # NER crashed (error already printed by get_date_entities);
+                        # do not silently fall through to the "no dates" branch.
+                        error = 'Date entity recognition failed!'
+                        print(error)
+                        return None
                     if date_spans:
                         result = []
                         last_pos = 0
@@ -1597,7 +1603,10 @@ def get_sanitized(str:str, replacement:str='_')->str:
     sanitized = sanitized.strip('_')
     return sanitized
     
-def get_date_entities(text:str, stanza_nlp:Pipeline)->list[tuple[int,int,str]]|bool:
+def get_date_entities(text:str, stanza_nlp:Pipeline)->list[tuple[int,int,str]]|None:
+    # Returns a list of DATE spans ([] when none found) or None when the
+    # stanza NER pipeline itself crashed — callers must treat None as an error,
+    # not as "no dates".
     try:
         doc = stanza_nlp(text)
         date_spans = []
@@ -1608,7 +1617,7 @@ def get_date_entities(text:str, stanza_nlp:Pipeline)->list[tuple[int,int,str]]|b
     except Exception as e:
         error = f'get_date_entities() error: {e}'
         print(error)
-        return False
+        return None
 
 def get_num2words_compat(lang_iso1:str)->bool:
     try:
