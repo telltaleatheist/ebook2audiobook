@@ -603,15 +603,28 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
             traceback.print_exc()
             raise ValueError(error)
 
-    def _generate_mlx(self, text: str, max_tokens: int = 2048) -> np.ndarray:
+    def _generate_mlx(self, text: str, max_tokens: int = None) -> np.ndarray:
         """Generate audio using MLX backend.
 
-        Note: 125 tokens ≈ 10 seconds of audio, so 2048 tokens ≈ 163 seconds max.
+        max_tokens defaults to MLX_MAX_TOKENS. The old bare default was a stale
+        2048 literal, which silently clipped ~450-char packed chunks (need
+        2500-3400 tokens) on every bare call — and a 2048-clipped chunk implies
+        ~18.4 chars/sec, just UNDER the truncation guard's measured 19.0
+        threshold, so the guard could not catch what this default caused.
+
+        Returns an EMPTY array when the model produced no audio — never
+        fabricated silence, which would sail past _save_audio's empty-rejection
+        and ship a missing sentence as success.
         """
-        audio_data = None
+        if max_tokens is None:
+            max_tokens = self.MLX_MAX_TOKENS
         # Match vLLM/transformers sampling params - repetition_penalty prevents
         # repeated audio patterns that can sound like echo/reverb
         print(f"[ORPHEUS] Generating with voice='{self.voice}' for: {text[:50]}...")
+        # mlx_audio's generate() splits its input on newlines and yields ONE
+        # GenerationResult per segment — accumulate them ALL; keeping only the
+        # last silently dropped every segment before the final one.
+        segments = []
         for result in self.mlx_model.generate(
             text,
             voice=self.voice,
@@ -621,19 +634,17 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
             max_tokens=max_tokens
         ):
             audio_data = result.audio
+            if audio_data is None:
+                continue
+            # MLX returns audio as numpy array or MLX array
+            if hasattr(audio_data, 'tolist'):
+                audio_data = np.array(audio_data, dtype=np.float32)
+            if len(audio_data) > 0:
+                segments.append(audio_data)
 
-        if audio_data is None:
-            return np.zeros(int(self.SAMPLE_RATE * 0.1), dtype=np.float32)
-
-        # MLX returns audio as numpy array or MLX array
-        if hasattr(audio_data, 'tolist'):
-            # Convert MLX array to numpy
-            import numpy as np
-            audio_np = np.array(audio_data, dtype=np.float32)
-        else:
-            audio_np = audio_data
-
-        return audio_np
+        if not segments:
+            return np.zeros(0, dtype=np.float32)
+        return segments[0] if len(segments) == 1 else np.concatenate(segments)
 
     def _generate_mlx_safe(self, clean: str, depth: int = 0) -> np.ndarray:
         """Render a sentence whose batched MLX generation hit the token cap:
@@ -1136,7 +1147,16 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
         Guard applies only when clean length > 150 chars (short chunks' rates are
         noisy) and ORPHEUS_MAX_CHARS_PER_SEC > 0 (default 19.0; set 0 to disable).
         If the re-render STILL trips the guard we accept it and warn — no infinite
-        loop; the _generate_*_safe ladders already carry their own depth guard."""
+        loop; the _generate_*_safe ladders already carry their own depth guard.
+
+        EMPTY audio for non-empty text (immediate early-EOS / unparseable stream)
+        is a definite failure, not a noisy metric, so it gets its one re-render
+        regardless of the 150-char floor. If the retake is empty too, the empty
+        result flows back to the caller — _save_audio rejects it (row fails
+        loudly) and the streaming worker emits 'No audio generated'."""
+        if (audio_np is None or len(audio_np) == 0) and clean and clean.strip():
+            print(f"Orpheus: sentence {sentence_index} produced no audio — re-rendering split at sentence boundaries")
+            return resplit(clean)
         max_rate = float(os.environ.get('ORPHEUS_MAX_CHARS_PER_SEC', '19.0'))
         if max_rate <= 0 or len(clean) <= 150:
             return audio_np
@@ -1443,7 +1463,13 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
                                     decode_audio_from_codes(code_lists[0])[0], dtype=np.float32
                                 )
                             else:
-                                audio = np.zeros(int(self.SAMPLE_RATE * 0.1), dtype=np.float32)
+                                # No valid codes (immediate early-EOS / unparseable
+                                # stream): EMPTY, not fabricated silence — fabricated
+                                # zeros sailed past _save_audio's empty-rejection and
+                                # shipped the sentence as success with no audio. The
+                                # guard below re-renders empties once; if that fails
+                                # too, _save_audio fails the row loudly.
+                                audio = np.zeros(0, dtype=np.float32)
                             # Backstop a silent early-EOS truncation (clean stop, audio
                             # too short for the text) the token-cap check can't catch.
                             audio = self._guard_truncation(idx, clean, audio, self._generate_mlx_safe)
