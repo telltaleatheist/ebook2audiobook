@@ -614,7 +614,11 @@ def worker_only(args: dict, core_module) -> dict:
         session['cover'] = state.get('cover')
         session['language'] = state.get('language', default_language_code)
         session['language_iso1'] = state.get('language_iso1', 'en')
-        session['tts_engine'] = args.get('tts_engine') or state.get('tts_engine') or get_compatible_tts_engines(session['language'])[0]
+        # No silent engine default: assembling with the wrong engine's settings
+        # (or against another engine's sentence files) must fail loudly instead.
+        session['tts_engine'] = args.get('tts_engine') or state.get('tts_engine')
+        if not session['tts_engine']:
+            raise ValueError('No tts_engine in session state or args — the session must name its engine')
         session['fine_tuned'] = args.get('fine_tuned') or state.get('fine_tuned') or default_fine_tuned
         session['voice'] = args.get('voice') or state.get('voice')
         session['output_format'] = args.get('output_format') or state.get('output_format', default_output_format)
