@@ -493,12 +493,21 @@ def ocr2xhtml(img: Image.Image, lang: str)->str:
         return False
 
 def load_json_chapters(filepath:str)->list:
+    # Raises on a missing or unreadable chapters cache instead of returning [].
+    # This is only called on RESUME (checksum matched, so a prior run saved it).
+    # Returning [] made the caller silently re-run get_chapters(); the fresh
+    # sentence split can differ from the split the existing numbered sentence
+    # files were rendered from, and resume-by-file-index then pairs old audio
+    # with the WRONG text. A broken resume cache must stop the run, not degrade.
     try:
         with open(filepath, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception as e:
-        print(f"load_json_chapters() error: {e}")
-        return []
+        raise RuntimeError(
+            f'Saved chapters cache {filepath} could not be read ({e}). Refusing to '
+            f're-split sentences over the existing session audio — delete the session '
+            f'processing directory to start fresh.'
+        ) from e
 
 def save_json_chapters(session_id:str, filepath:str)->bool:
     try:
@@ -796,7 +805,13 @@ YOU CAN IMPROVE IT OR ASK TO A TRAINING MODEL EXPERT.
             for doc_idx, doc in enumerate(all_docs):
                 sentences_list = filter_chapter(doc_idx, doc, session_id, stanza_nlp, is_num2words_compat)
                 if sentences_list is None:
-                    break
+                    # A genuine extraction error on ONE document must not silently
+                    # truncate the book — the old `break` returned the chapters
+                    # gathered so far as if the whole book had been processed. Fail
+                    # the whole conversion loudly so the missing content is surfaced.
+                    error = f'Chapter extraction failed at document index {doc_idx}; aborting so the audiobook is not silently truncated'
+                    print(error)
+                    return []
                 elif len(sentences_list) > 0:
                     chapters.append(sentences_list)
             if len(chapters) == 0:
@@ -1146,7 +1161,7 @@ def filter_chapter(idx:int, doc:EpubHtml, session_id:str, stanza_nlp:Pipeline, i
                             )
                         else:
                             text = re_ordinal.sub(
-                                lambda m: math2words(int(m.group(1)), lang, lang_iso1, tts_engine, is_num2words_compat),
+                                lambda m: math2words(m.group(1), lang, lang_iso1, tts_engine, is_num2words_compat),
                                 text
                             )
                         text = re.sub(
@@ -1174,8 +1189,12 @@ def filter_chapter(idx:int, doc:EpubHtml, session_id:str, stanza_nlp:Pipeline, i
             msg = f'Get sentences…'
             print(msg)
             sentences = get_sentences(text, session_id)
-            if sentences and len(sentences) == 0:
-                error = 'No sentences found!'
+            # get_sentences returns None on a genuine failure and [] for empty text.
+            # The old `if sentences and len(sentences)==0` could never be true and
+            # did not guard None, so a None fell through to the list comprehension
+            # below → TypeError → swallowed → chapter dropped. Handle None explicitly.
+            if sentences is None:
+                error = 'Failed to split chapter text into sentences'
                 print(error)
                 return None
             sentences = [restore_sml(s, sml_blocks) for s in sentences]
@@ -1324,7 +1343,13 @@ def get_sentences(text:str, session_id:str)->list|None:
         if tts_engine == 'voxtral':
             max_chars *= 2
         elif tts_engine == 'orpheus':
-            max_chars = int(max_chars * 1.2)
+            # Orpheus packs to a SHORT cap. At the old ~300 chars this fine-tune ran away
+            # (no EOS) on ~half of packed chunks; 200 cut that to ~1/22 and made the batch
+            # path 3.2x faster with IDENTICAL audio (validated 2026-07-12, rohan on
+            # Deathstalker prose). ORPHEUS_MAX_CHARS overrides; invalid value raises (NO
+            # FALLBACK). The old language_mapping*1.2 formula is retired for Orpheus.
+            _mc = os.environ.get('ORPHEUS_MAX_CHARS')
+            max_chars = int(_mc) if _mc else 200
 
         assert not SML_TAG_PATTERN.search(text)
 
@@ -1505,17 +1530,60 @@ def get_sentences(text:str, session_id:str)->list|None:
                 # its escaped form is shorter than its raw form (strip_escaped_sml drops
                 # the escaped tag chars). Only plain-prose runs pack; every pause is kept.
                 # (_plain is defined once up top and shared with PASS 4.)
+                # SENTENCE-COUNT CAP (2026-07-12): packing is char-capped AND sentence-
+                # capped. A/B-proven (diag_packed.py, deathstalker/rohan): runaway (no
+                # EOS, silence attractor entered at an INTERNAL sentence boundary,
+                # dropping the remaining text) scales with the number of packed
+                # sentences — 1 sent: 0/26, 2: 0/3, 3: 4/9, 4: 4/6, 6: 3/3 — while the
+                # SAME text split singly is 0/20. Char length was NOT the driver (all
+                # 179-200 chars). Each internal boundary is a stochastic chance to
+                # enter the silence attractor, so cap chunks at 2 sentences.
+                # ORPHEUS_MAX_SENTENCES overrides; invalid value raises (NO FALLBACK).
+                _ms = os.environ.get('ORPHEUS_MAX_SENTENCES')
+                max_sents = int(_ms) if _ms else 2
+                def _nsent(t):
+                    return max(1, len(re.findall(r'[.!?…]["\'”’)\]]*(?:\s|$)', t)))
                 packed = []
                 for s in final_list:
                     s = s.strip()
                     if not s:
                         continue
                     if (packed and _plain(packed[-1]) and _plain(s)
-                            and clean_len(packed[-1]) + 1 + clean_len(s) <= max_chars):
+                            and clean_len(packed[-1]) + 1 + clean_len(s) <= max_chars
+                            and _nsent(packed[-1]) + _nsent(s) <= max_sents):
                         packed[-1] = packed[-1].rstrip() + ' ' + s.lstrip()
                     else:
                         packed.append(s)
-                return packed
+                # The merge cap alone is NOT enough: items ARRIVE here already multi-
+                # sentence (PASS 4 merges short dialogue fragments upstream), so a
+                # merge-only cap left 593/2516 chunks at 3-9 sentences in the first
+                # capped run — and the capped chunk indices matched those chunks almost
+                # 1:1. SPLIT any over-cap item at sentence boundaries and regroup into
+                # <=max_sents pieces. SML tokens stay inside their piece, so no pause
+                # is dropped; each piece gets its own sentence-gap tail (correct).
+                def _split_to_cap(t):
+                    parts, last = [], 0
+                    for m in re.finditer(r'[.!?…]["\'”’)\]]*\s+', t):
+                        parts.append(t[last:m.end()].strip())
+                        last = m.end()
+                    if last < len(t):
+                        parts.append(t[last:].strip())
+                    parts = [p for p in parts if p]
+                    out = []
+                    for p in parts:
+                        if (out and _nsent(out[-1]) + _nsent(p) <= max_sents
+                                and clean_len(out[-1]) + 1 + clean_len(p) <= max_chars):
+                            out[-1] = out[-1] + ' ' + p
+                        else:
+                            out.append(p)
+                    return out or [t]
+                capped = []
+                for item in packed:
+                    if _nsent(item) > max_sents:
+                        capped.extend(_split_to_cap(item))
+                    else:
+                        capped.append(item)
+                return capped
             return final_list
     except Exception as e:
         print(f'get_sentences() error: {e}')
@@ -1631,7 +1699,11 @@ def year2words(year_str:str, lang:str, lang_iso1:str, is_num2words_compat:bool)-
     except Exception as e:
         error = f'year2words() error: {e}'
         print(error)
-        return False
+        # MUST return a str, not False: this is a re.sub replacement callable, and
+        # returning a bool raises TypeError inside re.sub → the exception is swallowed
+        # by filter_chapter's blanket except → the chapter becomes None → get_chapters
+        # aborts the rest of the book. Leaving the original token in place is harmless.
+        return year_str
 
 def clock2words(text:str, lang:str, lang_iso1:str, tts_engine:str, is_num2words_compat:bool)->str:
 
@@ -1987,7 +2059,7 @@ def normalize_text(text:str, lang:str, lang_iso1:str, tts_engine:str)->str:
             
     # Remove emojis
     emoji_pattern = re.compile(f"[{''.join(emojis_list)}]+", flags=re.UNICODE)
-    emoji_pattern.sub('', text)
+    text = emoji_pattern.sub('', text)
     if lang in abbreviations_mapping:
         mapping = abbreviations_mapping[lang]
         # Sort keys by descending length so longer ones match first
@@ -2260,6 +2332,10 @@ def combine_audio_chapters(session_id:str)->list[str]|None:
                 ffmpeg_metadata += f"{tag('description')}={session['metadata']['description']}\n"
             if session['metadata'].get('publisher') and (is_mp4_like or is_mp3):
                 ffmpeg_metadata += f"{tag('publisher')}={session['metadata']['publisher']}\n"
+            # Only stamp a year we can actually derive. Defaulting an unknown or
+            # unparseable publish date to the CURRENT year silently brands the book
+            # with a wrong publication year; leave the tag off instead.
+            year = None
             if session['metadata'].get('published'):
                 try:
                     if '.' in session['metadata']['published']:
@@ -2267,13 +2343,12 @@ def combine_audio_chapters(session_id:str)->list[str]|None:
                     else:
                         year = datetime.strptime(session['metadata']['published'], '%Y-%m-%dT%H:%M:%S%z').year
                 except Exception:
-                    year = datetime.now().year
-            else:
-                year = datetime.now().year
-            if is_vorbis:
-                ffmpeg_metadata += f"{tag('date')}={year}\n"
-            else:
-                ffmpeg_metadata += f"{tag('year')}={year}\n"
+                    year = None
+            if year is not None:
+                if is_vorbis:
+                    ffmpeg_metadata += f"{tag('date')}={year}\n"
+                else:
+                    ffmpeg_metadata += f"{tag('year')}={year}\n"
             if session['metadata'].get('identifiers') and isinstance(session['metadata']['identifiers'], dict):
                 if is_mp3 or is_mp4_like:
                     isbn = session['metadata']['identifiers'].get('isbn')
@@ -2450,6 +2525,36 @@ def combine_audio_chapters(session_id:str)->list[str]|None:
             if selected_chapters:
                 # chapter_files are already filtered, map file numbers to titles
                 chapter_titles = [chapter_titles[ch-1] for ch in selected_chapters if ch-1 < len(chapter_titles)]
+            # INVARIANT: the files about to be concatenated must cover EXACTLY the
+            # chapter set this function believes it is assembling. The glob above
+            # collects whatever files happen to exist, so a missing (or 0-byte)
+            # chapter file would otherwise produce a silently SHORTER audiobook
+            # with misaligned chapter titles. The intended set is:
+            #   - session['selected_chapters'] when set (assemble_audiobook always
+            #     sets it — 1-indexed; includes the designed partial-assembly path,
+            #     where the selection itself is the already-narrowed chapter list);
+            #   - otherwise one 0-indexed file per chapter in session['chapters']
+            #     (legacy finalize_audiobook/convert_chapters2audio flow).
+            # Every intended chapter file must exist and be non-empty, else abort.
+            if selected_chapters:
+                expected_chapter_nums = list(selected_chapters)
+            else:
+                expected_chapter_nums = list(range(len(chapters_data)))
+            if expected_chapter_nums:
+                files_by_num = {int(re.search(r'\d+', f).group()): f for f in chapter_files}
+                missing_chapter_nums = [n for n in expected_chapter_nums if n not in files_by_num]
+                empty_chapter_nums = [
+                    n for n in expected_chapter_nums
+                    if n in files_by_num and os.path.getsize(os.path.join(session['chapters_dir'], files_by_num[n])) == 0
+                ]
+                if missing_chapter_nums or empty_chapter_nums:
+                    error = 'combine_audio_chapters(): refusing to assemble an incomplete audiobook.'
+                    if missing_chapter_nums:
+                        error += f' Missing chapter audio files for chapter(s): {missing_chapter_nums}.'
+                    if empty_chapter_nums:
+                        error += f' Empty (0-byte) chapter audio files for chapter(s): {empty_chapter_nums}.'
+                    print(error)
+                    return None
             is_gui_process = session['is_gui_process']
             if len(chapter_files) == 0:
                 print('No block files exists!')
@@ -2901,7 +3006,10 @@ def convert_ebook(args:dict)->tuple:
                                         if not convert2epub(session_id):
                                             error = 'convert2epub() failed!'
                                     else:
-                                        session['chapters'] = load_json_chapters(saved_json_chapters)
+                                        try:
+                                            session['chapters'] = load_json_chapters(saved_json_chapters)
+                                        except Exception as e:
+                                            error = str(e)
                                     if error is None:
                                         epubBook = epub.read_epub(session['epub_path'], {'ignore_ncx': True})
                                         if epubBook:

@@ -1064,7 +1064,7 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
         # it's a FIXED 0.75. Override with ORPHEUS_SENTENCE_GAP.
         sentence_gap = _env('ORPHEUS_SENTENCE_GAP')
         if sentence_gap is None:
-            sentence_gap = 0.75
+            sentence_gap = 0.6   # tightened from 0.75 (2026-07-12, ear-approved on rohan)
 
         # Section pause ([pause] / [pause:X]) — the strong, long boundary.
         m = re.search(r'\[pause(?::([0-9.]+))?\]', raw, flags=re.IGNORECASE)
@@ -1165,11 +1165,13 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
             return False
         final_sentence_file = self._sentence_file(sentence_index)
         audio_tensor = torch.from_numpy(audio_np).float()
-        # Trim trailing silence (Orpheus tends to add long end pauses); keep 200ms buffer.
-        if audio_tensor.dim() == 1:
-            audio_tensor = trim_audio(audio_tensor, self.SAMPLE_RATE, silence_threshold=0.01, buffer_sec=0.20)
-            if len(audio_tensor) == 0:
-                audio_tensor = torch.zeros(int(self.SAMPLE_RATE * 0.1))
+        # NO-FALLBACK (2026-07-11): the trailing-silence trim was REMOVED here. It
+        # silently erased the runaway silence a mis-behaving model emits (a stop-token
+        # failure), masking the bug and destroying data — a forbidden fallback. The
+        # end-of-sentence pause is added DETERMINISTICALLY below (trail_gap); the model
+        # must be trained to stop cleanly (trimmed-tail clips), not have its dead air
+        # papered over at save time. If a clip has abnormal trailing silence, that must
+        # be VISIBLE, not hidden.
         if audio_tensor.dim() == 1:
             audio_tensor = audio_tensor.unsqueeze(0)
         # Normalize to prevent clipping
