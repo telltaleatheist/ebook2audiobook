@@ -178,7 +178,11 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
     # min_p drops tokens below this fraction of the top token's probability —
     # cuts the rare-junk tail without flattening expressive variety the way
     # lowering top_p does (confidence-scaled cutoff vs fixed probability mass).
-    # vLLM path only; the MLX sampler has no min_p. 0 disables.
+    # Applied on the vLLM paths and the MLX BATCH paths (mlx_lm make_sampler
+    # takes min_p). The MLX single-sentence path can't honor it: mlx_audio's
+    # llama Model.generate builds its own sampler and only forwards top_k /
+    # repetition_penalty from kwargs, so min_p would be silently dropped there.
+    # 0 disables.
     MIN_P = float(os.environ.get('ORPHEUS_MIN_P', '0.05'))
 
     # Special token IDs
@@ -764,7 +768,7 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
                     self.mlx_model,
                     max_tokens=self.MLX_MAX_TOKENS,
                     stop_tokens={self.END_OF_AUDIO_TOKEN},
-                    sampler=make_sampler(self.TEMPERATURE, top_p=self.TOP_P),
+                    sampler=make_sampler(self.TEMPERATURE, top_p=self.TOP_P, min_p=self.MIN_P),
                     logits_processors=make_logits_processors(None, self.REP_PENALTY, 20),
                     completion_batch_size=len(bucket),
                     prefill_batch_size=len(bucket),
@@ -1427,8 +1431,10 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
         would grow unbounded (~46 GB over one chunk) if not limited — bounded
         once at load via mx.set_cache_limit (_load_mlx_engine), NOT by per-chunk
         flushes. Throughput: 12.4 sent/min at B=16 → 27-28 at B=96 (the knee;
-        B=128 is slower). Sampling matches the single-seq MLX path
-        (_generate_mlx): temp 0.6, top_p 0.8, repetition_penalty 1.1.
+        B=128 is slower). Sampling follows the class constants
+        (TEMPERATURE/TOP_P/MIN_P/REP_PENALTY) like the vLLM paths — except
+        min_p, which the single-seq MLX path (_generate_mlx) can't apply
+        (mlx_audio's generate doesn't plumb it; see the MIN_P comment).
         """
         try:
             import numpy as np
@@ -1463,7 +1469,7 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
                         self.mlx_model,
                         max_tokens=self.MLX_MAX_TOKENS,
                         stop_tokens={self.END_OF_AUDIO_TOKEN},
-                        sampler=make_sampler(self.TEMPERATURE, top_p=self.TOP_P),
+                        sampler=make_sampler(self.TEMPERATURE, top_p=self.TOP_P, min_p=self.MIN_P),
                         logits_processors=make_logits_processors(None, self.REP_PENALTY, 20),
                         completion_batch_size=len(bucket),
                         prefill_batch_size=len(bucket),
