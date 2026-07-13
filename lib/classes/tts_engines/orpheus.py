@@ -161,7 +161,11 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
     # core.py packs 2-3 sentences per chunk (~450 chars); temp 0.6 is the reference.
     # All three override via env so they can be A/B-tuned live
     # (ORPHEUS_TEMPERATURE / ORPHEUS_TOP_P / ORPHEUS_REP_PENALTY).
-    TEMPERATURE = float(os.environ.get('ORPHEUS_TEMPERATURE', '0.6'))
+    # Temperature 0.85: ear-picked winner of a 0.6-1.0 ladder (2026-07-12,
+    # deathstalker_v3, 350-char packing) — livelier prosody; EVERY arm rendered
+    # clean (0 guard trips), so the old "cooler is safer" assumption didn't hold
+    # on EOS-safe voices. Cooling to 0.5 flattened prosody (see note above).
+    TEMPERATURE = float(os.environ.get('ORPHEUS_TEMPERATURE', '0.85'))
     TOP_P = float(os.environ.get('ORPHEUS_TOP_P', '0.8'))
     REP_PENALTY = float(os.environ.get('ORPHEUS_REP_PENALTY', '1.1'))
 
@@ -497,9 +501,16 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
         # Override with ORPHEUS_GPU_MEM_UTIL for headless / dedicated-GPU machines.
         gpu_mem_util = float(os.environ.get('ORPHEUS_GPU_MEM_UTIL', '0.70'))
         print(f"Orpheus: vLLM gpu_memory_utilization={gpu_mem_util}")
+        # dtype: the fine-tune checkpoints are bfloat16; "float16" forces a lossy
+        # cast on load (vLLM warns "Casting torch.bfloat16 to torch.float16" every
+        # run) — suspected contributor to subtle broadband artifacts. Same VRAM
+        # either way; Ampere+ runs bf16 natively. ORPHEUS_VLLM_DTYPE overrides
+        # ("bfloat16"/"float16"/"auto" — auto follows the checkpoint) for A/B.
+        vllm_dtype = os.environ.get('ORPHEUS_VLLM_DTYPE', 'float16')
+        print(f"Orpheus: vLLM dtype={vllm_dtype}")
         engine = LLM(
             model=self.TRANSFORMERS_MODEL,
-            dtype="float16",
+            dtype=vllm_dtype,
             max_model_len=4096,
             gpu_memory_utilization=gpu_mem_util,
             enforce_eager=use_eager,
