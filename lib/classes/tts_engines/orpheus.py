@@ -167,20 +167,19 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
     # on EOS-safe voices. Cooling to 0.5 flattened prosody (see note above).
     TEMPERATURE = float(os.environ.get('ORPHEUS_TEMPERATURE', '0.85'))
     TOP_P = float(os.environ.get('ORPHEUS_TOP_P', '0.8'))
-    # Rep penalty 1.07 (from 1.1, 2026-07-12): the penalty is the PAUSE governor
-    # (audio silence tokens repeat; ladder-proven: 1.0 = pauses sprawl to 2x
-    # runtime + token-cap runaways, 1.05 = audibly long, 1.07/1.1 = right) but it
-    # also chokes legitimately repeating codes mid-vowel — 1.1 caused frequent
-    # breathy mid-word voicing "cracks", 1.07 balances. Cracks are NOT purely
-    # penalty-induced (one still occurred at 1.0): breathy frames are in the
-    # learned distribution; the durable fix is retrain-side (pause-capped,
-    # crack-screened re-cut), after which this can drop toward ~1.02-1.05.
-    REP_PENALTY = float(os.environ.get('ORPHEUS_REP_PENALTY', '1.07'))
+    # Rep penalty 1.1: the penalty is the PAUSE governor (audio silence tokens
+    # repeat; ladder-proven 2026-07-12: 1.0 = pauses sprawl to 2x runtime +
+    # token-cap runaways, 1.05/1.07 = audibly long, 1.1 = right) but it also
+    # chokes legitimately repeating codes mid-vowel, causing occasional breathy
+    # voicing "cracks". Owen chose pauses-right over cracks-fewer; the real fix
+    # is retrain-side — see orpheus-finetune SAMPLING_AND_VOICE_QUALITY_FINDINGS.md
+    # (pause-capped re-cut lets this drop to ~1.02-1.05 where cracks fade).
+    REP_PENALTY = float(os.environ.get('ORPHEUS_REP_PENALTY', '1.1'))
     # min_p drops tokens below this fraction of the top token's probability —
-    # cuts the rare-junk tail (mid-word voicing "cracks") without flattening
-    # expressive variety the way lowering top_p does. 0.0 = off (vLLM default).
-    # vLLM path only; the MLX sampler has no min_p.
-    MIN_P = float(os.environ.get('ORPHEUS_MIN_P', '0.0'))
+    # cuts the rare-junk tail without flattening expressive variety the way
+    # lowering top_p does (confidence-scaled cutoff vs fixed probability mass).
+    # vLLM path only; the MLX sampler has no min_p. 0 disables.
+    MIN_P = float(os.environ.get('ORPHEUS_MIN_P', '0.05'))
 
     # Special token IDs
     END_OF_AUDIO_TOKEN = 128258
