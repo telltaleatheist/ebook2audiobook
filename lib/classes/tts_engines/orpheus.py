@@ -161,11 +161,12 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
     # core.py packs 2-3 sentences per chunk (~450 chars); temp 0.6 is the reference.
     # All three override via env so they can be A/B-tuned live
     # (ORPHEUS_TEMPERATURE / ORPHEUS_TOP_P / ORPHEUS_REP_PENALTY).
-    # Temperature 0.85: ear-picked winner of a 0.6-1.0 ladder (2026-07-12,
-    # deathstalker_v3, 350-char packing) — livelier prosody; EVERY arm rendered
-    # clean (0 guard trips), so the old "cooler is safer" assumption didn't hold
-    # on EOS-safe voices. Cooling to 0.5 flattened prosody (see note above).
-    TEMPERATURE = float(os.environ.get('ORPHEUS_TEMPERATURE', '0.85'))
+    # Temperature: back at the 0.6 upstream reference (2026-07-13) as the clean
+    # baseline for the retrained voices — the 0.85 ladder winner (2026-07-12,
+    # deathstalker_v3, 350-char packing) was ear-picked around the OLD fine-tune
+    # and the next full book came out rough. Re-run the ladder per retrain via
+    # ORPHEUS_TEMPERATURE rather than baking a voice-specific value in here.
+    TEMPERATURE = float(os.environ.get('ORPHEUS_TEMPERATURE', '0.6'))
     TOP_P = float(os.environ.get('ORPHEUS_TOP_P', '0.8'))
     # Rep penalty 1.1: the penalty is the PAUSE governor (audio silence tokens
     # repeat; ladder-proven 2026-07-12: 1.0 = pauses sprawl to 2x runtime +
@@ -182,8 +183,10 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
     # takes min_p). The MLX single-sentence path can't honor it: mlx_audio's
     # llama Model.generate builds its own sampler and only forwards top_k /
     # repetition_penalty from kwargs, so min_p would be silently dropped there.
-    # 0 disables.
-    MIN_P = float(os.environ.get('ORPHEUS_MIN_P', '0.05'))
+    # Default 0 = off, matching upstream (which never uses min_p); the Jul 12
+    # tuning pass ran 0.05 — re-enable per-voice via ORPHEUS_MIN_P if the
+    # retrain still shows a junk tail.
+    MIN_P = float(os.environ.get('ORPHEUS_MIN_P', '0.0'))
 
     # Special token IDs
     END_OF_AUDIO_TOKEN = 128258
