@@ -501,12 +501,15 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
         # Override with ORPHEUS_GPU_MEM_UTIL for headless / dedicated-GPU machines.
         gpu_mem_util = float(os.environ.get('ORPHEUS_GPU_MEM_UTIL', '0.70'))
         print(f"Orpheus: vLLM gpu_memory_utilization={gpu_mem_util}")
-        # dtype: the fine-tune checkpoints are bfloat16; "float16" forces a lossy
-        # cast on load (vLLM warns "Casting torch.bfloat16 to torch.float16" every
-        # run) — suspected contributor to subtle broadband artifacts. Same VRAM
-        # either way; Ampere+ runs bf16 natively. ORPHEUS_VLLM_DTYPE overrides
-        # ("bfloat16"/"float16"/"auto" — auto follows the checkpoint) for A/B.
-        vllm_dtype = os.environ.get('ORPHEUS_VLLM_DTYPE', 'float16')
+        # dtype: the fine-tune checkpoints are bfloat16; the old hardcoded
+        # "float16" forced a lossy cast on load (vLLM warned "Casting
+        # torch.bfloat16 to torch.float16" every run). A/B'd 2026-07-12: bf16 is
+        # AUDIBLY clearer / less muffled (Owen: "significantly... a keeper")
+        # even though the >8kHz RMS delta measured only 0.6dB — trust ears over
+        # a single band metric. Same VRAM and speed; Ampere+ runs bf16 natively
+        # (pre-Ampere would need the env override back to float16).
+        # ORPHEUS_VLLM_DTYPE overrides ("bfloat16"/"float16"/"auto").
+        vllm_dtype = os.environ.get('ORPHEUS_VLLM_DTYPE', 'bfloat16')
         print(f"Orpheus: vLLM dtype={vllm_dtype}")
         engine = LLM(
             model=self.TRANSFORMERS_MODEL,
