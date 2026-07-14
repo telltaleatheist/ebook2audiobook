@@ -205,6 +205,12 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
             self.tokenizer = None
             self.mlx_model = None  # For MLX backend
 
+            # Session-scoped self-calibrating ceiling for the truncation guard's
+            # chars/sec threshold (see _guard_truncation). Starts at 0.0 (no
+            # ratchet); the guard only ever raises it, and only from rates
+            # measured on force-split re-renders (which cannot be truncated).
+            self._rate_ceiling = 0.0
+
             # Try to load presets, but don't fail if they're missing
             try:
                 self.models = load_engine_presets(self.session['tts_engine'])
@@ -1181,8 +1187,25 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
 
         Guard applies only when clean length > 150 chars (short chunks' rates are
         noisy) and ORPHEUS_MAX_CHARS_PER_SEC > 0 (default 19.0; set 0 to disable).
-        If the re-render STILL trips the guard we accept it and warn — no infinite
-        loop; the _generate_*_safe ladders already carry their own depth guard.
+
+        SELF-CALIBRATING RATCHET (self._rate_ceiling): the 19.0 default was
+        calibrated on ~15-17 ch/s voices; a faster fine-tune (e.g. one that
+        naturally reads ~20 ch/s) trips the guard on every long healthy chunk,
+        each false positive costing a full wasted serialized re-render. But the
+        force-split re-render hands us GROUND TRUTH for the voice's natural rate:
+        the pieces are short, and early-EOS truncation only strikes past ~300
+        chars, so a split render CANNOT itself be truncated. Therefore when the
+        re-render's rate2 STILL exceeds the threshold, that is not "still short"
+        — it PROVES the voice's true speaking rate is above the configured
+        threshold, and staying at 19.0 would keep re-splitting every fast-but-
+        healthy chunk for the rest of the session. So we ratchet the session
+        ceiling up to rate2 + 0.5 and log it LOUDLY. The effective threshold used
+        for every check is max(env-configured, ratchet); the ratchet only ever
+        moves UP, only from split-render rates (never a first-pass render), and
+        NEVER resurrects a disabled guard (env <= 0 short-circuits before the
+        ratchet is ever consulted). This is not an infinite loop — a first-pass
+        chunk measured above the raised ceiling still trips exactly once and
+        re-splits; the _generate_*_safe ladders carry their own depth guard.
 
         EMPTY audio for non-empty text (immediate early-EOS / unparseable stream)
         is a definite failure, not a noisy metric, so it gets its one re-render
@@ -1192,9 +1215,12 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
         if (audio_np is None or len(audio_np) == 0) and clean and clean.strip():
             print(f"Orpheus: sentence {sentence_index} produced no audio — re-rendering split at sentence boundaries")
             return resplit(clean)
-        max_rate = float(os.environ.get('ORPHEUS_MAX_CHARS_PER_SEC', '19.0'))
-        if max_rate <= 0 or len(clean) <= 150:
+        env_rate = float(os.environ.get('ORPHEUS_MAX_CHARS_PER_SEC', '19.0'))
+        # A disabled guard (env <= 0) stays disabled — the ratchet must NEVER
+        # resurrect it. Only past this gate does the session ceiling apply.
+        if env_rate <= 0 or len(clean) <= 150:
             return audio_np
+        max_rate = max(env_rate, self._rate_ceiling)
         rate = self._speech_rate(clean, audio_np)
         if rate is None or rate <= max_rate:
             return audio_np
@@ -1203,8 +1229,14 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
         audio_np = resplit(clean)
         rate2 = self._speech_rate(clean, audio_np)
         if rate2 is not None and rate2 > max_rate:
-            print(f"Orpheus: sentence {sentence_index} still short after re-render "
-                  f"({rate2:.1f} ch/s > {max_rate:.1f}); accepting")
+            # The split render is un-truncatable, so rate2 is the voice's real
+            # rate — the threshold is miscalibrated for this voice, not the audio
+            # truncated. Ratchet the ceiling up (never down) so subsequent healthy
+            # fast chunks stop tripping. Loud by design (NO silent fallbacks).
+            new_ceiling = rate2 + 0.5
+            self._rate_ceiling = new_ceiling
+            print(f"Orpheus: voice's measured natural rate {rate2:.1f} ch/s exceeds guard "
+                  f"threshold {max_rate:.1f} — recalibrating threshold to {new_ceiling:.1f} for this session")
         return audio_np
 
     def _save_audio(self, sentence_index: int, audio_np, lead_gap: float = 0.0, trail_gap: float = 0.0) -> bool:
