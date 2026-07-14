@@ -18,3 +18,6 @@ voices/__sessions/
 
 # Runtime logs
 logs/
+
+# Benchmark harness output (bench_orpheus_mlx.py / bench_validate_real.py)
+bench_*.log
