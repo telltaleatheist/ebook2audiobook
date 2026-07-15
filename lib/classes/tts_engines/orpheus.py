@@ -1511,7 +1511,21 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
                     )
                     uids = bg.insert([list(p) for _, p, _ in bucket])
                     out = {u: [] for u in uids}
+                    # Heartbeat: a long MLX batch is otherwise SILENT for minutes, which
+                    # the BookForge worker watchdog reads as "stuck" and false-kills the
+                    # worker (its GENERATION_ACTIVITY_RE only knew vLLM's tqdm). Emit a
+                    # throttled liveness line (~every 15 s) carrying real token progress —
+                    # keeps the watchdog fresh AND gives visibility into the silent batch.
+                    import time as _time
+                    _step = 0
+                    _last_hb = _time.time()
                     while responses := bg.next():
+                        _step += 1
+                        if _time.time() - _last_hb >= 15.0:
+                            _maxtok = max((len(v) for v in out.values()), default=0)
+                            print(f"[ORPHEUS] MLX batch generating: {len(bucket)} rows, "
+                                  f"~{_maxtok} tokens (step {_step})", flush=True)
+                            _last_hb = _time.time()
                         for r in responses:
                             if r.finish_reason != 'stop':  # stop token (128258) is dropped
                                 out[r.uid].append(r.token)
