@@ -65,6 +65,26 @@ def main():
                        help='First sentence index to process (0-indexed)')
     parser.add_argument('--sentence_end', type=int, default=None,
                        help='Last sentence index to process (0-indexed)')
+    parser.add_argument('--sentence_indices', type=str, default=None,
+                       help='Comma-separated explicit sentence indices to (re)generate '
+                            '(0-indexed). Overrides --sentence_start/--sentence_end. Used by '
+                            'the BookForge "Correct Sentences" flow to regenerate a scattered '
+                            'set of sentences in one warm model load.')
+    parser.add_argument('--num_takes', type=int, default=1,
+                       help='Generate each target sentence this many times in ONE model load '
+                            '(BookForge "Correct Sentences" re-roll). When >1, each take is '
+                            'written to a take{k}/ subdir of --sentences_dir. Sampling is '
+                            'stochastic, so every take differs. Default 1 (normal render).')
+    parser.add_argument('--take_temperatures', type=str, default=None,
+                       help='Comma-separated per-take sampling temperatures (e.g. "0.4,0.8,1.0"). '
+                            'Sets num_takes = the count; each take renders at its own temperature '
+                            'in ONE model load (Orpheus), for genuinely varied "Correct Sentences" '
+                            're-rolls.')
+    parser.add_argument('--sentence_overrides', type=str, default=None,
+                       help='Path to a JSON file mapping sentence index -> replacement text '
+                            '(BookForge "Correct Sentences" text edits). Those indices render the '
+                            'given text instead of the cached sentence. Overlong edits are split '
+                            'and re-merged by the engine, so they still produce one {i} file.')
 
     # Chapter mode arguments
     parser.add_argument('--chapter_start', type=int, default=None,
@@ -103,12 +123,48 @@ def main():
 
     args = parser.parse_args()
 
-    # Validate mode
-    sentence_mode = args.sentence_start is not None and args.sentence_end is not None
+    # Parse the optional explicit index list (BookForge "Correct Sentences").
+    sentence_indices = None
+    if args.sentence_indices is not None:
+        try:
+            sentence_indices = [int(x) for x in args.sentence_indices.split(',') if x.strip() != '']
+        except ValueError:
+            print("Error: --sentence_indices must be a comma-separated list of integers")
+            sys.exit(1)
+        if not sentence_indices:
+            print("Error: --sentence_indices was provided but empty")
+            sys.exit(1)
+
+    # Parse optional per-take temperatures; their count sets num_takes.
+    take_temperatures = None
+    if args.take_temperatures is not None:
+        try:
+            take_temperatures = [float(x) for x in args.take_temperatures.split(',') if x.strip() != '']
+        except ValueError:
+            print("Error: --take_temperatures must be a comma-separated list of numbers")
+            sys.exit(1)
+        if not take_temperatures:
+            print("Error: --take_temperatures was provided but empty")
+            sys.exit(1)
+    effective_num_takes = len(take_temperatures) if take_temperatures else args.num_takes
+
+    # Parse optional per-index text overrides (edited sentences).
+    sentence_overrides = None
+    if args.sentence_overrides is not None:
+        try:
+            with open(args.sentence_overrides, 'r', encoding='utf-8') as f:
+                _ov = json.load(f)
+            sentence_overrides = {int(k): str(v) for k, v in _ov.items()}
+        except Exception as e:
+            print(f"Error: failed to read --sentence_overrides: {e}")
+            sys.exit(1)
+
+    # Validate mode. Discrete-index mode counts as sentence mode.
+    sentence_mode = (args.sentence_start is not None and args.sentence_end is not None) or sentence_indices is not None
     chapter_mode = args.chapter_start is not None and args.chapter_end is not None
 
     if not sentence_mode and not chapter_mode:
-        print("Error: Must specify either --sentence_start/--sentence_end or --chapter_start/--chapter_end")
+        print("Error: Must specify --sentence_start/--sentence_end, --sentence_indices, or --chapter_start/--chapter_end")
         sys.exit(1)
 
     if sentence_mode and chapter_mode:
@@ -144,7 +200,11 @@ def main():
         args=worker_args,
         chapter_start=args.chapter_start,
         chapter_end=args.chapter_end,
-        session_dir_override=args.session_dir
+        session_dir_override=args.session_dir,
+        sentence_indices=sentence_indices,
+        num_takes=effective_num_takes,
+        take_temperatures=take_temperatures,
+        sentence_overrides=sentence_overrides
     )
 
     # Output result as JSON (for parsing by caller)

@@ -254,7 +254,11 @@ def run_worker_tts(
     args: dict,
     chapter_start: int | None = None,
     chapter_end: int | None = None,
-    session_dir_override: str | None = None
+    session_dir_override: str | None = None,
+    sentence_indices: list[int] | None = None,
+    num_takes: int = 1,
+    take_temperatures: list[float] | None = None,
+    sentence_overrides: dict | None = None
 ) -> dict:
     """
     Run TTS conversion for an assigned sentence range.
@@ -282,6 +286,7 @@ def run_worker_tts(
     # file that passes the >1KB resume check.
     in_flight: list[int] = []
     sentences_dir_for_cleanup: str | None = None
+    num_takes = max(1, int(num_takes))
     try:
         # Load session state — use override path if provided (for cached sessions
         # that aren't in the default e2a tmp dir)
@@ -332,11 +337,22 @@ def run_worker_tts(
             sentence_end = work_end
             print(f"[WORKER] Chapter mode: chapters {chapter_start}-{chapter_end} = sentences {sentence_start}-{sentence_end}")
 
-        # Validate range
-        if sentence_start < 0 or sentence_end >= len(all_sentences):
-            return {'success': False, 'error': f'Invalid sentence range: {sentence_start}-{sentence_end} (total: {len(all_sentences)})'}
+        # Determine the work list. Discrete-index mode (BookForge "Correct
+        # Sentences" regeneration) processes an explicit, possibly-scattered set
+        # of indices; otherwise we process the contiguous [start, end] range.
+        # Default book renders never pass sentence_indices, so their behavior is
+        # unchanged.
+        if sentence_indices is not None:
+            for idx in sentence_indices:
+                if idx < 0 or idx >= len(all_sentences):
+                    return {'success': False, 'error': f'Invalid sentence index {idx} (total: {len(all_sentences)})'}
+            work_indices = list(sentence_indices)
+        else:
+            if sentence_start < 0 or sentence_end >= len(all_sentences):
+                return {'success': False, 'error': f'Invalid sentence range: {sentence_start}-{sentence_end} (total: {len(all_sentences)})'}
+            work_indices = list(range(sentence_start, sentence_end + 1))
 
-        print(f"[WORKER] Processing sentences {sentence_start}-{sentence_end} on {session['device'].upper()}")
+        print(f"[WORKER] Processing {len(work_indices)} sentence(s) on {session['device'].upper()}")
         print(f"[WORKER] TTS engine: {session['tts_engine']}, fine_tuned: {session['fine_tuned']}")
 
         # DEBUG: Dump full session dict for memory debugging
@@ -354,12 +370,21 @@ def run_worker_tts(
         tts_manager = TTSManager(session)
         log_memory("After TTSManager init (model loaded)")
 
-        # Process sentences
-        total_to_process = sentence_end - sentence_start + 1
+        # Process sentences. For num_takes > 1 (BookForge "Correct Sentences"
+        # re-roll), generate each index num_takes times in ONE model load, writing
+        # each take into its own take{k}/ subdir of the target sentences_dir so the
+        # {i}.flac files don't overwrite each other. Sampling is stochastic (no seed),
+        # so every take is a genuinely different reading of the same sentence.
+        base_sentences_dir = session['sentences_dir']
+        # Write take{k}/ subdirs whenever there's >1 take OR explicit per-take temps
+        # (so a single-temp "long override" take still lands in take0/, matching how the
+        # BookForge bridge collects candidates).
+        multi_take = num_takes > 1 or bool(take_temperatures)
+        total_to_process = len(work_indices) * num_takes
         total_sentences = state['total_sentences']
         processed = 0
         skipped = 0
-        failed = []  # sentence indices whose conversion failed
+        failed = []  # sentence indices whose conversion failed (any take)
         start_time = time.time()
 
         def _write_empty_sentence_silence(output_file: str):
@@ -380,100 +405,122 @@ def run_worker_tts(
             silence = torch.zeros(1, int(samplerate * 0.1))
             torchaudio.save(output_file, silence, samplerate, format=default_audio_proc_format)
 
-        # Batched path: engines like Orpheus (vLLM) convert many sentences in one
-        # call — faster, and it avoids the host-RAM creep of tens of thousands of
-        # single-prompt calls. We still emit ONE "Converting sentence" line per
-        # sentence so BookForge's stdout progress counter stays accurate.
-        use_batch = tts_manager.supports_batch and tts_manager.batch_size > 1
-        if use_batch:
-            batch_size = tts_manager.batch_size
-            print(f"[WORKER] Batched inference enabled (batch size {batch_size})")
-            first_logged = False
-            pending = []  # (sentence_index, sentence)
+        for take in range(num_takes):
+            # Each take writes to its own dir when multi_take, so same-index files
+            # don't collide (and don't skip each other via the >1KB resume check).
+            pass_dir = os.path.join(base_sentences_dir, f'take{take}') if multi_take else base_sentences_dir
+            os.makedirs(pass_dir, exist_ok=True)
+            session['sentences_dir'] = pass_dir
+            sentences_dir_for_cleanup = pass_dir
 
-            def _flush_batch():
-                nonlocal processed, first_logged
-                if not pending:
-                    return
-                in_flight[:] = [idx for idx, _ in pending]
-                results = tts_manager.convert_sentences_batch(pending)
-                in_flight.clear()
-                for (idx, _), ok in zip(pending, results):
-                    if not ok:
-                        print(f"[WORKER] Warning: Failed to convert sentence {idx}")
-                        # Keep processing remaining batches, but record the failure —
-                        # the final result must report success=False so the caller
-                        # doesn't treat a run with holes as complete.
-                        failed.append(idx)
-                    processed += 1
+            # Per-take temperature (BookForge "Correct Sentences" entropy): give each take
+            # a different sampling temperature IN THE SAME model load, so re-rolls are
+            # genuinely varied rather than near-identical. make_sampler reads
+            # engine.TEMPERATURE fresh per batch, so setting it here takes effect for this
+            # take. Orpheus exposes TEMPERATURE; engines that don't just use their default.
+            if take_temperatures and take < len(take_temperatures):
+                _temp = float(take_temperatures[take])
+                if hasattr(tts_manager.engine, 'TEMPERATURE'):
+                    tts_manager.engine.TEMPERATURE = _temp
+                    print(f"[WORKER] Take {take}: sampling temperature = {_temp}")
+                else:
+                    print(f"[WORKER] Take {take}: engine has no TEMPERATURE knob; using default")
+
+            # Batched path: engines like Orpheus (vLLM) convert many sentences in one
+            # call — faster, and it avoids the host-RAM creep of tens of thousands of
+            # single-prompt calls. We still emit ONE "Converting sentence" line per
+            # sentence so BookForge's stdout progress counter stays accurate.
+            use_batch = tts_manager.supports_batch and tts_manager.batch_size > 1
+            if use_batch:
+                batch_size = tts_manager.batch_size
+                if take == 0:
+                    print(f"[WORKER] Batched inference enabled (batch size {batch_size})")
+                first_logged = False
+                pending = []  # (sentence_index, sentence)
+
+                def _flush_batch():
+                    nonlocal processed, first_logged
+                    if not pending:
+                        return
+                    in_flight[:] = [idx for idx, _ in pending]
+                    results = tts_manager.convert_sentences_batch(pending)
+                    in_flight.clear()
+                    for (idx, _), ok in zip(pending, results):
+                        if not ok:
+                            print(f"[WORKER] Warning: Failed to convert sentence {idx}")
+                            # Keep processing remaining batches, but record the failure —
+                            # the final result must report success=False so the caller
+                            # doesn't treat a run with holes as complete.
+                            failed.append(idx)
+                        processed += 1
+                        progress_pct = (processed / total_to_process) * 100
+                        print(f"Converting sentence {idx}/{total_sentences} ({progress_pct:.1f}%)")
+                        if not first_logged:
+                            log_memory("After first sentence TTS")
+                            first_logged = True
+                    pending.clear()
+
+                for i in work_indices:
+                    # Skip already-rendered (resume) and empty sentences — same as the
+                    # per-sentence path; empties never reach the batch.
+                    output_file = os.path.join(session['sentences_dir'], f'{i}.{default_audio_proc_format}')
+                    if os.path.exists(output_file) and os.path.getsize(output_file) > 1024:
+                        skipped += 1
+                        processed += 1
+                        continue
+                    sentence = sentence_overrides.get(i, all_sentences[i]) if sentence_overrides else all_sentences[i]
+                    if not sentence or not sentence.strip():
+                        # See _write_empty_sentence_silence: empties must still produce
+                        # a file at their index or the book is un-assemblable.
+                        _write_empty_sentence_silence(output_file)
+                        skipped += 1
+                        processed += 1
+                        continue
+                    pending.append((i, sentence))
+                    if len(pending) >= batch_size:
+                        _flush_batch()
+                _flush_batch()
+            else:
+                for i in work_indices:
+                    # Check if already exists (for resume)
+                    output_file = os.path.join(session['sentences_dir'], f'{i}.{default_audio_proc_format}')
+                    if os.path.exists(output_file) and os.path.getsize(output_file) > 1024:
+                        skipped += 1
+                        processed += 1
+                        continue
+
+                    sentence = sentence_overrides.get(i, all_sentences[i]) if sentence_overrides else all_sentences[i]
+                    if not sentence or not sentence.strip():
+                        # See _write_empty_sentence_silence: empties must still produce
+                        # a file at their index or the book is un-assemblable.
+                        _write_empty_sentence_silence(output_file)
+                        skipped += 1
+                        processed += 1
+                        continue
+
+                    # Show progress (global sentence position)
                     progress_pct = (processed / total_to_process) * 100
-                    print(f"Converting sentence {idx}/{total_sentences} ({progress_pct:.1f}%)")
-                    if not first_logged:
+                    print(f"Converting sentence {i}/{total_sentences} ({progress_pct:.1f}%)")
+
+                    # Convert sentence to audio
+                    in_flight[:] = [i]
+                    success = tts_manager.convert_sentence2audio(i, sentence)
+                    in_flight.clear()
+                    if not success:
+                        print(f"[WORKER] Warning: Failed to convert sentence {i}")
+                        # Keep processing the remaining sentences, but record the
+                        # failure — the final result must report success=False so the
+                        # caller doesn't treat a run with holes as complete.
+                        failed.append(i)
+
+                    processed += 1
+
+                    # Log memory after first sentence
+                    if processed == 1:
                         log_memory("After first sentence TTS")
-                        first_logged = True
-                pending.clear()
 
-            for i in range(sentence_start, sentence_end + 1):
-                # Skip already-rendered (resume) and empty sentences — same as the
-                # per-sentence path; empties never reach the batch.
-                output_file = os.path.join(session['sentences_dir'], f'{i}.{default_audio_proc_format}')
-                if os.path.exists(output_file) and os.path.getsize(output_file) > 1024:
-                    skipped += 1
-                    processed += 1
-                    continue
-                sentence = all_sentences[i]
-                if not sentence or not sentence.strip():
-                    # See _write_empty_sentence_silence: empties must still produce
-                    # a file at their index or the book is un-assemblable.
-                    _write_empty_sentence_silence(output_file)
-                    skipped += 1
-                    processed += 1
-                    continue
-                pending.append((i, sentence))
-                if len(pending) >= batch_size:
-                    _flush_batch()
-            _flush_batch()
-        else:
-            for i in range(sentence_start, sentence_end + 1):
-                # Check if already exists (for resume)
-                output_file = os.path.join(session['sentences_dir'], f'{i}.{default_audio_proc_format}')
-                if os.path.exists(output_file) and os.path.getsize(output_file) > 1024:
-                    skipped += 1
-                    processed += 1
-                    continue
-
-                sentence = all_sentences[i]
-                if not sentence or not sentence.strip():
-                    # See _write_empty_sentence_silence: empties must still produce
-                    # a file at their index or the book is un-assemblable.
-                    _write_empty_sentence_silence(output_file)
-                    skipped += 1
-                    processed += 1
-                    continue
-
-                # Show progress (global sentence position)
-                progress_pct = (processed / total_to_process) * 100
-                print(f"Converting sentence {i}/{total_sentences} ({progress_pct:.1f}%)")
-
-                # Convert sentence to audio
-                in_flight[:] = [i]
-                success = tts_manager.convert_sentence2audio(i, sentence)
-                in_flight.clear()
-                if not success:
-                    print(f"[WORKER] Warning: Failed to convert sentence {i}")
-                    # Keep processing the remaining sentences, but record the
-                    # failure — the final result must report success=False so the
-                    # caller doesn't treat a run with holes as complete.
-                    failed.append(i)
-
-                processed += 1
-
-                # Log memory after first sentence
-                if processed == 1:
-                    log_memory("After first sentence TTS")
-
-                # Periodic memory cleanup (every 10 sentences for MPS memory pressure)
-                memory_cleanup(processed, interval=10)
+                    # Periodic memory cleanup (every 10 sentences for MPS memory pressure)
+                    memory_cleanup(processed, interval=10)
 
         elapsed = time.time() - start_time
         actual_converted = processed - skipped
