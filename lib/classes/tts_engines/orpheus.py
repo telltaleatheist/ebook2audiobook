@@ -1068,40 +1068,40 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
         return sentence.strip()
 
     def _classify_gap(self, sentence: str):
-        """Decide the inter-clip silence for this sentence from the e2a SML tokens
-        it carries, matching the cross-engine standard in common/utils.py
-        (_convert_sml). Returns (lead_gap_sec, trail_gap_sec):
+        """Inter-clip silence for a chunk. Returns (lead_gap_sec, trail_gap_sec).
 
-          [pause] / [pause:X]  -> SECTION gap: explicit X, else 1.0-1.6s. Marks
-                                  blank-line / heading / <div> boundaries.
-          [break] / [silence]  -> PARAGRAPH gap: 0.5-0.7s. Marks <p>/<br> ends.
-          (no token)           -> SENTENCE gap: fixed 0.75s so Orpheus breathes
-                                  instead of rushing.
+        2026-07-17 — AUTO PARAGRAPH/SECTION GAPS REMOVED FOR ORPHEUS (deliberately).
+        Root cause of the long-standing "dialogue has huge pauses" complaint: e2a's
+        SHARED text prep (lib/core.py ~2098) rewrites EVERY blank line to a valueless
+        [pause] token, and prose puts EVERY dialogue turn in its own blank-line-
+        separated paragraph. The old three-tier logic here then stamped a
+        deterministic SECTION gap (1.0-1.6s lead) on top of each turn's sentence-gap
+        tail. Measured with auto-editor on the mistborn 0.6s-cap model: dialogue-turn
+        gaps were 2.0-2.5s (13 of them, one per paragraph break) vs the narrator's own
+        ~0.6-1.0s; a STRAIGHT-NARRATION render from the same model measured median
+        0.57s / max 1.17s with NO outliers — i.e. the Orpheus model, trained on clips
+        that keep their natural inter-sentence pauses (only the clip EDGES trimmed),
+        already reproduces the narrator's pausing itself. The e2a paragraph/section
+        insertion was therefore PURELY additive dead air, and it was e2a — not the
+        model — putting those pauses in.
 
-        INVARIANT: a chunk's tail is NEVER bare. Every chunk gets at least the
-        sentence gap on its trailing edge; a boundary token at the chunk START
-        adds its (longer) paragraph/section gap as a LEADING pad ON TOP. This
-        replaces the old one-gap-either-side design, where a chunk that STARTED
-        with [break]/[pause] got the whole gap prepended and its tail got nothing
-        but the 0.20s trim buffer — ~25% of chunks (the lead chunks) so joined the
-        NEXT chunk almost instantly, verified in the rendered flac. Now:
+        So for Orpheus we now keep ONLY:
+          - the sentence-gap FLOOR on every chunk's tail (each chunk is a separate
+            generation whose trailing silence is trimmed, so without a small floor the
+            chunks butt together), and
+          - an EXPLICIT [pause:X] (intentional, markup-specified beat) — still honored,
+            because that's a deliberate pause, not the auto blank-line noise.
+        The auto valueless [pause] (blank line) and [break]/[silence] (<p>/<br>) tiers
+        are GONE. The tokens themselves still drive chunk boundaries in the packer
+        (core.py) and are stripped by _clean_sentence_for_tts before TTS — only their
+        deterministic GAP is removed here.
 
-          lead_gap  = the classified paragraph/section gap IF a token opens the
-                      chunk, else 0.
-          trail_gap = the sentence gap, EXCEPT a token that sits at the chunk end
-                      raises the tail to max(token gap, sentence gap) — a [break]'s
-                      0.5-0.7 must never yield a SHORTER tail than plain prose's
-                      0.75. Checked on the RAW sentence, before
-                      _clean_sentence_for_tts strips the tokens.
+        If a real scene/section break ever under-pauses as a result, re-introduce a
+        section tier HERE (or emit an explicit [pause:X] at that break) — do NOT
+        restore the blanket blank-line gap that caused the dialogue problem. (The old
+        ORPHEUS_PARAGRAPH_GAP / ORPHEUS_SECTION_GAP env knobs are retired with it.)
 
-        Why three tiers and not the old binary [break]==[pause]: the standard
-        treats [break] as a SHORT gap and [pause] as the LONG one. Lumping them
-        meant every <p>/<br>/<span> [break] got a long gap — long pauses in odd
-        places. Now [break] is a modest paragraph gap and only [pause] (rare, real
-        section breaks) is long.
-
-        Env overrides (a fixed value, 0 disables): ORPHEUS_SENTENCE_GAP,
-        ORPHEUS_PARAGRAPH_GAP, ORPHEUS_SECTION_GAP.
+        Env override: ORPHEUS_SENTENCE_GAP (the floor; 0 disables).
         """
         raw = (sentence or '').strip()
         lowered = raw.lower()
@@ -1110,39 +1110,25 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
             v = os.environ.get(name)
             return float(v) if v is not None else None
 
-        # The sentence gap is the tail FLOOR: every chunk ends with at least this
-        # so a chunk-to-chunk join is never bare. Was a random 0.55-0.75; the short
-        # end left some transitions too tight while the long end sounded right, so
-        # it's a FIXED 0.75. Override with ORPHEUS_SENTENCE_GAP.
+        # Sentence-gap floor: the minimum tail every chunk gets so a chunk-to-chunk
+        # join is never bare. Override with ORPHEUS_SENTENCE_GAP.
         sentence_gap = _env('ORPHEUS_SENTENCE_GAP')
         if sentence_gap is None:
-            sentence_gap = 0.6   # tightened from 0.75 (2026-07-12, ear-approved on rohan)
+            sentence_gap = 0.6   # ear-approved on rohan (2026-07-12)
 
-        # Section pause ([pause] / [pause:X]) — the strong, long boundary.
-        m = re.search(r'\[pause(?::([0-9.]+))?\]', raw, flags=re.IGNORECASE)
+        # Honor ONLY an EXPLICIT [pause:X] — a deliberate, markup-specified beat.
+        # (Auto valueless [pause] from a blank line is intentionally NOT matched: that
+        # is the dialogue-pause noise removed 2026-07-17; see the docstring.)
+        m = re.search(r'\[pause:([0-9.]+)\]', raw, flags=re.IGNORECASE)
         if m:
-            override = _env('ORPHEUS_SECTION_GAP')
-            if override is not None:
-                token_gap = override
-            elif m.group(1):
-                token_gap = float(m.group(1))               # honor an explicit [pause:1.4]
-            else:
-                token_gap = int(np.random.uniform(1.0, 1.6) * 100) / 100
-            if lowered.startswith('[pause'):
-                return token_gap, sentence_gap               # long lead + normal sentence tail
-            return 0.0, max(token_gap, sentence_gap)          # token at end → tail at least the floor
-
-        # Paragraph break ([break] / [silence]) — modest gap.
-        m = re.search(r'\[(?:break|silence)(?::[^\]]+)?\]', raw, flags=re.IGNORECASE)
-        if m:
-            override = _env('ORPHEUS_PARAGRAPH_GAP')
-            token_gap = override if override is not None else int(np.random.uniform(0.5, 0.7) * 100) / 100
-            if re.match(r'\[(?:break|silence)', lowered):
-                return token_gap, sentence_gap
+            token_gap = float(m.group(1))
+            if lowered.startswith('[pause:'):
+                return token_gap, sentence_gap               # explicit beat as lead + normal tail
             return 0.0, max(token_gap, sentence_gap)
 
-        # Plain sentence end — the gap BETWEEN chunks (each packed chunk of 2-3
-        # sentences ends here). Pauses WITHIN a chunk are the model's own.
+        # Everything else — plain sentence end, auto [break]/[silence], auto valueless
+        # [pause] — collapses to the sentence-gap floor. Orpheus supplies the real
+        # inter-sentence pausing itself (learned from natural-pause training clips).
         return 0.0, sentence_gap
 
     def _write_silence(self, sentence_index: int) -> bool:
