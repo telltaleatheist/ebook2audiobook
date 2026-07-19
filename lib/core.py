@@ -7,7 +7,7 @@
 
 import argparse, asyncio, csv, difflib, fnmatch, hashlib, io, json, math, os, pytesseract, gc
 import random, shutil, subprocess, sys, tempfile, threading, time, uvicorn
-import traceback, socket, unicodedata, urllib.request, uuid, zipfile, fitz, multiprocessing
+import traceback, socket, unicodedata, urllib.request, urllib.parse, uuid, zipfile, fitz, multiprocessing
 import ebooklib, gradio as gr, psutil, regex as re, requests, stanza, importlib, queue
 
 from typing import Any, Generator, Dict
@@ -492,6 +492,57 @@ def ocr2xhtml(img: Image.Image, lang: str)->str:
         print(error)
         return False
 
+def chapter_provenance_path(process_dir:str)->str:
+    # Chapter provenance lives in the session's process_dir, NOT only in the
+    # session dict or session-state.json: the prepare, worker and assemble phases
+    # can be separate processes (and separate front-ends — bookforge_ext writes its
+    # own session-state.json), and all of them share process_dir.
+    return os.path.join(process_dir, 'chapter-provenance.json')
+
+def save_chapter_provenance(session_id:str)->bool:
+    session = context.get_session(session_id)
+    if not session or not session.get('process_dir'):
+        print('save_chapter_provenance(): no process_dir; chapter provenance NOT persisted')
+        return False
+    try:
+        path = chapter_provenance_path(session['process_dir'])
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump({
+                'chapter_docs': list(session.get('chapter_docs', [])),
+                'chapter_titles_by_doc': dict(session.get('chapter_titles_by_doc', {})),
+                'chapter_titles': list(session.get('chapter_titles', [])),
+            }, f, ensure_ascii=False, indent=2)
+        print(f"[TOC] Chapter provenance for {len(session.get('chapter_docs', []))} chapters saved to {path}")
+        return True
+    except Exception as e:
+        print(f'save_chapter_provenance() error: {e}')
+        return False
+
+def load_chapter_provenance(session_id:str)->bool:
+    # Restore chapter provenance written by get_chapters(). If it is absent or
+    # unreadable the session keys are left EMPTY on purpose — assembly then uses
+    # per-chapter first sentences and says so, instead of pairing TOC titles by
+    # position, which is what mislabels chapters.
+    session = context.get_session(session_id)
+    if not session or not session.get('process_dir'):
+        return False
+    path = chapter_provenance_path(session['process_dir'])
+    if not os.path.exists(path):
+        print(f'[TOC] No chapter provenance at {path}')
+        return False
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        session['chapter_docs'] = list(data.get('chapter_docs', []))
+        session['chapter_titles_by_doc'] = dict(data.get('chapter_titles_by_doc', {}))
+        if data.get('chapter_titles') and not session.get('chapter_titles'):
+            session['chapter_titles'] = list(data['chapter_titles'])
+        print(f"[TOC] Restored provenance for {len(session['chapter_docs'])} chapters from {path}")
+        return True
+    except Exception as e:
+        print(f'[TOC] Chapter provenance {path} unreadable ({e})')
+        return False
+
 def load_json_chapters(filepath:str)->list:
     # Raises on a missing or unreadable chapters cache instead of returning [].
     # This is only called on RESUME (checksum matched, so a prior run saved it).
@@ -726,6 +777,40 @@ def get_cover(epubBook:EpubBook, session_id:str)->bool|str:
         DependencyError(e)
         return False
 
+def normalize_doc_key(href:Any)->str|None:
+    # Canonical form used to compare a TOC entry href with a spine document name.
+    # Drops the fragment (#anchor), percent-decodes, folds separators and any
+    # './' noise, and lowercases. Returns None for an empty/absent href.
+    if not href:
+        return None
+    s = str(href).split('#')[0].strip()
+    if not s:
+        return None
+    s = urllib.parse.unquote(s).replace('\\', '/')
+    while s.startswith('./'):
+        s = s[2:]
+    s = s.lstrip('/')
+    return s.lower() or None
+
+def flatten_toc(nodes:Any)->list:
+    # epub TOCs nest: a node is either a Link-like object (has .title/.href) or a
+    # (Section, [children]) tuple/list. The old flat comprehension dropped BOTH
+    # the Section itself and every child under it. Depth-first, document order.
+    out = []
+    try:
+        for node in nodes:
+            if isinstance(node, (tuple, list)):
+                for part in node:
+                    if isinstance(part, (tuple, list)):
+                        out.extend(flatten_toc(part))
+                    elif hasattr(part, 'title'):
+                        out.append(part)
+            elif hasattr(node, 'title'):
+                out.append(node)
+    except Exception as e:
+        print(f'flatten_toc() error: {e}')
+    return out
+
 def get_chapters(session_id:str, epubBook:EpubBook)->list:
     try:
         msg = r'''
@@ -746,16 +831,24 @@ YOU CAN IMPROVE IT OR ASK TO A TRAINING MODEL EXPERT.
                 print(msg)
                 return []
             # Step 1: Extract TOC (Table of Contents)
+            # toc_list keeps the old flat title list (heading detection below reads it).
+            # toc_by_href is the identity-bearing form: normalized document href -> title.
             toc_list = []
+            toc_by_href = {}
             try:
-                toc = epubBook.toc
-                toc_list = [
-                        nt for item in toc if hasattr(item, 'title')
-                        if (nt := normalize_text(str(item.title), session['language'], session['language_iso1'], session['tts_engine'])) is not None
-                ]
+                for item in flatten_toc(epubBook.toc):
+                    nt = normalize_text(str(item.title), session['language'], session['language_iso1'], session['tts_engine'])
+                    if nt is None:
+                        continue
+                    toc_list.append(nt)
+                    href_key = normalize_doc_key(getattr(item, 'href', None))
+                    # Several TOC entries can point into the SAME document (anchors);
+                    # the first one in reading order names that document.
+                    if href_key and href_key not in toc_by_href:
+                        toc_by_href[href_key] = nt
                 # Store TOC titles in session for use during assembly
                 session['chapter_titles'] = toc_list
-                print(f'[TOC] Extracted {len(toc_list)} chapter titles from TOC')
+                print(f'[TOC] Extracted {len(toc_list)} chapter titles from TOC ({len(toc_by_href)} distinct documents)')
             except Exception as toc_error:
                 error = f'Error extracting Table of Content: {toc_error}'
                 show_alert({"type": "warning", "msg": error})
@@ -772,7 +865,34 @@ YOU CAN IMPROVE IT OR ASK TO A TRAINING MODEL EXPERT.
                 print(error)
                 return []
             title = get_ebook_title(epubBook, all_docs)
+            # Resolve TOC titles onto spine documents by IDENTITY (never position).
+            # Keyed by the exact doc.get_name() also recorded in session['chapter_docs'],
+            # so assembly does a plain dict lookup with no re-normalization.
+            titles_by_doc = {}
+            toc_by_basename = {}
+            for href_key in toc_by_href:
+                toc_by_basename.setdefault(href_key.rsplit('/', 1)[-1], []).append(href_key)
+            for doc in all_docs:
+                doc_key = normalize_doc_key(doc.get_name())
+                if not doc_key:
+                    continue
+                if doc_key in toc_by_href:
+                    titles_by_doc[doc.get_name()] = toc_by_href[doc_key]
+                else:
+                    # Some epubs write TOC hrefs relative to the nav document while
+                    # document names carry an OPF-root prefix (e.g. 'OEBPS/'). Match
+                    # on basename ONLY when it is unambiguous — still identity, not position.
+                    candidates = toc_by_basename.get(doc_key.rsplit('/', 1)[-1], [])
+                    if len(candidates) == 1:
+                        titles_by_doc[doc.get_name()] = toc_by_href[candidates[0]]
+                        print(f"[TOC] Matched document '{doc.get_name()}' to TOC href '{candidates[0]}' by basename")
+            session['chapter_titles_by_doc'] = titles_by_doc
+            unmatched_docs = [d.get_name() for d in all_docs if d.get_name() not in titles_by_doc]
+            print(f'[TOC] Mapped {len(titles_by_doc)}/{len(all_docs)} spine documents to a TOC title')
+            if unmatched_docs:
+                print(f'[TOC] No TOC entry for: {unmatched_docs} (these use their own first sentence as title)')
             chapters = []
+            chapter_docs = []
             stanza_nlp = False
             if session['language'] in year_to_decades_languages:
                 try:
@@ -813,7 +933,13 @@ YOU CAN IMPROVE IT OR ASK TO A TRAINING MODEL EXPERT.
                     print(error)
                     return []
                 elif len(sentences_list) > 0:
+                    # chapters and chapter_docs MUST stay index-aligned: append together.
+                    # A document yielding no sentences produces no chapter and therefore
+                    # consumes no title.
                     chapters.append(sentences_list)
+                    chapter_docs.append(doc.get_name())
+            session['chapter_docs'] = chapter_docs
+            save_chapter_provenance(session_id)
             if len(chapters) == 0:
                 error = 'No chapters found! possible reason: file corrupted or need to convert images to text with OCR'
                 print(error)
@@ -2608,21 +2734,60 @@ def combine_audio_chapters(session_id:str)->list[str]|None:
                 chapter_files = [f for f in chapter_files if int(re.search(r'\d+', f).group()) in selected_chapters]
                 print(f'[ASSEMBLE] Filtered to {len(chapter_files)} selected chapters')
 
-            # Use TOC titles if available, otherwise fall back to first sentence of each chapter
-            toc_titles = session.get('chapter_titles', [])
+            # Chapter marker titles are bound to chapters by DOCUMENT IDENTITY.
+            # NEVER by position: the TOC and the chapter list describe different sets
+            # (a part-title page has a TOC entry but yields no audio; leading front
+            # matter yields audio but has no TOC entry) and the counts can coincidentally
+            # match while the sets differ, so a length check cannot detect the skew.
             chapters_data = session.get('chapters', [])
-            if toc_titles and len(toc_titles) >= len(chapters_data):
-                chapter_titles = toc_titles[:len(chapters_data)]
-                print(f'[ASSEMBLE] Using {len(chapter_titles)} TOC titles for chapters')
+            # Assembly can run in a different process than prepare (and under a
+            # front-end that persists its own session-state.json), so recover the
+            # provenance from process_dir when this session dict does not carry it.
+            if len(session.get('chapter_docs', [])) != len(chapters_data):
+                load_chapter_provenance(session_id)
+            chapter_docs = session.get('chapter_docs', [])
+            titles_by_doc = session.get('chapter_titles_by_doc', {})
+            # A chapter's own first sentence is correct BY CONSTRUCTION — e2a voices the
+            # heading as that chapter's first sentence, so it always describes that audio.
+            own_titles = [c[0] if c else f'Chapter {i+1}' for i, c in enumerate(chapters_data)]
+            if len(chapter_docs) != len(chapters_data):
+                print(
+                    f'[ASSEMBLE] Chapter provenance unusable: {len(chapter_docs)} chapter_docs entries for '
+                    f'{len(chapters_data)} chapters. This session was prepared before document-identity chapter '
+                    f'titles existed (or its provenance was not persisted). Using each chapter\'s OWN first '
+                    f'sentence as its marker title. TOC titles are deliberately NOT paired by position — that '
+                    f'pairing is what mislabelled chapters.'
+                )
+                chapter_titles = own_titles
             else:
-                # Fall back to first sentence (old behavior)
-                chapter_titles = [c[0] if c else f'Chapter {i+1}' for i, c in enumerate(chapters_data)]
-                print(f'[ASSEMBLE] TOC titles not available ({len(toc_titles)} titles for {len(chapters_data)} chapters), using first sentence')
+                chapter_titles = []
+                from_toc = 0
+                for i, doc_name in enumerate(chapter_docs):
+                    toc_title = titles_by_doc.get(doc_name)
+                    if toc_title:
+                        chapter_titles.append(toc_title)
+                        from_toc += 1
+                    else:
+                        chapter_titles.append(own_titles[i])
+                print(
+                    f'[ASSEMBLE] {from_toc}/{len(chapters_data)} chapter titles resolved from the TOC by document '
+                    f'identity; {len(chapters_data) - from_toc} from the chapter\'s own first sentence'
+                )
 
             # Filter chapter_titles to match selected chapters
             if selected_chapters:
-                # chapter_files are already filtered, map file numbers to titles
-                chapter_titles = [chapter_titles[ch-1] for ch in selected_chapters if ch-1 < len(chapter_titles)]
+                # chapter_files are already filtered; selected_chapters are 1-indexed
+                # chapter numbers. Every one MUST resolve, else the surviving titles
+                # would slide onto the wrong files.
+                out_of_range = [ch for ch in selected_chapters if not (1 <= ch <= len(chapter_titles))]
+                if out_of_range:
+                    error = (
+                        f'combine_audio_chapters(): selected chapter(s) {out_of_range} have no title entry '
+                        f'({len(chapter_titles)} chapters known). Refusing to assemble with misaligned markers.'
+                    )
+                    print(error)
+                    return None
+                chapter_titles = [chapter_titles[ch-1] for ch in selected_chapters]
             # INVARIANT: the files about to be concatenated must cover EXACTLY the
             # chapter set this function believes it is assembling. The glob above
             # collects whatever files happen to exist, so a missing (or 0-byte)
@@ -3106,6 +3271,7 @@ def convert_ebook(args:dict)->tuple:
                                     else:
                                         try:
                                             session['chapters'] = load_json_chapters(saved_json_chapters)
+                                            load_chapter_provenance(session_id)
                                         except Exception as e:
                                             error = str(e)
                                     if error is None:
@@ -3471,7 +3637,12 @@ def save_session_state(session_id: str, args: dict, prep_result: dict) -> bool:
             'filename_noext': session.get('filename_noext'),
             'cover': session.get('cover'),
             'final_name': session.get('final_name'),
-            'chapter_titles': session.get('chapter_titles', []),  # TOC titles for chapter markers
+            'chapter_titles': session.get('chapter_titles', []),  # TOC titles (flat, legacy consumers)
+            # Chapter provenance: chapter_docs[i] names the spine document that produced
+            # chapters[i]; chapter_titles_by_doc maps that document name to its TOC title.
+            # Assembly pairs titles to chapters through these two, never by position.
+            'chapter_docs': list(session.get('chapter_docs', [])),
+            'chapter_titles_by_doc': dict(session.get('chapter_titles_by_doc', {})),
         }
 
         state_path = os.path.join(session['process_dir'], 'session-state.json')
@@ -3967,6 +4138,17 @@ def assemble_audiobook(args: dict) -> dict:
             session['chapter_titles'] = state.get('chapter_titles', [])
             if session['chapter_titles']:
                 print(f"[ASSEMBLE] Loaded {len(session['chapter_titles'])} chapter titles from TOC")
+            # Chapter provenance — required to bind titles to chapters by identity.
+            session['chapter_docs'] = list(state.get('chapter_docs', []))
+            session['chapter_titles_by_doc'] = dict(state.get('chapter_titles_by_doc', {}))
+            if len(session['chapter_docs']) == len(session['chapters']):
+                print(f"[ASSEMBLE] Loaded chapter provenance for {len(session['chapter_docs'])} chapters")
+            else:
+                print(
+                    f"[ASSEMBLE] session-state.json has no usable chapter provenance "
+                    f"({len(session['chapter_docs'])} chapter_docs for {len(session['chapters'])} chapters); "
+                    f"chapter markers will use each chapter's own first sentence"
+                )
         else:
             return {'success': False, 'error': 'No chapter_sentences in session state'}
 

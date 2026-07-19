@@ -92,6 +92,17 @@ def save_session_state(session_id: str, args: dict, prep_result: dict, core_modu
             'cover': session.get('cover'),
             'final_name': session.get('final_name'),
             'chapter_titles': session.get('chapter_titles', []),
+            # Chapter provenance: chapter_docs[i] names the spine document that
+            # produced chapters[i], and chapter_titles_by_doc maps that document to
+            # its TOC title. combine_audio_chapters() binds marker titles through
+            # these two — NEVER by position, which mislabelled chapters whenever the
+            # TOC and the chapter list described different sets (a part-title page
+            # with no audio, or leading front matter with no TOC entry). core's
+            # get_chapters() also writes chapter-provenance.json into process_dir;
+            # persisting here too means the binding survives even if that file is
+            # missing (both ride along with the WSL->Windows `cp -r` of the session).
+            'chapter_docs': list(session.get('chapter_docs', [])),
+            'chapter_titles_by_doc': dict(session.get('chapter_titles_by_doc', {})),
             # BookForge metadata (title, author, year from BFP project)
             'bookforge_metadata': args.get('bookforge_metadata', {}),
         }
@@ -978,6 +989,15 @@ def assemble_audiobook(args: dict, core_module) -> dict:
             session['chapter_titles'] = state.get('chapter_titles', [])
             if session['chapter_titles']:
                 print(f"[ASSEMBLE] Loaded {len(session['chapter_titles'])} chapter titles from TOC")
+            # Chapter provenance — combine_audio_chapters() binds marker titles to
+            # chapters through these (document identity), never by position. Absent
+            # here (e.g. a session prepared before this existed), it re-reads
+            # chapter-provenance.json from process_dir, and failing that falls back
+            # to each chapter's own first sentence rather than a positional pairing.
+            session['chapter_docs'] = list(state.get('chapter_docs', []))
+            session['chapter_titles_by_doc'] = dict(state.get('chapter_titles_by_doc', {}))
+            if session['chapter_docs']:
+                print(f"[ASSEMBLE] Loaded chapter provenance for {len(session['chapter_docs'])} chapters")
         else:
             return {'success': False, 'error': 'No chapter_sentences in session state'}
 
