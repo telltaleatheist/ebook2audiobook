@@ -9,6 +9,7 @@ import platform
 import sys
 import os
 import re
+import math
 import atexit
 import weakref
 
@@ -153,6 +154,15 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
     # re-rendered split at sentence boundaries (see _generate_audio_vllm_safe) so the
     # audio is never clipped. Override with ORPHEUS_MAX_TOKENS.
     MAX_AUDIO_TOKENS = int(os.environ.get('ORPHEUS_MAX_TOKENS', '3700'))
+
+    # Audio-token <-> wall-clock relationship. Orpheus emits 7 audio tokens per
+    # SNAC frame (_redistribute_codes); the SNAC-24kHz coarse-frame rate is ~12 Hz,
+    # so ~84 audio tokens == 1 second of audio. Cross-checks with this file's own
+    # anchor: a 2048-token clip of a ~450-char chunk measured ~18.4 ch/s
+    # (_generate_mlx docstring), i.e. 450/18.4 = 24.5 s -> 2048/24.5 = 83.6 tok/s.
+    # Rounded UP to 84 because it only sizes a per-chunk max_tokens CEILING
+    # (_mlx_token_budget), where a larger value is the safe direction.
+    TOKENS_PER_AUDIO_SECOND = 84
 
     # Sampling params at the Orpheus reference values. The spurious leading-syllable
     # artifact once chased here (cooling temperature to 0.5 only flattened prosody and
@@ -642,7 +652,26 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
             traceback.print_exc()
             raise ValueError(error)
 
-    def _generate_mlx(self, text: str, max_tokens: int = None) -> np.ndarray:
+    def _mlx_token_budget(self, text: str) -> int:
+        """Per-chunk MLX max_tokens CEILING sized from the text length, so a short
+        repetition-primed chunk can't burn the flat MLX_MAX_TOKENS looping one
+        sentence (the MLX runaway: minutes of the same line, because mlx-lm's
+        ~20-token repetition penalty can't see a loop that is hundreds of audio
+        tokens long).
+
+        The divisor is the SLOWEST plausible reading rate, so the ceiling never
+        clips HEALTHY audio (prose runs as slow as ~11 ch/s): the vLLM duration
+        guard's per-voice rate (ORPHEUS_MAX_CHARS_PER_SEC — same source) when it is
+        slower than the 12 ch/s slow-narrator floor, else the 12 floor. A smaller
+        divisor = a MORE generous ceiling (safe); a larger one risks truncating
+        slow narration, so we only ever go slower than 12, never faster. The 1.4
+        factor is head-room over that worst case — only a runaway (many times the
+        text's real token count) exceeds it."""
+        env_rate = float(os.environ.get('ORPHEUS_MAX_CHARS_PER_SEC', '19.0'))
+        chars_per_sec_floor = min(env_rate, 12.0) if env_rate > 0 else 12.0
+        return math.ceil(len(text) / chars_per_sec_floor * self.TOKENS_PER_AUDIO_SECOND * 1.4)
+
+    def _generate_mlx(self, text: str, max_tokens: int = None, sentence_index: int = None) -> np.ndarray:
         """Generate audio using MLX backend.
 
         max_tokens defaults to MLX_MAX_TOKENS. The old bare default was a stale
@@ -657,6 +686,11 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
         """
         if max_tokens is None:
             max_tokens = self.MLX_MAX_TOKENS
+        # Per-chunk anti-runaway ceiling — only ever LOWERS the cap (min), never
+        # raises it (see _mlx_token_budget). A short chunk that tries to loop is
+        # cut at its text-proportional budget instead of the flat MLX_MAX_TOKENS.
+        budget = self._mlx_token_budget(text)
+        effective_max = min(max_tokens, budget)
         # Match vLLM/transformers sampling params - repetition_penalty prevents
         # repeated audio patterns that can sound like echo/reverb
         print(f"[ORPHEUS] Generating with voice='{self.voice}' for: {text[:50]}...")
@@ -670,7 +704,7 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
             temperature=self.TEMPERATURE,
             top_p=self.TOP_P,
             repetition_penalty=self.REP_PENALTY,
-            max_tokens=max_tokens
+            max_tokens=effective_max
         ):
             audio_data = result.audio
             if audio_data is None:
@@ -680,6 +714,17 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
                 audio_data = np.array(audio_data, dtype=np.float32)
             if len(audio_data) > 0:
                 segments.append(audio_data)
+
+        # Visibility: log only when the budget was the binding cap AND generation
+        # ran right up to it — an actual runaway-shaped truncation, not a chunk
+        # that finished early. tokens-emitted is ESTIMATED from audio duration
+        # (mlx_audio's generate() doesn't surface a token count).
+        if effective_max < max_tokens and segments:
+            est_tokens = sum(len(s) for s in segments) / self.SAMPLE_RATE * self.TOKENS_PER_AUDIO_SECOND
+            if est_tokens >= effective_max * 0.95:
+                idx_str = '' if sentence_index is None else f'sentence {sentence_index}: '
+                print(f"[ORPHEUS] {idx_str}MLX per-chunk token budget truncated generation "
+                      f"(len={len(text)}, budget={effective_max}, ~{int(est_tokens)} tokens emitted)")
 
         if not segments:
             return np.zeros(0, dtype=np.float32)
@@ -1287,7 +1332,7 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
 
             try:
                 if self.backend == 'mlx':
-                    audio_np = self._generate_mlx(clean)
+                    audio_np = self._generate_mlx(clean, sentence_index=sentence_index)
                     audio_np = self._guard_truncation(sentence_index, clean, audio_np, self._generate_mlx_safe)
                 elif self.backend == 'vllm':
                     try:

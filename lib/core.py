@@ -5,7 +5,7 @@
 # IS USED TO PRINT IT OUT TO THE TERMINAL, AND "CHAPTER" TO THE CODE
 # WHICH IS LESS GENERIC FOR THE DEVELOPERS
 
-import argparse, asyncio, csv, fnmatch, hashlib, io, json, math, os, pytesseract, gc
+import argparse, asyncio, csv, difflib, fnmatch, hashlib, io, json, math, os, pytesseract, gc
 import random, shutil, subprocess, sys, tempfile, threading, time, uvicorn
 import traceback, socket, unicodedata, urllib.request, uuid, zipfile, fitz, multiprocessing
 import ebooklib, gradio as gr, psutil, regex as re, requests, stanza, importlib, queue
@@ -1215,6 +1215,84 @@ def filter_chapter(idx:int, doc:EpubHtml, session_id:str, stanza_nlp:Pipeline, i
         DependencyError(error)
         return None
 
+def _normalize_for_dup(s: str) -> str:
+    """Lowercase, strip punctuation, collapse whitespace — the cheap normal form
+    for near-duplicate sentence detection in the Orpheus packer (see
+    _is_near_duplicate). Uses the module's `regex as re`."""
+    s = re.sub(r'[^\w\s]', ' ', s.lower())
+    return re.sub(r'\s+', ' ', s).strip()
+
+
+def _is_near_duplicate(a: str, b: str, threshold: float = 0.8) -> bool:
+    """True when a and b are near-identical prose — the pattern that primes
+    Orpheus into a repetition loop (real case: "Kershaw didn't use it in his
+    book." / "Trevor-Roper didn't use it in his book."). One spoken sentence is
+    hundreds of audio tokens, so such a loop sits entirely OUTSIDE MLX's ~20-token
+    repetition-penalty window; keeping the priming pair out of one generation is
+    the cheap structural fix.
+
+    Only meaningful for real sentences: both sides must be >= 4 words (short
+    dialogue like "Yes."/"No." repeats naturally and is NOT a loop primer) and
+    within a [0.6, 1.67] length ratio before the pricier SequenceMatcher ratio is
+    even computed. stdlib difflib only."""
+    wa, wb = _normalize_for_dup(a).split(), _normalize_for_dup(b).split()
+    if len(wa) < 4 or len(wb) < 4:
+        return False
+    la, lb = len(wa), len(wb)
+    if min(la, lb) / max(la, lb) < 0.6:   # length ratio outside [0.6, 1.67]
+        return False
+    # Ratio over the WORD sequences, not the raw char stream: the repetition
+    # primer differs only by a subject ("Kershaw" vs "Trevor-Roper"), and a
+    # different-length name prefix drags a char-level ratio under 0.8 even though
+    # the sentences are clearly the same template. Word-level ratio scores that
+    # real case at ~0.82 while unrelated similar-length prose stays far below.
+    return difflib.SequenceMatcher(None, wa, wb).ratio() >= threshold
+
+
+def _split_into_sentences_for_dup(text: str) -> list:
+    """Split a packed prose chunk back into its component sentences for the
+    near-duplicate scan. Mirrors the boundary the Orpheus packer's _split_to_cap
+    uses (terminal .!?… plus trailing quotes/brackets)."""
+    parts, last = [], 0
+    for m in re.finditer(r'[.!?…]["\'”’)\]]*\s+', text):
+        parts.append(text[last:m.end()].strip())
+        last = m.end()
+    if last < len(text):
+        parts.append(text[last:].strip())
+    return [p for p in parts if p]
+
+
+def _split_near_dup_chunk(chunk: str) -> list:
+    """Split one packed Orpheus chunk so no single generation contains a
+    near-duplicate sentence pair (the repetition-loop primer; see
+    _is_near_duplicate). Walk the chunk's sentences, starting a NEW sub-chunk
+    whenever the next sentence near-duplicates one already in the current
+    sub-chunk. Returns [chunk] UNCHANGED (exact original text) when nothing
+    splits, so non-repetitive prose keeps its packing boundaries byte-for-byte."""
+    sents = _split_into_sentences_for_dup(chunk)
+    if len(sents) < 2:
+        return [chunk]
+    groups = [[sents[0]]]
+    for s in sents[1:]:
+        if any(_is_near_duplicate(m, s) for m in groups[-1]):
+            groups.append([s])
+        else:
+            groups[-1].append(s)
+    if len(groups) < 2:
+        return [chunk]
+    return [' '.join(g) for g in groups]
+
+
+def _apply_near_dup_split(chunks: list) -> list:
+    """Run _split_near_dup_chunk over a packed Orpheus chunk list (a no-op for
+    non-repetitive prose). Splitting only ever shortens a chunk, so no result can
+    exceed the char/sentence budget the packer already enforced."""
+    out = []
+    for c in chunks:
+        out.extend(_split_near_dup_chunk(c))
+    return out
+
+
 def get_sentences(text:str, session_id:str)->list|None:
 
     def split_inclusive(text:str, pattern:re.Pattern[str])->list[str]:
@@ -1573,7 +1651,10 @@ def get_sentences(text:str, session_id:str)->list|None:
                     else:
                         packed.append(s)
                 if max_sents is None:
-                    return packed
+                    # PASS 6 — repetition-primed split (anti-runaway). See
+                    # _apply_near_dup_split: keeps a near-duplicate sentence pair
+                    # out of one generation. No-op for non-repetitive prose.
+                    return _apply_near_dup_split(packed)
                 def _split_to_cap(t):
                     parts, last = [], 0
                     for m in re.finditer(r'[.!?…]["\'”’)\]]*\s+', t):
@@ -1596,7 +1677,8 @@ def get_sentences(text:str, session_id:str)->list|None:
                         capped.extend(_split_to_cap(item))
                     else:
                         capped.append(item)
-                return capped
+                # PASS 6 — repetition-primed split (anti-runaway); see above.
+                return _apply_near_dup_split(capped)
             return final_list
     except Exception as e:
         print(f'get_sentences() error: {e}')
