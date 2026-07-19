@@ -2535,6 +2535,13 @@ def combine_audio_sentences(session_id:str, file:str, start:int, end:int)->bool:
         DependencyError(e)
     return False
 
+# Opt-in final-pass denoise (FINAL_DENOISE=1), applied in export_audio()'s final
+# encode. Tuned for the faint ~-65 dBFS room-hiss bed that hiss-bed-trained voice
+# models (e.g. Orpheus) reproduce; tn=1 tracks the actual noise so it also smooths
+# the hiss/dead-silence alternation across sentence gaps. Values may be adjusted
+# after listening tests.
+final_denoise_filter = 'afftdn=nr=12:nf=-50:tn=1'
+
 def combine_audio_chapters(session_id:str)->list[str]|None:
 
     def generate_ffmpeg_metadata(part_chapters:list[tuple[str,str]], output_metadata_path:str, default_audio_proc_format:str)->str|bool:
@@ -2609,6 +2616,10 @@ def combine_audio_chapters(session_id:str)->list[str]|None:
                 print(msg)
                 return False
             cover_path = None
+            final_denoise = os.environ.get('FINAL_DENOISE', '0') == '1'
+            if final_denoise:
+                msg = f'[assembly] FINAL_DENOISE active: {final_denoise_filter}'
+                print(msg)
             ffprobe_cmd = [
                 shutil.which('ffprobe'), '-v', 'error', '-threads', '0', '-select_streams', 'a:0',
                 '-show_entries', 'stream=codec_name,sample_rate,sample_fmt',
@@ -2655,7 +2666,8 @@ def combine_audio_chapters(session_id:str)->list[str]|None:
                 cmd += ['-ac', '2']
             else:
                 cmd += ['-ac', '1']
-            if input_codec == target_codec and input_rate == target_rate:
+            # FINAL_DENOISE needs a filter pass, so it must skip the stream-copy shortcut
+            if input_codec == target_codec and input_rate == target_rate and not final_denoise:
                 cmd = [
                     shutil.which('ffmpeg'), '-hide_banner', '-nostats', '-hwaccel', 'auto', '-thread_queue_size', '1024', '-i', ffmpeg_combined_audio,
                     '-threads', '0', '-f', 'ffmetadata', '-i', ffmpeg_metadata_file,
@@ -2669,16 +2681,23 @@ def combine_audio_chapters(session_id:str)->list[str]|None:
                 audio_duration = get_audio_duration(ffmpeg_combined_audio)
                 if audio_duration and audio_duration > 7200:  # 2 hours in seconds
                     print(f'Skipping loudnorm filter for long audiobook ({audio_duration/3600:.1f} hours) to avoid memory issues')
+                    if final_denoise:
+                        # afftdn streams (unlike loudnorm linear=true) so it is safe on long audiobooks
+                        cmd += ['-af', final_denoise_filter]
                     cmd += [
                         '-threads', '0',
                         '-progress', 'pipe:2',
                         '-y', ffmpeg_final_file
                     ]
                 else:
+                    audio_filters = 'loudnorm=I=-16:LRA=11:TP=-1.5:linear=true,afftdn=nf=-70'
+                    if final_denoise:
+                        # Denoise the raw hiss bed BEFORE loudnorm measures and boosts it
+                        audio_filters = f'{final_denoise_filter},{audio_filters}'
                     cmd += [
                         '-filter_threads', '0',
                         '-filter_complex_threads', '0',
-                        '-af', 'loudnorm=I=-16:LRA=11:TP=-1.5:linear=true,afftdn=nf=-70',
+                        '-af', audio_filters,
                         '-threads', '0',
                         '-progress', 'pipe:2',
                         '-y', ffmpeg_final_file
