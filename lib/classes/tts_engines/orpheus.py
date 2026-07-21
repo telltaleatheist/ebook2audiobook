@@ -198,6 +198,19 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
     # retrain still shows a junk tail.
     MIN_P = float(os.environ.get('ORPHEUS_MIN_P', '0.0'))
 
+    # EOS logit boost (2026-07-21, ghost-whisper campaign): voices trained on
+    # bed-free corpora carry a thinner GREEDY end-of-speech margin (mb_2hd:
+    # 15/20 greedy stops vs bed model's 20/20) — runaways are EOS losing
+    # razor-thin ties to "one more audio frame". This adds a small bias to the
+    # EOS logit, but ONLY once generation is past EOS_BOOST_START x the
+    # chunk's expected token count (derived from text length), so it cannot
+    # truncate speech that hasn't been spoken yet. Past that point the bias
+    # ramps with the overrun. Default 0 = OFF; enable per-voice via
+    # models.json backends.vllm.eosBoost -> ORPHEUS_EOS_BOOST. vLLM paths
+    # only. Gate any tuning with eos_gate.py + an endings ear-check.
+    EOS_BOOST = float(os.environ.get('ORPHEUS_EOS_BOOST', '0.0'))
+    EOS_BOOST_START = float(os.environ.get('ORPHEUS_EOS_BOOST_START', '1.2'))
+
     # Special token IDs
     END_OF_AUDIO_TOKEN = 128258
 
@@ -877,6 +890,41 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
         body = self.tokenizer(f"{self.voice}: {text}").input_ids   # includes leading BOS
         return [128259] + list(body) + [128009, 128260, 128261, 128257]
 
+    def _eos_boost_processor(self, n_chars: int):
+        """Per-request vLLM logits processor implementing the EOS boost (see the
+        EOS_BOOST comment at the top of the class). Returns None when disabled.
+        Expected token count uses the file's own anchors: ~18.4 chars/sec of
+        speech and TOKENS_PER_AUDIO_SECOND audio tokens/sec."""
+        if self.EOS_BOOST <= 0:
+            return None
+        expected = max(300.0, n_chars / 18.4 * self.TOKENS_PER_AUDIO_SECOND)
+        start = self.EOS_BOOST_START * expected
+        eos = self.END_OF_AUDIO_TOKEN
+        base = self.EOS_BOOST
+
+        def _boost(token_ids, logits):
+            n = len(token_ids)
+            if n > start:
+                # ramp with overrun, capped at 4x the base bias
+                logits[eos] += base * min(4.0, 1.0 + (n - start) / expected)
+            return logits
+        return _boost
+
+    def _vllm_sampling_params(self, n_chars: int, max_tokens: int = None):
+        """The ONE place vLLM SamplingParams are built, so every path carries
+        identical sampling config + the (optional) per-request EOS boost."""
+        from vllm import SamplingParams
+        proc = self._eos_boost_processor(n_chars)
+        return SamplingParams(
+            temperature=self.TEMPERATURE,
+            top_p=self.TOP_P,
+            min_p=self.MIN_P,
+            repetition_penalty=self.REP_PENALTY,
+            max_tokens=max_tokens if max_tokens is not None else self.MAX_AUDIO_TOKENS,
+            stop_token_ids=[self.END_OF_AUDIO_TOKEN],
+            logits_processors=[proc] if proc else None,
+        )
+
     def _generate_tokens_vllm(self, prompt: str, max_tokens: int = None) -> list:
         """Generate audio tokens using vLLM backend."""
         from vllm import SamplingParams, TokensPrompt
@@ -886,14 +934,7 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
         # Feed token IDs directly (no decode->re-tokenize round-trip; see _format_prompt_ids)
         prompt_ids = self._format_prompt_ids(prompt)
 
-        sampling_params = SamplingParams(
-            temperature=self.TEMPERATURE,
-            top_p=self.TOP_P,
-            min_p=self.MIN_P,
-            repetition_penalty=self.REP_PENALTY,
-            max_tokens=max_tokens,
-            stop_token_ids=[self.END_OF_AUDIO_TOKEN]
-        )
+        sampling_params = self._vllm_sampling_params(len(prompt), max_tokens)
 
         outputs = self.engine.generate([TokensPrompt(prompt_token_ids=prompt_ids)], sampling_params)
         tokens = list(outputs[0].outputs[0].token_ids)
@@ -927,11 +968,7 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
             parts = self._split_long_text(clean, max_length=max(60, len(clean) // 2))
             if len(parts) >= 2:
                 return np.concatenate([self._generate_audio_vllm_safe(p, depth + 1) for p in parts])
-        sampling_params = SamplingParams(
-            temperature=self.TEMPERATURE, top_p=self.TOP_P, min_p=self.MIN_P,
-            repetition_penalty=self.REP_PENALTY,
-            max_tokens=self.MAX_AUDIO_TOKENS, stop_token_ids=[self.END_OF_AUDIO_TOKEN]
-        )
+        sampling_params = self._vllm_sampling_params(len(clean))
         prompt = TokensPrompt(prompt_token_ids=self._format_prompt_ids(clean))
         try:
             outputs = self.engine.generate([prompt], sampling_params, use_tqdm=False)
@@ -1403,11 +1440,9 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
                     gen.append((idx, clean, self._format_prompt_ids(clean), gap))
 
             if gen:
-                sampling_params = SamplingParams(
-                    temperature=self.TEMPERATURE, top_p=self.TOP_P, min_p=self.MIN_P,
-                    repetition_penalty=self.REP_PENALTY,
-                    max_tokens=self.MAX_AUDIO_TOKENS, stop_token_ids=[self.END_OF_AUDIO_TOKEN]
-                )
+                # Per-item SamplingParams: the EOS-boost threshold depends on each
+                # sentence's expected length. vLLM accepts a list aligned to prompts.
+                sampling_params = [self._vllm_sampling_params(len(clean)) for _, clean, _, _ in gen]
                 prompts = [TokensPrompt(prompt_token_ids=fp) for _, _, fp, _ in gen]
                 # use_tqdm=False: a per-call progress bar adds overhead and noise.
                 try:
