@@ -2312,10 +2312,19 @@ def normalize_text(text:str, lang:str, lang_iso1:str, tts_engine:str)->str:
     # remove unwanted chars
     chars_remove_table = str.maketrans({ch: ' ' for ch in chars_remove})
     text = text.translate(chars_remove_table)
-    # replace double quotes by a comma if no punctuation precedes it
-    text = re.sub(r'\s*"\s*', '"', text)
-    text = re.sub(r'(?<=[\p{L}\p{N}])"(?=[\p{L}\p{N}]|$)', ', ', text)
-    text = re.sub(r'"', '', text)
+    # Quote handling. Orpheus is an LLM-based TTS trained on ordinary prose, where
+    # quotation marks are the cue that a span is spoken dialogue — stripping them
+    # leaves the model guessing which lines are in a character's mouth. The removal
+    # below exists for the older acoustic engines (XTTS/VITS/Bark), which hallucinate
+    # on quotes; Orpheus keeps them (already folded to straight quotes above).
+    if tts_engine != TTS_ENGINES['ORPHEUS']:
+        # A quote that FOLLOWS a letter/digit becomes a comma — it is doing the work
+        # a comma would ("she whispered never again before" needs the pause). Any
+        # other quote is dropped, but its surrounding whitespace MUST survive: the
+        # old code collapsed spaces around every quote FIRST, so dropping one fused
+        # the words across it ('"Get out!" he shouted' -> 'Get out!he shouted').
+        text = re.sub(r'(?<=[\p{L}\p{N}])\s*"\s*(?=[\p{L}\p{N}])', ', ', text)
+        text = re.sub(r'\s*"\s*', ' ', text)
     # Replace multiple and spaces with single space
     text = re.sub(r'\s+', ' ', text)
     # Replace ok by 'Owkey'
