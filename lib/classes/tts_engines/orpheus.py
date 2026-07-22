@@ -1,6 +1,7 @@
 from lib.classes.tts_engines.common.headers import *
 from lib.classes.tts_engines.common.preset_loader import load_engine_presets
 from lib.classes.tts_engines.common.audio import trim_audio
+from lib.classes.tts_engines.common.orpheus_text import to_tts_form
 # TEST Step 3c: Direct imports since headers no longer provides them
 import torch
 import torchaudio
@@ -1144,10 +1145,20 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
 
     def _clean_sentence_for_tts(self, sentence: str) -> str:
         """Strip whitespace + the e2a SML tags Orpheus doesn't understand
-        ([break]/[pause]/[music]/[sfx]/[silence]); Orpheus has its own emotion tags."""
+        ([break]/[pause]/[music]/[sfx]/[silence]); Orpheus has its own emotion tags.
+
+        Then apply the book-exact -> model transform (to_tts_form: scripture refs
+        + bare-integer expansion, the exact transforms the fine-tunes trained
+        with). Sentences arrive here BOOK-EXACT — that is what session['chapters']
+        stores and what the m4b transcript is built from — so this boundary is
+        the ONLY place the model text diverges from the display text. Everything
+        downstream (prompt, token budgets, chars/sec + truncation guards, resplit
+        ladders) measures the transformed text because they all consume this
+        function's return. Idempotent: sentences from a pre-display-text session
+        (already expanded) pass through unchanged."""
         sentence = (sentence or '').strip()
         sentence = re.sub(r'\[(?:break|pause|music|sfx|silence)(?::[^\]]+)?\]', '', sentence, flags=re.IGNORECASE)
-        return sentence.strip()
+        return to_tts_form(sentence.strip()).strip()
 
     def _classify_gap(self, sentence: str):
         """Inter-clip silence for a chunk. Returns (lead_gap_sec, trail_gap_sec).

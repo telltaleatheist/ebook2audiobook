@@ -39,6 +39,10 @@ from unidecode import unidecode
 from phonemizer import phonemize
 
 from lib.classes.subprocess_pipe import SubprocessPipe
+from lib.classes.tts_engines.common.orpheus_text import (
+    expand_digits as orpheus_expand_digits,
+    normalize_scripture as orpheus_normalize_scripture,
+)
 from lib.classes.vram_detector import VRAMDetector
 from lib.classes.voice_extractor import VoiceExtractor
 from lib.classes.tts_manager import TTSManager
@@ -1245,23 +1249,24 @@ def filter_chapter(idx:int, doc:EpubHtml, session_id:str, stanza_nlp:Pipeline, i
             # escape all SML tags to not be touched by any text treatment
             text, sml_blocks = escape_sml(text)
             if tts_engine == TTS_ENGINES['ORPHEUS']:
-                # Orpheus fine-tunes are trained on book-exact text with only
-                # normalize_scripture + expand_digits applied to the transcripts
-                # (orpheus-finetune cut_audiobook.py). Inference must match that
-                # distribution, so the whole date/year/roman/clock/math pipeline
-                # is SKIPPED for Orpheus and the two training transforms run
-                # instead — digits like '5,000', '1930s', '7th' and romans like
-                # 'Henry VIII' stay as printed. Orpheus is English-only by
-                # design; any other language is an XTTS job — fail loudly rather
-                # than anglicize.
+                # Orpheus fine-tunes are trained on book-exact text, so the whole
+                # date/year/roman/clock/math pipeline is SKIPPED — digits like
+                # '5,000', '1930s', '7th' and romans like 'Henry VIII' stay as
+                # printed. The ONLY lexical transforms the fine-tunes know
+                # (scripture refs + bare-integer expansion, orpheus_text.py) run
+                # at the ENGINE boundary (_clean_sentence_for_tts), NOT here: the
+                # sentences stored below — and the m4b transcript built from
+                # them — therefore read like the book, while get_sentences packs
+                # against the TRANSFORMED length so the 350-char cap bounds what
+                # the model actually reads. Orpheus is English-only by design;
+                # any other language is an XTTS job — fail loudly rather than
+                # anglicize.
                 if lang != 'eng':
                     error = f"Orpheus is English-only (got '{lang}') — route this language to another engine (XTTS)."
                     print(error)
                     return None
-                msg = 'Orpheus: book-exact text prep (scripture refs + bare integers)…'
+                msg = 'Orpheus: book-exact sentences (lexical transforms deferred to the engine)…'
                 print(msg)
-                text = orpheus_normalize_scripture(text)
-                text = orpheus_expand_digits(text)
             elif stanza_nlp:
                 msg = 'Converting dates and years to words…'
                 print(msg)
@@ -1473,7 +1478,13 @@ def get_sentences(text:str, session_id:str)->list|None:
         return ''.join(c for c in s if ord(c) < sml_escape_tag)
 
     def clean_len(s:str)->int:
-        return len(strip_escaped_sml(s))
+        # Length of what the ENGINE will actually read: SML tokens don't count,
+        # and for Orpheus the row is measured through tts_form (book-exact ->
+        # model transform; '1923' is 4 chars on screen, 37 spoken as 'one
+        # thousand nine hundred twenty three'). Every packing/split decision in
+        # the passes below uses this, so the 350-char cap bounds the MODEL's
+        # text, not the display text.
+        return len(strip_escaped_sml(tts_form(s)))
 
     def _plain(s:str)->bool:
         # A row is "plain prose" only when it carries NO escaped SML token: the
@@ -1482,7 +1493,10 @@ def get_sentences(text:str, session_id:str)->list|None:
         # merging/packing across a [break]/[pause]/… (PASS 4 and PASS 5) — merging
         # over one silently discards that paragraph/section pause (orpheus.py
         # strips the token before TTS, so the only record of it is the row split).
-        return clean_len(s) == len(s)
+        # NOTE: compares strip_escaped_sml directly, NOT clean_len — clean_len is
+        # transform-aware for Orpheus and would misread any digit-bearing row as
+        # "carries SML".
+        return len(strip_escaped_sml(s)) == len(s)
 
     def is_latin_only(s:str)->bool:
         s = strip_escaped_sml(s)
@@ -1588,13 +1602,54 @@ def get_sentences(text:str, session_id:str)->list|None:
             _mc = os.environ.get('ORPHEUS_MAX_CHARS')
             max_chars = int(_mc) if _mc else 350
 
+        # Orpheus rows are stored/displayed BOOK-EXACT; the scripture+digit
+        # expansion happens at the engine boundary (_clean_sentence_for_tts).
+        # tts_form is that same transform, used HERE only so clean_len measures
+        # the text the model will read. Deterministic and cached; identity for
+        # every other engine (their text is already fully words by this point).
+        if tts_engine == 'orpheus':
+            _tts_form_cache:dict[str,str] = {}
+            def tts_form(s:str)->str:
+                r = _tts_form_cache.get(s)
+                if r is None:
+                    r = orpheus_expand_digits(orpheus_normalize_scripture(s))
+                    _tts_form_cache[s] = r
+                return r
+        else:
+            def tts_form(s:str)->str:
+                return s
+
         assert not SML_TAG_PATTERN.search(text)
 
         # PASS 1 — hard punctuation
-        hard_pattern = re.compile(
-            rf"(.*?(?:{'|'.join(map(re.escape, punctuation_split_hard_set))}))(?=\s|$)",
-            re.DOTALL
-        )
+        if tts_engine == 'orpheus':
+            # Abbreviations stay unexpanded for Orpheus (book-exact text), so
+            # the splitter must not treat their dot as a sentence end ('He asked
+            # Mr. Darcy…' must not break after 'Mr.' — a break there is a bogus
+            # sentence gap at assembly). Guard the dot with lookbehinds for the
+            # known English abbreviation stems (the same table normalize_text
+            # expands for the other engines) plus any single letter (initials,
+            # 'C.I.A.', 'e.g.'). Cost of the guard: a dot that ends BOTH an
+            # abbreviation and a real sentence ('…joined the C.I.A. The next
+            # year…') no longer splits — two sentences ride one row, which
+            # Orpheus reads fine — far lesser evil than a mid-name break.
+            stems = set()
+            for k in abbreviations_mapping.get('eng', {}):
+                stem = (k[:-1] if k.endswith('.') else k).split('.')[-1].strip()
+                if len(stem) >= 2:
+                    stems.add(stem)
+            guards = ''.join(f'(?<!\\b{re.escape(s)})' for s in sorted(stems))
+            guarded_dot = rf'(?<!\b[A-Za-z]){guards}\.'
+            others = [re.escape(p) for p in punctuation_split_hard_set if p != '.']
+            hard_pattern = re.compile(
+                rf"(.*?(?:{'|'.join([guarded_dot] + others)}))(?=\s|$)",
+                re.DOTALL
+            )
+        else:
+            hard_pattern = re.compile(
+                rf"(.*?(?:{'|'.join(map(re.escape, punctuation_split_hard_set))}))(?=\s|$)",
+                re.DOTALL
+            )
         hard_list = split_inclusive(text, hard_pattern)
         if not hard_list:
             hard_list = [text.strip()]
@@ -1623,14 +1678,14 @@ def get_sentences(text:str, session_id:str)->list|None:
                     i += 1
             else:
                 i += 1
-            if len(strip_escaped_sml(s)) <= max_chars:
+            if clean_len(s) <= max_chars:
                 soft_list.append(s)
                 continue
             parts = split_inclusive(s, soft_pattern)
             if parts:
                 valid = False
                 for p in parts:
-                    if len(strip_escaped_sml(p.strip())) <= max_chars:
+                    if clean_len(p.strip()) <= max_chars:
                         valid = True
                         break
                 if valid:
@@ -1648,7 +1703,7 @@ def get_sentences(text:str, session_id:str)->list|None:
                 continue
             rest = s
             while rest:
-                current_len = len(strip_escaped_sml(rest))   # ← rename variable
+                current_len = clean_len(rest)
                 if current_len <= max_chars:
                     last_list.append(rest.strip())
                     break
@@ -1922,84 +1977,6 @@ def set_formatted_number(text:str, lang:str, lang_iso1:str, is_num2words_compat:
             return f'{first_num}{trailing}'
 
     return number_re.sub(clean_match, text)
-
-# ─── Orpheus book-exact text preparation ─────────────────────────────────────
-# Orpheus fine-tunes are trained on epub-exact transcripts (orpheus-finetune
-# repo: cut_audiobook.py) with exactly two text transforms applied before
-# training: normalize_scripture, then expand_digits. Inference must feed the
-# same distribution, so the functions below are faithful ports of that training
-# code — NOT num2words. The style difference matters: the training expander
-# writes 1923 as 'one thousand nine hundred twenty three' (cardinal, no hyphens,
-# no 'and'), and everything it does NOT match stays as printed in the book:
-# comma-grouped numbers ('5,000'), decades ('1930s'), ordinals ('7th'),
-# numbers > 9999, roman numerals ('Henry VIII'), abbreviations ('Mr.'), quotes.
-
-_ORPHEUS_ONES = ["zero", "one", "two", "three", "four", "five", "six", "seven",
-                 "eight", "nine", "ten", "eleven", "twelve", "thirteen",
-                 "fourteen", "fifteen", "sixteen", "seventeen", "eighteen",
-                 "nineteen"]
-_ORPHEUS_TENS = ["", "", "twenty", "thirty", "forty", "fifty", "sixty",
-                 "seventy", "eighty", "ninety"]
-
-def orpheus_num_to_words(n:int)->list[str]|None:
-    # Port of orpheus-finetune align_excerpts.num_to_words (training-text style)
-    if n < 0 or n > 9999:
-        return None
-    if n < 20:
-        return [_ORPHEUS_ONES[n]]
-    if n < 100:
-        w = [_ORPHEUS_TENS[n // 10]]
-        if n % 10:
-            w.append(_ORPHEUS_ONES[n % 10])
-        return w
-    if n < 1000:
-        w = [_ORPHEUS_ONES[n // 100], "hundred"]
-        if n % 100:
-            w += orpheus_num_to_words(n % 100)
-        return w
-    w = [_ORPHEUS_ONES[n // 1000], "thousand"]
-    if n % 1000:
-        w += orpheus_num_to_words(n % 1000)
-    return w
-
-def orpheus_expand_digits(text:str)->str:
-    # Port of orpheus-finetune cut_excerpts.expand_digits, made whitespace-safe:
-    # the original split()/join collapsed ALL whitespace (fine on single training
-    # cues); here paragraph breaks must survive because normalize_text turns them
-    # into [pause] tokens later. Token shape is identical: a whitespace-delimited
-    # token that is punctuation + a bare 1-4 digit integer + punctuation. Any
-    # digit-bearing token that does not match ('5,000', '1930s', '7th', '$5.50',
-    # '160299') is left exactly as printed — the fine-tunes were TRAINED on those
-    # as digits.
-    def repl(m:re.Match)->str:
-        words = orpheus_num_to_words(int(m.group(2)))
-        if not words:
-            return m.group(0)
-        return m.group(1) + " ".join(words) + m.group(3)
-    return re.sub(r'(?<!\S)([^\w\s]*)(\d{1,4})([^\w\s]*)(?!\S)', repl, text)
-
-def orpheus_normalize_scripture(text:str)->str:
-    # Port of orpheus-finetune cut_audiobook.normalize_scripture: Bible refs to
-    # the spoken form ('1 John 1:9' -> 'First John one nine', 'Matthew 5:16-18'
-    # -> 'Matthew five sixteen through eighteen'). Runs BEFORE
-    # orpheus_expand_digits so the ordinal book prefix is not turned into a
-    # cardinal ('one John').
-    # Deliberate deviation from the training version: its ordinal-prefix rule
-    # rewrote EVERY '[123] Capitalized' pair, safe in a scripture-dense book but
-    # wrong on general prose ('Chapter 3 The Journey' -> 'Third The Journey');
-    # here the ordinal applies only when a chapter:verse ref follows the name.
-    text = re.sub(r"\b([123]) ([A-Z][a-z]+ \d+:\d+)",
-                  lambda m: {'1': 'First', '2': 'Second', '3': 'Third'}[m.group(1)] + " " + m.group(2),
-                  text)
-    def _num(n:str)->str:
-        x = orpheus_num_to_words(int(n))
-        return " ".join(x) if x else str(n)
-    def repl(m:re.Match)->str:
-        s = f"{_num(m.group('c'))} {_num(m.group('v'))}"
-        if m.group('v2'):
-            s += f" through {_num(m.group('v2'))}"
-        return s
-    return re.sub(r"(?P<c>\d+):(?P<v>\d+)(?:[–-](?P<v2>\d+))?(?:ff\.)?", repl, text)
 
 def year2words(year_str:str, lang:str, lang_iso1:str, is_num2words_compat:bool)->str|bool:
     try:
@@ -2457,10 +2434,14 @@ def normalize_text(text:str, lang:str, lang_iso1:str, tts_engine:str)->str:
     # would mangle the very tokens the book-exact branch preserves.
     if tts_engine != TTS_ENGINES['ORPHEUS']:
         text = re.sub(r'(?<=[\p{L}])(?=\d)|(?<=\d)(?=[\p{L}])', ' ', text)
-    # Replace special chars with words
-    specialchars = specialchars_mapping.get(lang, specialchars_mapping.get(default_language_code, specialchars_mapping['eng']))
-    specialchars_table = {ord(char): f" {word} " for char, word in specialchars.items()}
-    text = text.translate(specialchars_table)
+    # Replace special chars with words — acoustic engines only. Orpheus training
+    # text keeps the raw glyphs ('40%', 'Q&A', '@'), so the fine-tunes read them
+    # natively; substituting words here would leave the transcript saying
+    # 'forty percent' where the book says '40%'.
+    if tts_engine != TTS_ENGINES['ORPHEUS']:
+        specialchars = specialchars_mapping.get(lang, specialchars_mapping.get(default_language_code, specialchars_mapping['eng']))
+        specialchars_table = {ord(char): f" {word} " for char, word in specialchars.items()}
+        text = text.translate(specialchars_table)
     text = ' '.join(text.split())
     return text
 
