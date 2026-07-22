@@ -2620,6 +2620,23 @@ def combine_audio_chapters(session_id:str)->list[str]|None:
             if final_denoise:
                 msg = f'[assembly] FINAL_DENOISE active: {final_denoise_filter}'
                 print(msg)
+            # BookForge per-voice corrective filter (notch/EQ/expander for the artifacts
+            # a fine-tune reproduces), from --post_render_filter. Applied in the SAME
+            # single encode as loudnorm — never a separate re-encode pass.
+            post_render_filter = session.get('post_render_filter')
+            if post_render_filter:
+                msg = f'[assembly] post_render_filter active: {post_render_filter}'
+                print(msg)
+            # Filters that must run BEFORE loudnorm (so the target loudness holds after
+            # the correction): denoise the raw hiss bed first, then the per-voice
+            # corrective chain. Any non-empty entry also forces a real encode (no
+            # stream-copy). All of these stream frame-by-frame, so they are safe even on
+            # the long-audiobook path where loudnorm (linear=true) is skipped.
+            pre_filters = []
+            if final_denoise:
+                pre_filters.append(final_denoise_filter)
+            if post_render_filter:
+                pre_filters.append(post_render_filter)
             ffprobe_cmd = [
                 shutil.which('ffprobe'), '-v', 'error', '-threads', '0', '-select_streams', 'a:0',
                 '-show_entries', 'stream=codec_name,sample_rate,sample_fmt',
@@ -2666,8 +2683,9 @@ def combine_audio_chapters(session_id:str)->list[str]|None:
                 cmd += ['-ac', '2']
             else:
                 cmd += ['-ac', '1']
-            # FINAL_DENOISE needs a filter pass, so it must skip the stream-copy shortcut
-            if input_codec == target_codec and input_rate == target_rate and not final_denoise:
+            # Any pre-loudnorm filter (FINAL_DENOISE or a per-voice post_render_filter)
+            # needs a real filter pass, so it must skip the stream-copy shortcut.
+            if input_codec == target_codec and input_rate == target_rate and not pre_filters:
                 cmd = [
                     shutil.which('ffmpeg'), '-hide_banner', '-nostats', '-hwaccel', 'auto', '-thread_queue_size', '1024', '-i', ffmpeg_combined_audio,
                     '-threads', '0', '-f', 'ffmetadata', '-i', ffmpeg_metadata_file,
@@ -2681,9 +2699,9 @@ def combine_audio_chapters(session_id:str)->list[str]|None:
                 audio_duration = get_audio_duration(ffmpeg_combined_audio)
                 if audio_duration and audio_duration > 7200:  # 2 hours in seconds
                     print(f'Skipping loudnorm filter for long audiobook ({audio_duration/3600:.1f} hours) to avoid memory issues')
-                    if final_denoise:
-                        # afftdn streams (unlike loudnorm linear=true) so it is safe on long audiobooks
-                        cmd += ['-af', final_denoise_filter]
+                    if pre_filters:
+                        # These stream (unlike loudnorm linear=true) so they are safe on long audiobooks
+                        cmd += ['-af', ','.join(pre_filters)]
                     cmd += [
                         '-threads', '0',
                         '-progress', 'pipe:2',
@@ -2691,9 +2709,9 @@ def combine_audio_chapters(session_id:str)->list[str]|None:
                     ]
                 else:
                     audio_filters = 'loudnorm=I=-16:LRA=11:TP=-1.5:linear=true,afftdn=nf=-70'
-                    if final_denoise:
-                        # Denoise the raw hiss bed BEFORE loudnorm measures and boosts it
-                        audio_filters = f'{final_denoise_filter},{audio_filters}'
+                    if pre_filters:
+                        # Denoise/correct the raw signal BEFORE loudnorm measures and normalizes it
+                        audio_filters = f"{','.join(pre_filters)},{audio_filters}"
                     cmd += [
                         '-filter_threads', '0',
                         '-filter_complex_threads', '0',

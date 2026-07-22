@@ -956,6 +956,9 @@ def assemble_audiobook(args: dict, core_module) -> dict:
         session['output_channel'] = args.get('output_channel', 'mono')
         session['output_split'] = args.get('output_split', default_output_split)
         session['output_split_hours'] = args.get('output_split_hours', default_output_split_hours)
+        # BookForge: per-voice ffmpeg filter chain applied at the final encode (see
+        # export_audio in lib/core.py). None → no post-render filtering.
+        session['post_render_filter'] = args.get('post_render_filter')
 
         # Language ISO
         try:
