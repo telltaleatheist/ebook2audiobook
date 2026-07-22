@@ -21,3 +21,6 @@ logs/
 
 # Benchmark harness output (bench_orpheus_mlx.py / bench_validate_real.py)
 bench_*.log
+
+# Unsloth compiled kernel cache (build artifact)
+/unsloth_compiled_cache/
