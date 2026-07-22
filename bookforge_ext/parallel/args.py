@@ -12,7 +12,7 @@ PARALLEL_OPTIONS = [
     '--resume_session', '--list_sessions', '--no_split', '--chapters', '--skip_deps',
     '--bilingual', '--bilingual_pause', '--bilingual_gap', '--skip_assembly',
     '--sentence_per_paragraph', '--skip_headings', '--session_dir', '--custom_model_dir',
-    '--sentences_dir', '--orpheus_model_dir'
+    '--sentences_dir', '--orpheus_model_dir', '--post_render_filter'
 ]
 
 
@@ -166,4 +166,15 @@ def add_arguments(parser):
              'Orpheus engine points every backend at this dir, bypassing the built-in '
              'voice allowlist. Stored in session-state so workers reuse it. Mirrors '
              'the same flag on worker.py.'
+    )
+
+    parallel_group.add_argument(
+        '--post_render_filter', type=str, default=None,
+        help='(assemble_only, BookForge) An ffmpeg audio-filter chain (the -af value) '
+             'applied to the audio during the FINAL assembly encode — a per-voice '
+             'corrective pass (notch/EQ/expander) for artifacts a fine-tune reproduces. '
+             'Applied before loudnorm, in the SAME single encode (no extra pass); a '
+             'present filter also disables the stream-copy shortcut so it always takes '
+             'effect. Passed as one argument (may contain |, :, /, quotes). BookForge '
+             'reads it from the Orpheus voice\'s models.json entry.'
     )

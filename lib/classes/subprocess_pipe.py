@@ -12,6 +12,8 @@ class SubprocessPipe:
         self._stop_requested = False
         self.on_progress = on_progress
         self.progress_bar = False
+        # Rolling tail of ffmpeg stderr (capped), so _on_error can report WHY it failed.
+        self._stderr_tail = ''
         if self.is_gui_process:
             self.progress_bar = gr.Progress(track_tqdm=False)
         # Store the run result. Callers test `if proc_pipe:` — without __bool__
@@ -39,6 +41,10 @@ class SubprocessPipe:
 
     def _on_error(self, err:Exception)->None:
         error = f"{self.msg} failed! {err}"
+        # Surface ffmpeg's own stderr tail so a rejected filter / bad arg fails loudly
+        # WITH its cause (a bare exit code hides why). Empty for non-ffmpeg processes.
+        if self._stderr_tail:
+            error = f"{error}\n{self._stderr_tail.strip()}"
         print(error)
         if self.progress_bar:
             self.progress_bar(0.0, desc=error)
@@ -75,6 +81,8 @@ class SubprocessPipe:
                 last_percent=0.0
                 for raw_line in self.process.stderr:
                     line=raw_line.decode(errors='ignore')
+                    # Keep a bounded tail of stderr; on failure it holds ffmpeg's error text.
+                    self._stderr_tail = (self._stderr_tail + line)[-4000:]
                     match=time_pattern.search(raw_line)
                     if match and self.total_duration > 0:
                         current_time=int(match.group(1))/1_000_000
