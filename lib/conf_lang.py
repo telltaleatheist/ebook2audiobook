@@ -481,7 +481,7 @@ language_clock = {
 abbreviations_mapping = {
     "eng": {
         "Mr.": "Mister",
-        "Mrs.": "Mistress",
+        "Mrs.": "Missus",
         "Dr.": "Doctor",
         "St.": "Saint",
         "Jr.": "Junior",

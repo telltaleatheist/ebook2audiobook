@@ -1244,7 +1244,25 @@ def filter_chapter(idx:int, doc:EpubHtml, session_id:str, stanza_nlp:Pipeline, i
             text = break_between_alnum_re.sub(' ', text)
             # escape all SML tags to not be touched by any text treatment
             text, sml_blocks = escape_sml(text)
-            if stanza_nlp:
+            if tts_engine == TTS_ENGINES['ORPHEUS']:
+                # Orpheus fine-tunes are trained on book-exact text with only
+                # normalize_scripture + expand_digits applied to the transcripts
+                # (orpheus-finetune cut_audiobook.py). Inference must match that
+                # distribution, so the whole date/year/roman/clock/math pipeline
+                # is SKIPPED for Orpheus and the two training transforms run
+                # instead — digits like '5,000', '1930s', '7th' and romans like
+                # 'Henry VIII' stay as printed. Orpheus is English-only by
+                # design; any other language is an XTTS job — fail loudly rather
+                # than anglicize.
+                if lang != 'eng':
+                    error = f"Orpheus is English-only (got '{lang}') — route this language to another engine (XTTS)."
+                    print(error)
+                    return None
+                msg = 'Orpheus: book-exact text prep (scripture refs + bare integers)…'
+                print(msg)
+                text = orpheus_normalize_scripture(text)
+                text = orpheus_expand_digits(text)
+            elif stanza_nlp:
                 msg = 'Converting dates and years to words…'
                 print(msg)
                 re_ordinal = re.compile(
@@ -1305,19 +1323,20 @@ def filter_chapter(idx:int, doc:EpubHtml, session_id:str, stanza_nlp:Pipeline, i
                             lambda m: year2words(m.group(), lang, lang_iso1, is_num2words_compat),
                             text
                         )
-            # year-form ALL remaining 4-digit years (1000-2099), even outside a
-            # stanza-detected date span ("October 1933" -> "nineteen thirty-three").
-            text = re.sub(r"(?<!\d)(1\d{3}|20\d{2})(?!\d)",
-                          lambda m: year2words(m.group(), lang, lang_iso1, is_num2words_compat), text)
-            msg = 'Convert romans to numbers…'
-            print(msg)
-            text = roman2number(text)
-            msg = 'Convert time to words…'
-            print(msg)
-            text = clock2words(text, lang, lang_iso1, tts_engine, is_num2words_compat)
-            msg = 'Convert numbers, maths signs to words…'
-            print(msg)
-            text = math2words(text, lang, lang_iso1, tts_engine, is_num2words_compat)
+            if tts_engine != TTS_ENGINES['ORPHEUS']:
+                # year-form ALL remaining 4-digit years (1000-2099), even outside a
+                # stanza-detected date span ("October 1933" -> "nineteen thirty-three").
+                text = re.sub(r"(?<!\d)(1\d{3}|20\d{2})(?!\d)",
+                              lambda m: year2words(m.group(), lang, lang_iso1, is_num2words_compat), text)
+                msg = 'Convert romans to numbers…'
+                print(msg)
+                text = roman2number(text)
+                msg = 'Convert time to words…'
+                print(msg)
+                text = clock2words(text, lang, lang_iso1, tts_engine, is_num2words_compat)
+                msg = 'Convert numbers, maths signs to words…'
+                print(msg)
+                text = math2words(text, lang, lang_iso1, tts_engine, is_num2words_compat)
             msg = 'Normalize text…'
             print(msg)
             text = normalize_text(text, lang, lang_iso1, tts_engine)
@@ -1904,6 +1923,84 @@ def set_formatted_number(text:str, lang:str, lang_iso1:str, is_num2words_compat:
 
     return number_re.sub(clean_match, text)
 
+# ─── Orpheus book-exact text preparation ─────────────────────────────────────
+# Orpheus fine-tunes are trained on epub-exact transcripts (orpheus-finetune
+# repo: cut_audiobook.py) with exactly two text transforms applied before
+# training: normalize_scripture, then expand_digits. Inference must feed the
+# same distribution, so the functions below are faithful ports of that training
+# code — NOT num2words. The style difference matters: the training expander
+# writes 1923 as 'one thousand nine hundred twenty three' (cardinal, no hyphens,
+# no 'and'), and everything it does NOT match stays as printed in the book:
+# comma-grouped numbers ('5,000'), decades ('1930s'), ordinals ('7th'),
+# numbers > 9999, roman numerals ('Henry VIII'), abbreviations ('Mr.'), quotes.
+
+_ORPHEUS_ONES = ["zero", "one", "two", "three", "four", "five", "six", "seven",
+                 "eight", "nine", "ten", "eleven", "twelve", "thirteen",
+                 "fourteen", "fifteen", "sixteen", "seventeen", "eighteen",
+                 "nineteen"]
+_ORPHEUS_TENS = ["", "", "twenty", "thirty", "forty", "fifty", "sixty",
+                 "seventy", "eighty", "ninety"]
+
+def orpheus_num_to_words(n:int)->list[str]|None:
+    # Port of orpheus-finetune align_excerpts.num_to_words (training-text style)
+    if n < 0 or n > 9999:
+        return None
+    if n < 20:
+        return [_ORPHEUS_ONES[n]]
+    if n < 100:
+        w = [_ORPHEUS_TENS[n // 10]]
+        if n % 10:
+            w.append(_ORPHEUS_ONES[n % 10])
+        return w
+    if n < 1000:
+        w = [_ORPHEUS_ONES[n // 100], "hundred"]
+        if n % 100:
+            w += orpheus_num_to_words(n % 100)
+        return w
+    w = [_ORPHEUS_ONES[n // 1000], "thousand"]
+    if n % 1000:
+        w += orpheus_num_to_words(n % 1000)
+    return w
+
+def orpheus_expand_digits(text:str)->str:
+    # Port of orpheus-finetune cut_excerpts.expand_digits, made whitespace-safe:
+    # the original split()/join collapsed ALL whitespace (fine on single training
+    # cues); here paragraph breaks must survive because normalize_text turns them
+    # into [pause] tokens later. Token shape is identical: a whitespace-delimited
+    # token that is punctuation + a bare 1-4 digit integer + punctuation. Any
+    # digit-bearing token that does not match ('5,000', '1930s', '7th', '$5.50',
+    # '160299') is left exactly as printed — the fine-tunes were TRAINED on those
+    # as digits.
+    def repl(m:re.Match)->str:
+        words = orpheus_num_to_words(int(m.group(2)))
+        if not words:
+            return m.group(0)
+        return m.group(1) + " ".join(words) + m.group(3)
+    return re.sub(r'(?<!\S)([^\w\s]*)(\d{1,4})([^\w\s]*)(?!\S)', repl, text)
+
+def orpheus_normalize_scripture(text:str)->str:
+    # Port of orpheus-finetune cut_audiobook.normalize_scripture: Bible refs to
+    # the spoken form ('1 John 1:9' -> 'First John one nine', 'Matthew 5:16-18'
+    # -> 'Matthew five sixteen through eighteen'). Runs BEFORE
+    # orpheus_expand_digits so the ordinal book prefix is not turned into a
+    # cardinal ('one John').
+    # Deliberate deviation from the training version: its ordinal-prefix rule
+    # rewrote EVERY '[123] Capitalized' pair, safe in a scripture-dense book but
+    # wrong on general prose ('Chapter 3 The Journey' -> 'Third The Journey');
+    # here the ordinal applies only when a chapter:verse ref follows the name.
+    text = re.sub(r"\b([123]) ([A-Z][a-z]+ \d+:\d+)",
+                  lambda m: {'1': 'First', '2': 'Second', '3': 'Third'}[m.group(1)] + " " + m.group(2),
+                  text)
+    def _num(n:str)->str:
+        x = orpheus_num_to_words(int(n))
+        return " ".join(x) if x else str(n)
+    def repl(m:re.Match)->str:
+        s = f"{_num(m.group('c'))} {_num(m.group('v'))}"
+        if m.group('v2'):
+            s += f" through {_num(m.group('v2'))}"
+        return s
+    return re.sub(r"(?P<c>\d+):(?P<v>\d+)(?:[–-](?P<v2>\d+))?(?:ff\.)?", repl, text)
+
 def year2words(year_str:str, lang:str, lang_iso1:str, is_num2words_compat:bool)->str|bool:
     try:
         year = int(year_str)
@@ -2284,20 +2381,24 @@ def normalize_text(text:str, lang:str, lang_iso1:str, tts_engine:str)->str:
     # Remove emojis
     emoji_pattern = re.compile(f"[{''.join(emojis_list)}]+", flags=re.UNICODE)
     text = emoji_pattern.sub('', text)
-    if lang in abbreviations_mapping:
-        mapping = abbreviations_mapping[lang]
-        # Sort keys by descending length so longer ones match first
-        keys = sorted(mapping.keys(), key=len, reverse=True)
-        # Build a regex that only matches whole “words” (tokens) exactly
-        pattern = re.compile(
-            r'(?<!\w)(' + '|'.join(re.escape(k) for k in keys) + r')(?!\w)',
-            flags=re.IGNORECASE
-        )
-        text = pattern.sub(replace, text)
-    # This regex matches sequences like a., c.i.a., f.d.a., m.c., etc…
-    pattern = re.compile(r'\b(?:[a-zA-Z]\.){1,}[a-zA-Z]?\b\.?')
-    # uppercase acronyms
-    text = re.sub(r'\b(?:[a-zA-Z]\.){1,}[a-zA-Z]?\b\.?', lambda m: m.group().replace('.', '').upper(), text)
+    # Orpheus fine-tunes are trained on book-exact text: 'Mr.', 'Mrs.', 'St.'
+    # and dotted acronyms ('C.I.A.') appear verbatim in the training transcripts,
+    # so expanding or de-dotting them at inference moves AWAY from the training
+    # distribution. Both transforms stay for the acoustic engines (XTTS/VITS/…).
+    if tts_engine != TTS_ENGINES['ORPHEUS']:
+        if lang in abbreviations_mapping:
+            mapping = abbreviations_mapping[lang]
+            # Sort keys by descending length so longer ones match first
+            keys = sorted(mapping.keys(), key=len, reverse=True)
+            # Build a regex that only matches whole “words” (tokens) exactly
+            pattern = re.compile(
+                r'(?<!\w)(' + '|'.join(re.escape(k) for k in keys) + r')(?!\w)',
+                flags=re.IGNORECASE
+            )
+            text = pattern.sub(replace, text)
+        # This regex matches sequences like a., c.i.a., f.d.a., m.c., etc…
+        # uppercase acronyms
+        text = re.sub(r'\b(?:[a-zA-Z]\.){1,}[a-zA-Z]?\b\.?', lambda m: m.group().replace('.', '').upper(), text)
     # romanize foreign words
     if language_mapping[lang]['script'] == 'latin':
         text = foreign2latin(text, lang)
@@ -2307,8 +2408,20 @@ def normalize_text(text:str, lang:str, lang_iso1:str, tts_engine:str)->str:
     # Replace single newlines ("\n" or "\r") with spaces
     text = re.sub(r'\r\n|\r|\n', ' ', text)
     # Replace punctuations causing hallucinations
-    pattern = f"[{''.join(map(re.escape, punctuation_switch.keys()))}]"
-    text = re.sub(pattern, lambda match: punctuation_switch.get(match.group(), match.group()), text)
+    switch = punctuation_switch
+    if tts_engine == TTS_ENGINES['ORPHEUS']:
+        # Book-exact overrides. The shared table rewrites em/en dashes to '.'
+        # (forcing sentence breaks mid-clause) and parens to commas — both wrong
+        # for Orpheus, whose training text folds dashes to hyphens (the corpus
+        # extractor's _SMART table: '—' -> ' - ', '–' -> '-') and keeps parens
+        # verbatim (parentheticals are prosody the LLM reads natively).
+        switch = dict(punctuation_switch)
+        switch['–'] = '-'
+        switch['—'] = ' - '
+        del switch['(']
+        del switch[')']
+    pattern = f"[{''.join(map(re.escape, switch.keys()))}]"
+    text = re.sub(pattern, lambda match: switch.get(match.group(), match.group()), text)
     # remove unwanted chars
     chars_remove_table = str.maketrans({ch: ' ' for ch in chars_remove})
     text = text.translate(chars_remove_table)
@@ -2327,8 +2440,9 @@ def normalize_text(text:str, lang:str, lang_iso1:str, tts_engine:str)->str:
         text = re.sub(r'\s*"\s*', ' ', text)
     # Replace multiple and spaces with single space
     text = re.sub(r'\s+', ' ', text)
-    # Replace ok by 'Owkey'
-    text = re.sub(r'\bok\b', 'Okay', text, flags=re.IGNORECASE)
+    # Replace ok by 'Okay' — acoustic engines only; Orpheus reads book-exact text
+    if tts_engine != TTS_ENGINES['ORPHEUS']:
+        text = re.sub(r'\bok\b', 'Okay', text, flags=re.IGNORECASE)
     # Escape special characters in the punctuation list for regex
     pattern = '|'.join(map(re.escape, punctuation_split_hard_set))
     # Reduce multiple consecutive punctuations hard
@@ -2337,8 +2451,12 @@ def normalize_text(text:str, lang:str, lang_iso1:str, tts_engine:str)->str:
     pattern = '|'.join(map(re.escape, punctuation_split_soft_set))
     # Reduce multiple consecutive punctuations soft
     text = re.sub(rf'(\s*({pattern})\s*)+', r'\2 ', text).strip()
-    # Pattern 1: Add a space between UTF-8 characters and numbers
-    text = re.sub(r'(?<=[\p{L}])(?=\d)|(?<=\d)(?=[\p{L}])', ' ', text)
+    # Pattern 1: Add a space between UTF-8 characters and numbers.
+    # NOT for Orpheus: its kept-digit forms ('1930s', '7th', '76ers') appear
+    # exactly like that in the training transcripts — spacing them ('1930 s')
+    # would mangle the very tokens the book-exact branch preserves.
+    if tts_engine != TTS_ENGINES['ORPHEUS']:
+        text = re.sub(r'(?<=[\p{L}])(?=\d)|(?<=\d)(?=[\p{L}])', ' ', text)
     # Replace special chars with words
     specialchars = specialchars_mapping.get(lang, specialchars_mapping.get(default_language_code, specialchars_mapping['eng']))
     specialchars_table = {ord(char): f" {word} " for char, word in specialchars.items()}
