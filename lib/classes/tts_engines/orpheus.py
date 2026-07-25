@@ -968,7 +968,7 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
         if force_split:
             parts = self._split_long_text(clean, max_length=max(60, len(clean) // 2))
             if len(parts) >= 2:
-                return np.concatenate([self._generate_audio_vllm_safe(p, depth + 1) for p in parts])
+                return np.concatenate(self._generate_parts_batched(parts, depth + 1))
         sampling_params = self._vllm_sampling_params(len(clean))
         prompt = TokensPrompt(prompt_token_ids=self._format_prompt_ids(clean))
         try:
@@ -985,7 +985,41 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
         parts = self._split_long_text(clean, max_length=max(60, len(clean) // 2))
         if len(parts) < 2:
             return self._tokens_to_audio(tokens)
-        return np.concatenate([self._generate_audio_vllm_safe(p, depth + 1) for p in parts])
+        return np.concatenate(self._generate_parts_batched(parts, depth + 1))
+
+    def _generate_parts_batched(self, parts: list, depth: int) -> list:
+        """Render many text parts in ONE vLLM generate() call. Returns waveforms
+        aligned to `parts`.
+
+        This used to be `[self._generate_audio_vllm_safe(p, depth+1) for p in parts]` —
+        a Python loop of SINGLE-prompt generate() calls, each running at a concurrency
+        of one while the 60-odd other chunks of the batch that triggered it sat waiting
+        for their turn through the result loop. vLLM schedules a list of prompts
+        natively, so every part now runs concurrently in one scheduling round.
+
+        A part that STILL hits the token cap (or whose token stream misaligns) falls
+        back to the recursive serial ladder at `depth`. That is rare, and preserving its
+        exact recursion/accept behaviour matters more than batching it.
+        """
+        from vllm import TokensPrompt
+        sampling_params = [self._vllm_sampling_params(len(p)) for p in parts]
+        prompts = [TokensPrompt(prompt_token_ids=self._format_prompt_ids(p)) for p in parts]
+        try:
+            outputs = self.engine.generate(prompts, sampling_params, use_tqdm=False)
+        except TypeError:
+            outputs = self.engine.generate(prompts, sampling_params)
+        waves = []
+        for part, out in zip(parts, outputs):
+            tokens = list(out.outputs[0].token_ids)
+            if self.END_OF_AUDIO_TOKEN in tokens:
+                tokens = tokens[:tokens.index(self.END_OF_AUDIO_TOKEN)]
+                try:
+                    waves.append(self._tokens_to_audio(tokens))
+                    continue
+                except TokenStreamMisaligned as align_err:
+                    print(f"Orpheus: split part token stream misaligned ({align_err}); re-rendering once")
+            waves.append(self._generate_audio_vllm_safe(part, depth))
+        return waves
 
     def _generate_tokens_transformers(self, prompt: str, max_tokens: int = None) -> list:
         """Generate audio tokens using transformers backend."""
@@ -1291,32 +1325,57 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
         regardless of the 150-char floor. If the retake is empty too, the empty
         result flows back to the caller — _save_audio rejects it (row fails
         loudly) and the streaming worker emits 'No audio generated'."""
+        reason = self._needs_resplit(sentence_index, clean, audio_np)
+        if reason is None:
+            return audio_np
+        audio_np = resplit(clean)
+        if reason == 'short':
+            self._ratchet_after_resplit(clean, audio_np)
+        return audio_np
+
+    def _needs_resplit(self, sentence_index: int, clean: str, audio_np):
+        """DECISION half of _guard_truncation. Returns 'empty', 'short', or None.
+
+        Split out from the re-render so the BATCH path can defer the expensive half:
+        the verdict depends only on text and already-rendered audio, so every chunk in
+        a batch can be judged immediately and their re-renders pooled into one call
+        (see _render_deferred_resplits). The log lines still fire here, at detection
+        time, so the reason a chunk gets re-rendered is visible where it happens.
+        """
         if (audio_np is None or len(audio_np) == 0) and clean and clean.strip():
             print(f"Orpheus: sentence {sentence_index} produced no audio — re-rendering split at sentence boundaries")
-            return resplit(clean)
+            return 'empty'
         env_rate = float(os.environ.get('ORPHEUS_MAX_CHARS_PER_SEC', '19.0'))
         # A disabled guard (env <= 0) stays disabled — the ratchet must NEVER
         # resurrect it. Only past this gate does the session ceiling apply.
         if env_rate <= 0 or len(clean) <= 150:
-            return audio_np
+            return None
         max_rate = max(env_rate, self._rate_ceiling)
         rate = self._speech_rate(clean, audio_np)
         if rate is None or rate <= max_rate:
-            return audio_np
+            return None
         print(f"Orpheus: sentence {sentence_index} audio too short for text "
               f"({rate:.1f} ch/s > {max_rate:.1f}) — re-rendering split at sentence boundaries")
-        audio_np = resplit(clean)
+        return 'short'
+
+    def _ratchet_after_resplit(self, clean: str, audio_np) -> None:
+        """RATCHET half of _guard_truncation — see its docstring for the full rationale.
+
+        The split render is un-truncatable, so if its rate STILL exceeds the threshold
+        that is the voice's real speaking rate, not a truncation: raise the session
+        ceiling (never lower it) so subsequent healthy fast chunks stop tripping.
+        Only ever called for a 'short' verdict — an 'empty' one carries no rate signal.
+        """
+        env_rate = float(os.environ.get('ORPHEUS_MAX_CHARS_PER_SEC', '19.0'))
+        if env_rate <= 0:
+            return
+        max_rate = max(env_rate, self._rate_ceiling)
         rate2 = self._speech_rate(clean, audio_np)
         if rate2 is not None and rate2 > max_rate:
-            # The split render is un-truncatable, so rate2 is the voice's real
-            # rate — the threshold is miscalibrated for this voice, not the audio
-            # truncated. Ratchet the ceiling up (never down) so subsequent healthy
-            # fast chunks stop tripping. Loud by design (NO silent fallbacks).
             new_ceiling = rate2 + 0.5
             self._rate_ceiling = new_ceiling
             print(f"Orpheus: voice's measured natural rate {rate2:.1f} ch/s exceeds guard "
                   f"threshold {max_rate:.1f} — recalibrating threshold to {new_ceiling:.1f} for this session")
-        return audio_np
 
     def _save_audio(self, sentence_index: int, audio_np, lead_gap: float = 0.0, trail_gap: float = 0.0) -> bool:
         """Trim trailing silence, normalize, add the inter-clip pauses, and write a
@@ -1422,6 +1481,49 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
             traceback.print_exc()
             return False
 
+    def _render_deferred_resplits(self, deferred: list, results: dict) -> None:
+        """Re-render every truncated chunk of a batch in ONE pooled generate() call.
+
+        deferred: list of (sentence_index, clean, gap, reason). Fills `results` in place.
+
+        Each chunk is split exactly as the inline guard split it
+        (_generate_audio_vllm_safe with force_split — half-length parts, well inside the
+        reliable zone). The ONLY change is scheduling: the parts of every deferred chunk
+        in the batch are submitted together, so a batch carrying 3 truncations costs one
+        extra scheduling round rather than 3+ serial single-prompt rounds, each of which
+        used to hold up the whole batch's remaining results.
+
+        Audio is byte-for-byte the same decision path — same text, same split, same
+        per-part sampling params. Only the wall-clock changes.
+        """
+        import numpy as np
+        flat, owners = [], []     # part texts, and the deferred[] position each belongs to
+        for pos, (_idx, clean, _gap, _reason) in enumerate(deferred):
+            parts = self._split_long_text(clean, max_length=max(60, len(clean) // 2))
+            if len(parts) < 2:
+                # Unsplittable text — the ladder falls through to a plain render, and so
+                # do we. _generate_parts_batched still applies the cap ladder to it.
+                parts = [clean]
+            for p in parts:
+                flat.append(p)
+                owners.append(pos)
+
+        waves = self._generate_parts_batched(flat, 1)
+
+        for pos, (idx, clean, gap, reason) in enumerate(deferred):
+            try:
+                mine = [w for w, o in zip(waves, owners) if o == pos]
+                audio_np = np.concatenate(mine) if len(mine) > 1 else mine[0]
+                if reason == 'short':
+                    self._ratchet_after_resplit(clean, audio_np)
+                results[idx] = self._save_audio(idx, audio_np, gap[0], gap[1])
+            except Exception as resplit_err:
+                print(f"Orpheus deferred re-render failed for sentence {idx}: {resplit_err}")
+                if is_fatal_cuda_error(resplit_err):
+                    # Poisoned context — every remaining sentence would fail instantly.
+                    raise
+                results[idx] = False
+
     def convert_batch(self, items: list) -> list:
         """Convert many sentences in ONE vLLM generate() call.
 
@@ -1460,6 +1562,13 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
                     outputs = self.engine.generate(prompts, sampling_params, use_tqdm=False)
                 except TypeError:
                     outputs = self.engine.generate(prompts, sampling_params)
+                # Chunks whose audio came back truncated are NOT re-rendered here. The
+                # verdict (_needs_resplit) is pure text-vs-audio, and the force-split
+                # re-render is deterministic — the split follows from the text alone —
+                # so every failure in this batch can be pooled into ONE extra generate()
+                # after the loop instead of N serial single-prompt calls that stall the
+                # remaining results behind them. See _render_deferred_resplits.
+                deferred = []   # (sentence_index, clean, gap, reason)
                 # vLLM returns outputs in the same order as prompts.
                 for (idx, clean, _, gap), out in zip(gen, outputs):
                     try:
@@ -1483,12 +1592,11 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
                             audio_np = self._generate_audio_vllm_safe(clean)
                         # Backstop a silent early-EOS truncation (clean EOS, audio too
                         # short for the text) that the cap check above can't catch.
-                        # force_split: a whole-chunk re-render would just clean-EOS
-                        # (truncated) again — the resplit must actually split.
-                        audio_np = self._guard_truncation(
-                            idx, clean, audio_np,
-                            lambda c: self._generate_audio_vllm_safe(c, force_split=True)
-                        )
+                        # Only the VERDICT is taken here; the re-render is pooled.
+                        reason = self._needs_resplit(idx, clean, audio_np)
+                        if reason is not None:
+                            deferred.append((idx, clean, gap, reason))
+                            continue
                         results[idx] = self._save_audio(idx, audio_np, gap[0], gap[1])
                     except Exception as decode_err:
                         print(f"Orpheus batch decode error for sentence {idx}: {decode_err}")
@@ -1498,6 +1606,9 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
                             # resumes from the sentence files already on disk.
                             raise
                         results[idx] = False
+
+                if deferred:
+                    self._render_deferred_resplits(deferred, results)
 
             # NO _cleanup_memory() here: it empty_cache()s the CUDA allocator, and at
             # one flush per batch (~113 per book) every subsequent batch re-allocates
