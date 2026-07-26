@@ -107,16 +107,35 @@ def get_audio_duration(filepath: str) -> float:
 def get_audiolist_duration(filepaths:list[str])->dict[str, float]:
     durations = {os.path.realpath(p): 0.0 for p in filepaths}
     mediainfo = shutil.which("mediainfo")
-    cmd = [mediainfo, "--Output=JSON", *filepaths]
-    try:
-        out = subprocess.check_output(cmd, text=True)
-        data = json.loads(out)
-        extracted = _extract_mediainfo_durations(data)
-        for path in durations:
-            if path in extracted:
-                durations[path] = extracted[path]
-    except Exception:
-        pass
+    # Windows CreateProcess caps the command line at 32767 chars (and POSIX has
+    # ARG_MAX), so one mediainfo invocation over a long file list dies there —
+    # batch the paths by cumulative command length instead.
+    max_cmd_len = 24000
+    batches = []
+    batch = []
+    batch_len = 0
+    for p in filepaths:
+        p_len = len(str(p)) + 3  # quotes + separator
+        if batch and batch_len + p_len > max_cmd_len:
+            batches.append(batch)
+            batch = []
+            batch_len = 0
+        batch.append(p)
+        batch_len += p_len
+    if batch:
+        batches.append(batch)
+    for batch in batches:
+        cmd = [mediainfo, "--Output=JSON", *batch]
+        try:
+            out = subprocess.check_output(cmd, text=True)
+            data = json.loads(out)
+            extracted = _extract_mediainfo_durations(data)
+            for path in durations:
+                if path in extracted:
+                    durations[path] = extracted[path]
+        except Exception as e:
+            error = f"get_audiolist_duration() Error: mediainfo failed on a batch of {len(batch)} files: {e}"
+            print(error)
     return durations
 
 def normalize_audio(input_file:str, output_file:str, samplerate:int, is_gui_process:bool)->bool:
