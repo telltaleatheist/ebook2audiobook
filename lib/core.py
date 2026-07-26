@@ -2593,6 +2593,24 @@ def convert_chapters2audio(session_id:str)->bool:
             print(error)
             return False
 
+def read_flac_streaminfo(filepath:str)->tuple[int, int]:
+    # Parse the mandatory STREAMINFO metadata block directly (stdlib only):
+    # 'fLaC' magic, then the FIRST metadata block must be STREAMINFO (type 0)
+    # per the FLAC spec. Returns (max_blocksize, samplerate).
+    with open(filepath, 'rb') as f:
+        magic = f.read(4)
+        if magic != b'fLaC':
+            raise ValueError(f'Not a FLAC file (bad magic): {filepath}')
+        header = f.read(4)
+        if len(header) < 4 or (header[0] & 0x7F) != 0:
+            raise ValueError(f'First FLAC metadata block is not STREAMINFO: {filepath}')
+        info = f.read(34)
+        if len(info) < 34:
+            raise ValueError(f'Truncated FLAC STREAMINFO block: {filepath}')
+    max_blocksize = int.from_bytes(info[2:4], 'big')
+    samplerate = (info[10] << 12) | (info[11] << 4) | (info[12] >> 4)
+    return max_blocksize, samplerate
+
 def combine_audio_sentences(session_id:str, file:str, start:int, end:int)->bool:
     try:
         session = context.get_session(session_id)
@@ -2622,6 +2640,33 @@ def combine_audio_sentences(session_id:str, file:str, start:int, end:int)->bool:
                 error = 'No audio files found in the specified range.'
                 print(error)
                 return False
+            # ffmpeg's concat demuxer silently drops every FLAC frame whose
+            # blocksize exceeds the FIRST list entry's STREAMINFO max-blocksize
+            # (and still exits 0), so a mixed-encoder sentence set must never
+            # reach it. Refuse non-homogeneous max-blocksize or samplerate.
+            if ext == '.flac':
+                blocksizes = {}
+                samplerates = {}
+                for path in selected_files:
+                    max_blocksize, samplerate = read_flac_streaminfo(path)
+                    blocksizes.setdefault(max_blocksize, []).append(path)
+                    samplerates.setdefault(samplerate, []).append(path)
+                if len(blocksizes) > 1:
+                    error = 'combine_audio_sentences() FLAC max-blocksize is not homogeneous — ffmpeg concat would silently drop frames:'
+                    print(error)
+                    for max_blocksize in sorted(blocksizes):
+                        paths = blocksizes[max_blocksize]
+                        msg = f'  max-blocksize {max_blocksize}: {len(paths)} files (e.g. {os.path.basename(paths[0])})'
+                        print(msg)
+                    return False
+                if len(samplerates) > 1:
+                    error = 'combine_audio_sentences() FLAC samplerate is not homogeneous — ffmpeg concat would corrupt timing:'
+                    print(error)
+                    for samplerate in sorted(samplerates):
+                        paths = samplerates[samplerate]
+                        msg = f'  samplerate {samplerate}: {len(paths)} files (e.g. {os.path.basename(paths[0])})'
+                        print(msg)
+                    return False
             concat_dir = session['process_dir']
             concat_list = os.path.join(concat_dir, 'concat_list_sentences.txt')
             with open(concat_list, 'w') as f:
@@ -3111,6 +3156,21 @@ def assemble_audio_chunks(txt_file:str, out_file:str, is_gui_process:bool)->bool
             on_progress=on_progress
         )
         if proc_pipe:
+            # ffmpeg's concat demuxer can drop inputs (e.g. FLAC blocksize
+            # mismatches) and still exit 0, so the exit code alone proves
+            # nothing — verify the output actually contains all the input.
+            actual_duration = get_audio_duration(out_file)
+            tolerance = 0.5 + 0.01 * len(filepaths)
+            delta = actual_duration - total_duration
+            if abs(delta) > tolerance:
+                error = (
+                    f'assemble_audio_chunks() Output duration mismatch → {out_file}: '
+                    f'expected {total_duration:.2f}s, got {actual_duration:.2f}s '
+                    f'(delta {delta:+.2f}s, tolerance ±{tolerance:.2f}s). '
+                    f'ffmpeg exited 0 but the output is missing input audio.'
+                )
+                print(error)
+                return False
             msg = f'Completed → {out_file}'
             print(msg)
             return True
