@@ -2262,7 +2262,21 @@ def foreign2latin(text:str, base_lang:str)->str:
         key: str = f'__TTS_MARKER_{i}__'
         protected[key] = m.group(0)
         text = text.replace(m.group(0), key)
-    tokens: list[str] = re.findall(r"\w+|[^\w\s]", text, re.UNICODE)
+    # Tokenise INCLUDING whitespace, so the original spacing is REBUILT, not guessed.
+    #
+    # The previous pattern (r"\w+|[^\w\s]") dropped every space, and the rejoin below
+    # re-inserted one ONLY between two adjacent word tokens — so any space touching a
+    # punctuation mark was destroyed outright:
+    #     an "overtly-satanic ... LGBTQIA+ supplier," for so-called "pride month" in
+    #  -> an"overtly-satanic ... LGBTQIA+supplier,"for so-called"pride month"in
+    # Measured 2026-07-28 on Killing America: this is a no-op semantically for
+    # Latin-script books (romanize() returns Latin words unchanged) yet it mangled the
+    # spacing of every one of them, and the densest victim — 437 chars carrying four
+    # jammed quotes — was the ONE chunk in 1013 that hit the audio-token cap.
+    #
+    # Whitespace and punctuation now pass through verbatim; only word tokens are
+    # romanized. `protected` is still checked first so SML markers are never touched.
+    tokens: list[str] = re.findall(r"\w+|\s+|[^\w\s]", text, re.UNICODE)
     buf: list[str] = []
     for t in tokens:
         if t in protected:
@@ -2271,15 +2285,7 @@ def foreign2latin(text:str, base_lang:str)->str:
             buf.append(romanize(t))
         else:
             buf.append(t)
-    out: str = ''
-    for i, t in enumerate(buf):
-        if i == 0:
-            out += t
-        else:
-            if re.match(r"^\w+$", buf[i - 1]) and re.match(r"^\w+$", t):
-                out += ' ' + t
-            else:
-                out += t
+    out: str = ''.join(buf)
     for k, v in protected.items():
         out = out.replace(k, v)
     return out
