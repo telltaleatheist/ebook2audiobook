@@ -56,6 +56,72 @@ def trim_audio(audio_data: Union[list[float], Tensor], samplerate: int, silence_
     raise TypeError(error)
     return torch.tensor([], dtype=torch.float32)
     
+_LONGPATH_PREFIX = '\\\\?\\'
+
+def _mediainfo_path(path:str)->str:
+    """
+    Render a path in the form mediainfo can actually open on Windows.
+
+    mediainfo does not opt into long paths: handed anything past the 260-char MAX_PATH
+    limit it prints `"media": null` and STILL EXITS 0, so the duration comes back
+    missing with no error raised anywhere. The `\\\\?\\` extended-length prefix bypasses
+    the limit, and it works on short paths too — so it is applied unconditionally
+    rather than past a threshold that nothing in normal use would ever exercise.
+    """
+    if os.name != 'nt':
+        return path
+    # `\\?\` switches off path normalization, so normalize BEFORE prefixing: forward
+    # slashes, '..' and relative paths are all rejected once the prefix is on.
+    abspath = os.path.abspath(path)
+    if abspath.startswith(_LONGPATH_PREFIX):
+        return abspath
+    if abspath.startswith('\\\\'):
+        # UNC \\server\share\... → \\?\UNC\server\share\...
+        return f'{_LONGPATH_PREFIX}UNC\\{abspath[2:]}'
+    return f'{_LONGPATH_PREFIX}{abspath}'
+
+def _mediainfo_key(path:str)->str:
+    """Undo _mediainfo_path() so mediainfo's echoed @ref keys the same as the input."""
+    if path.startswith(f'{_LONGPATH_PREFIX}UNC\\'):
+        path = '\\\\' + path[len(_LONGPATH_PREFIX) + 4:]
+    elif path.startswith(_LONGPATH_PREFIX):
+        path = path[len(_LONGPATH_PREFIX):]
+    return os.path.realpath(path)
+
+def _mediainfo_durations(filepaths:list[str])->dict[str, float]:
+    """
+    Duration of each file, keyed by realpath. Files mediainfo could not read are
+    ABSENT from the result rather than present as 0.0 — callers must decide what a
+    missing duration means, because silently treating it as zero is what let a
+    17-hour assembly report itself empty.
+    """
+    mediainfo = shutil.which('mediainfo')
+    if mediainfo is None:
+        raise RuntimeError('mediainfo is not on PATH; audio durations cannot be measured.')
+    # Windows CreateProcess caps the command line at 32767 chars (and POSIX has
+    # ARG_MAX), so one mediainfo invocation over a long file list dies there —
+    # batch the paths by cumulative command length instead.
+    max_cmd_len = 24000
+    batches: list[list[str]] = []
+    batch: list[str] = []
+    batch_len = 0
+    for p in filepaths:
+        arg = _mediainfo_path(str(p))
+        arg_len = len(arg) + 3  # quotes + separator
+        if batch and batch_len + arg_len > max_cmd_len:
+            batches.append(batch)
+            batch = []
+            batch_len = 0
+        batch.append(arg)
+        batch_len += arg_len
+    if batch:
+        batches.append(batch)
+    durations: dict[str, float] = {}
+    for batch in batches:
+        out = subprocess.check_output([mediainfo, '--Output=JSON', *batch], text=True)
+        durations.update(_extract_mediainfo_durations(json.loads(out)))
+    return durations
+
 def _extract_mediainfo_durations(data:dict|list)->dict[str, float]:
     durations: dict[str, float] = {}
     if isinstance(data, list):
@@ -71,7 +137,7 @@ def _extract_mediainfo_durations(data:dict|list)->dict[str, float]:
             ref = m.get("@ref")
             if not ref:
                 continue
-            ref = os.path.realpath(ref)
+            ref = _mediainfo_key(ref)
 
             for track in m.get("track", []):
                 raw = track.get("Duration")
@@ -84,59 +150,32 @@ def _extract_mediainfo_durations(data:dict|list)->dict[str, float]:
                     continue
     return durations
 
-def get_audio_duration(filepath: str) -> float:
-    mediainfo = shutil.which("mediainfo")
-    cmd = [mediainfo, "--Output=JSON", filepath]
-    try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            check=True
+def get_audio_duration(filepath:str)->float:
+    """
+    Duration in seconds. Raises rather than returning 0.0 for an unreadable file: a
+    zero here does not look like an error to any caller, it looks like silence, and
+    every consumer (the assembly duration guard, VTT cue timing, the loudnorm
+    long-book branch) then draws a confidently wrong conclusion from it.
+    """
+    key = os.path.realpath(str(filepath))
+    durations = _mediainfo_durations([filepath])
+    if key not in durations:
+        raise RuntimeError(
+            f'get_audio_duration() mediainfo reported no duration for {filepath}'
         )
-        data = json.loads(result.stdout)
-        durations = _extract_mediainfo_durations(data)
-        return durations.get(os.path.realpath(filepath), 0.0)
-    except subprocess.CalledProcessError as e:
-        DependencyError(e)
-        return 0.0
-    except Exception as e:
-        print(f"get_audio_duration() Error: Failed to process {filepath}: {e}")
-        return 0.0
+    return durations[key]
 
 def get_audiolist_duration(filepaths:list[str])->dict[str, float]:
-    durations = {os.path.realpath(p): 0.0 for p in filepaths}
-    mediainfo = shutil.which("mediainfo")
-    # Windows CreateProcess caps the command line at 32767 chars (and POSIX has
-    # ARG_MAX), so one mediainfo invocation over a long file list dies there —
-    # batch the paths by cumulative command length instead.
-    max_cmd_len = 24000
-    batches = []
-    batch = []
-    batch_len = 0
-    for p in filepaths:
-        p_len = len(str(p)) + 3  # quotes + separator
-        if batch and batch_len + p_len > max_cmd_len:
-            batches.append(batch)
-            batch = []
-            batch_len = 0
-        batch.append(p)
-        batch_len += p_len
-    if batch:
-        batches.append(batch)
-    for batch in batches:
-        cmd = [mediainfo, "--Output=JSON", *batch]
-        try:
-            out = subprocess.check_output(cmd, text=True)
-            data = json.loads(out)
-            extracted = _extract_mediainfo_durations(data)
-            for path in durations:
-                if path in extracted:
-                    durations[path] = extracted[path]
-        except Exception as e:
-            error = f"get_audiolist_duration() Error: mediainfo failed on a batch of {len(batch)} files: {e}"
-            print(error)
-    return durations
+    """Duration of every path, keyed by realpath. Raises if any file is unreadable."""
+    durations = _mediainfo_durations(filepaths)
+    keys = [os.path.realpath(str(p)) for p in filepaths]
+    missing = [p for p, k in zip(filepaths, keys) if k not in durations]
+    if missing:
+        raise RuntimeError(
+            f'get_audiolist_duration() mediainfo reported no duration for '
+            f'{len(missing)} of {len(filepaths)} files, first: {missing[0]}'
+        )
+    return {k: durations[k] for k in keys}
 
 def normalize_audio(input_file:str, output_file:str, samplerate:int, is_gui_process:bool)->bool:
     filter_complex = (
