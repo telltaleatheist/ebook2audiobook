@@ -2426,14 +2426,38 @@ def normalize_text(text:str, lang:str, lang_iso1:str, tts_engine:str)->str:
     # Replace ok by 'Okay' — acoustic engines only; Orpheus reads book-exact text
     if tts_engine != TTS_ENGINES['ORPHEUS']:
         text = re.sub(r'\bok\b', 'Okay', text, flags=re.IGNORECASE)
-    # Escape special characters in the punctuation list for regex
+    # Reduce a RUN of consecutive punctuation to its last mark, followed by one space.
+    #
+    # The trailing space is withheld in two cases where it does real damage:
+    #
+    #  * before a CLOSING quote or bracket. The mark belongs to the sentence being
+    #    closed, so 'Get out!" he said' must not become 'Get out! " he said' — that
+    #    orphans the quote and is nowhere in any narrator's training transcripts.
+    #  * inside a DOTTED ACRONYM ('D.C.', 'C.I.A.'). The Orpheus branch above
+    #    deliberately skips de-dotting so these read book-exact; splitting them to
+    #    'D. C.' here silently undid that, and changes how they are spoken.
+    #
+    # Both were latent until 2026-07-28, masked by foreign2latin having already
+    # stripped the spaces this rule then re-inserted.
+    closing = '"\'’”»)]}'
+
+    def _collapse(m: re.Match) -> str:
+        mark = m.group(2)
+        src = m.string
+        nxt = src[m.end():m.end() + 1]
+        if nxt == '' or nxt in closing:
+            return mark
+        if mark == '.' and nxt.isalpha():
+            # a lone letter before the dot => acronym element (D.C., C.I.A.)
+            before = src[:m.start()].rstrip()
+            if len(before) >= 1 and before[-1].isalpha() and (len(before) < 2 or not before[-2].isalpha()):
+                return mark
+        return mark + ' '
+
     pattern = '|'.join(map(re.escape, punctuation_split_hard_set))
-    # Reduce multiple consecutive punctuations hard
-    text = re.sub(rf'(\s*({pattern})\s*)+', r'\2 ', text).strip()
-    # Escape special characters in the punctuation list for regex
+    text = re.sub(rf'(\s*({pattern})\s*)+', _collapse, text).strip()
     pattern = '|'.join(map(re.escape, punctuation_split_soft_set))
-    # Reduce multiple consecutive punctuations soft
-    text = re.sub(rf'(\s*({pattern})\s*)+', r'\2 ', text).strip()
+    text = re.sub(rf'(\s*({pattern})\s*)+', _collapse, text).strip()
     # Pattern 1: Add a space between UTF-8 characters and numbers.
     # NOT for Orpheus: its kept-digit forms ('1930s', '7th', '76ers') appear
     # exactly like that in the training transcripts — spacing them ('1930 s')
