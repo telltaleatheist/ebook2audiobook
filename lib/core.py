@@ -2442,7 +2442,15 @@ def normalize_text(text:str, lang:str, lang_iso1:str, tts_engine:str)->str:
     closing = '"\'’”»)]}'
 
     def _collapse(m: re.Match) -> str:
-        mark = m.group(2)
+        run = m.group(0).strip()
+        # ADJACENT marks are the author's punctuation, not junk: '...' is a hesitation,
+        # '?!' is an intonation, '!!' is emphasis. Collapsing them to the last mark
+        # threw all three away — and '...' -> '.' is the worst, because it converts a
+        # mid-clause pause into a SENTENCE BOUNDARY ('He paused. then spoke.').
+        # Marks separated by WHITESPACE (', ,' / '. .') are genuine junk and still
+        # collapse. The splitter does not need the collapse either way: it requires
+        # (?=\s|$) after a mark, so 'He paused... then' already splits after 'paused...'.
+        mark = run if (run and not any(c.isspace() for c in run)) else m.group(2)
         src = m.string
         nxt = src[m.end():m.end() + 1]
         if nxt == '' or nxt in closing:
