@@ -1286,6 +1286,70 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
             return None
         return len(clean) / seconds
 
+    def _reject_dir(self):
+        """Where a rejected render is kept for post-mortem.
+
+        OUTSIDE the session dir on purpose: BookForge deletes the whole scratch
+        session when a job finishes, which would take the evidence with it. Default
+        is a sibling of the session: <tmp>/tts_rejects/<ebook-uuid>/. Override with
+        ORPHEUS_REJECT_DIR to collect them somewhere permanent.
+        """
+        override = os.environ.get('ORPHEUS_REJECT_DIR', '').strip()
+        if override:
+            return override
+        proc = self.session.get('process_dir')
+        if not proc:
+            return None
+        ebook_dir = os.path.dirname(os.path.normpath(proc))   # <tmp>/ebook-<uuid>
+        tmp_root = os.path.dirname(ebook_dir)                 # <tmp>
+        if not tmp_root or not os.path.basename(ebook_dir):
+            return None
+        return os.path.join(tmp_root, 'tts_rejects', os.path.basename(ebook_dir))
+
+    def _keep_reject(self, sentence_index: int, clean: str, audio_np, reason: str, detail: dict = None):
+        """Preserve a render the guards threw away, plus WHY.
+
+        Without this a truncation is only ever a log line: the bad audio is
+        overwritten by the re-render, so there is no way to see WHERE it cut — mid
+        word, at a clause boundary, right after a number. Keeping it turns every
+        guard fire into a data point (Owen 2026-07-28, after chunk 1005 of Killing
+        America truncated at 55% of its correct length and the evidence was gone).
+
+        BEST-EFFORT BY DESIGN: this is diagnostics, not product. Any failure here is
+        reported and swallowed — losing a post-mortem must never take down a book.
+        """
+        try:
+            directory = self._reject_dir()
+            if not directory:
+                return
+            os.makedirs(directory, exist_ok=True)
+            stem = os.path.join(directory, f'{sentence_index:06d}_{reason}')
+            seconds = None
+            if audio_np is not None and len(audio_np) > 0:
+                wave = torch.from_numpy(np.asarray(audio_np)).float()
+                if wave.dim() == 1:
+                    wave = wave.unsqueeze(0)
+                torchaudio.save(stem + '.wav', wave, self.SAMPLE_RATE)
+                seconds = round(float(wave.shape[-1]) / self.SAMPLE_RATE, 3)
+            record = {
+                'sentence_index': sentence_index,
+                'reason': reason,                 # 'short' | 'empty' | 'cap'
+                'chars': len(clean),
+                'audio_seconds': seconds,
+                'chars_per_second': round(len(clean) / seconds, 2) if seconds else None,
+                'voice': self.session.get('fine_tuned'),
+                'model_dir': self.session.get('orpheus_model_dir'),
+                'max_audio_tokens': self.MAX_AUDIO_TOKENS,
+                'text': clean,
+            }
+            if detail:
+                record.update(detail)
+            import json as _json
+            with open(stem + '.json', 'w', encoding='utf-8') as handle:
+                _json.dump(record, handle, indent=1, ensure_ascii=False)
+        except Exception as err:
+            print(f'Orpheus: could not keep the rejected render for sentence {sentence_index} ({err})')
+
     def _guard_truncation(self, sentence_index: int, clean: str, audio_np, resplit):
         """Backstop for silent early-EOS truncation (see _speech_rate). If the
         rendered clip is too short for the text, re-render it split at sentence
@@ -1344,6 +1408,7 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
         """
         if (audio_np is None or len(audio_np) == 0) and clean and clean.strip():
             print(f"Orpheus: sentence {sentence_index} produced no audio — re-rendering split at sentence boundaries")
+            self._keep_reject(sentence_index, clean, audio_np, 'empty')
             return 'empty'
         env_rate = float(os.environ.get('ORPHEUS_MAX_CHARS_PER_SEC', '19.0'))
         # A disabled guard (env <= 0) stays disabled — the ratchet must NEVER
@@ -1356,6 +1421,9 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
             return None
         print(f"Orpheus: sentence {sentence_index} audio too short for text "
               f"({rate:.1f} ch/s > {max_rate:.1f}) — re-rendering split at sentence boundaries")
+        self._keep_reject(sentence_index, clean, audio_np, 'short',
+                          {'measured_chars_per_second': round(rate, 2),
+                           'threshold_chars_per_second': round(max_rate, 2)})
         return 'short'
 
     def _ratchet_after_resplit(self, clean: str, audio_np) -> None:
@@ -1589,6 +1657,15 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
                             # and the audio would be clipped. Re-render it split at sentence
                             # boundaries so nothing is cut off.
                             print(f"Orpheus: sentence {idx} hit the audio-token cap; re-rendering split at sentence boundaries")
+                            # Keep the RUNAWAY itself before the re-render overwrites it:
+                            # this is the one failure that never leaves evidence otherwise.
+                            try:
+                                capped_np = self._tokens_to_audio(tokens)
+                            except Exception:
+                                capped_np = None
+                            self._keep_reject(idx, clean, capped_np, 'cap',
+                                              {'tokens_emitted': len(tokens),
+                                               'token_cap': self.MAX_AUDIO_TOKENS})
                             audio_np = self._generate_audio_vllm_safe(clean)
                         # Backstop a silent early-EOS truncation (clean EOS, audio too
                         # short for the text) that the cap check above can't catch.
@@ -1725,6 +1802,19 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
                                 # Hit the token cap without finishing → the audio would be
                                 # clipped. Re-render split at sentence boundaries instead.
                                 print(f"Orpheus: sentence {idx} hit the MLX audio-token cap; re-rendering split at sentence boundaries")
+                                # Keep the runaway before the re-render replaces it (see
+                                # _keep_reject); same evidence problem as the vLLM path.
+                                try:
+                                    ids = mx.array([ptoks + out[uid]])
+                                    code_lists = self.mlx_model.parse_output(ids)
+                                    capped = np.array(decode_audio_from_codes(code_lists[0])[0],
+                                                      dtype=np.float32) if code_lists and len(code_lists[0]) > 0 else None
+                                except Exception:
+                                    capped = None
+                                self._keep_reject(idx, clean, capped, 'cap',
+                                                  {'tokens_emitted': len(out[uid]),
+                                                   'token_cap': self.MLX_MAX_TOKENS,
+                                                   'backend': 'mlx'})
                                 audio = self._generate_mlx_safe(clean)
                                 results[idx] = self._save_audio(idx, audio, gap[0], gap[1])
                                 continue
