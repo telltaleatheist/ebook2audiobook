@@ -2448,9 +2448,14 @@ def normalize_text(text:str, lang:str, lang_iso1:str, tts_engine:str)->str:
         if nxt == '' or nxt in closing:
             return mark
         if mark == '.' and nxt.isalpha():
-            # a lone letter before the dot => acronym element (D.C., C.I.A.)
+            # Inside an acronym the dot is followed by a LONE letter that itself
+            # carries a dot ('D.C.', 'C.I.A.'). At the acronym's END the next word is
+            # ordinary ('D.C. in'), and that space must survive — checking only the
+            # letter BEFORE the dot cannot tell those apart and swallowed it.
             before = src[:m.start()].rstrip()
-            if len(before) >= 1 and before[-1].isalpha() and (len(before) < 2 or not before[-2].isalpha()):
+            lone_before = (len(before) >= 1 and before[-1].isalpha()
+                           and (len(before) < 2 or not before[-2].isalpha()))
+            if lone_before and re.match(r'[^\W\d_]\.', src[m.end():]):
                 return mark
         return mark + ' '
 
