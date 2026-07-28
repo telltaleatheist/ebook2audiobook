@@ -18,6 +18,17 @@ voices/__sessions/
 
 # Runtime logs
 logs/
+conversion.log
+
+# Gradio's serve cache — copies of every file passed through the web UI, plus its
+# resampled derivatives. Regenerated on demand; never repo content.
+/.cache/
+
+# ebooks/ is the drop folder for input books, so anything left there after a run
+# dirties the tree. The test fixtures under ebooks/tests/ stay tracked.
+/ebooks/*
+!/ebooks/.gitkeep
+!/ebooks/tests/
 
 # Benchmark harness output (bench_orpheus_mlx.py / bench_validate_real.py)
 bench_*.log
