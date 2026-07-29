@@ -149,6 +149,32 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
     # length (see _mlx_length_buckets). Override with ORPHEUS_MLX_BUCKET_RATIO.
     MLX_BUCKET_LEN_RATIO = float(os.environ.get('ORPHEUS_MLX_BUCKET_RATIO', '1.5'))
 
+    # How many BATCH_SIZE chunks the worker POOLS before handing them to
+    # convert_batch() on the MLX backend (see the batch_pool_size property).
+    #
+    # WHY (measured regression, 2026-07): length-bucketing alone tanked MLX
+    # throughput from ~28 sent/min to ~12. The worker flushed exactly BATCH_SIZE
+    # (96) sentences per call, and a real book's prompt-length spread fragments
+    # those 96 rows into ~4 buckets of 13-42 rows. Each bucket is its own
+    # sequential full decode, so effective batch width — the ONLY thing that buys
+    # MLX throughput (12.4 sent/min at B=16 vs 27-28 at B=96) — collapsed by ~2.5x.
+    # Bucketing is NOT the thing to remove (mixed-length prefills corrupt short
+    # rows); the fix is to bucket over a BIGGER POOL. With 4x96 = 384 sentences in
+    # hand, each near-uniform length band has enough members to fill a full-width
+    # batch, and _mlx_batch_groups then caps every generated batch at BATCH_SIZE
+    # so peak memory is unchanged (~0.153 GB per batch slot). The pool itself is
+    # just text + token lists — negligible bytes.
+    #
+    # Why 4 and not more: the bucket COUNT has a floor set by the length spread
+    # (log_1.5(longest/shortest) ≈ 6-7 bands on a real book), so widths grow with
+    # the pool and then flatten. Simulated over a 2000-sentence book at
+    # BATCH_SIZE=96 (rows-weighted mean batch width / total batches):
+    # mult 1 = 34.7 / 124, 2 = 49.0 / 76, 4 = 63.0 / 49, 8 = 70.1 / 34,
+    # 16 = 77.4 / 29. Mult 4 takes the knee; higher mults buy little width but
+    # coarsen progress reporting and enlarge the work a cooperative stop discards.
+    # Override with ORPHEUS_MLX_BATCH_POOL (1 = old flush-per-batch behavior).
+    MLX_BATCH_POOL_MULT = int(os.environ.get('ORPHEUS_MLX_BATCH_POOL', '4'))
+
     # Max audio tokens per generation. ~8 audio tokens/char, so ~3700 covers the
     # ~450-char multi-sentence chunks core.py now feeds Orpheus while staying under
     # the 4096 model context (prompt + audio). A chunk that would exceed this is
@@ -797,6 +823,52 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
             buckets.append(cur)
         return buckets
 
+    @property
+    def batch_pool_size(self) -> int:
+        """How many sentences the worker should accumulate before calling
+        convert_batch(). BATCH_SIZE everywhere except the MLX backend, where the
+        caller pools MLX_BATCH_POOL_MULT x BATCH_SIZE so _mlx_batch_groups has a
+        deep enough pool to rebuild full-width length buckets (see
+        MLX_BATCH_POOL_MULT). vLLM keeps flushing at BATCH_SIZE: it does its own
+        internal continuous batching and its memory profile is sized around the
+        chunk it is handed."""
+        width = max(1, int(self.BATCH_SIZE or 1))
+        if self.backend == 'mlx':
+            return width * max(1, int(self.MLX_BATCH_POOL_MULT or 1))
+        return width
+
+    def _mlx_batch_groups(self, entries: list) -> list:
+        """entries: list of (key, prompt_token_list, payload). Returns the list of
+        batches to actually feed BatchGenerator: length buckets
+        (_mlx_length_buckets, the padding-safety invariant) capped at BATCH_SIZE
+        rows each (the memory invariant, ~0.153 GB of KV+activations per slot).
+
+        Callers pool several BATCH_SIZE chunks before getting here (see
+        MLX_BATCH_POOL_MULT), so buckets routinely come back WIDER than one batch;
+        without this cap a pooled call would build one oversized BatchGenerator and
+        blow past the measured memory envelope.
+
+        Oversized buckets are split EVENLY, not into [width, width, remainder]: a
+        bucket's rows are length-uniform by construction, so every sub-batch takes
+        roughly the same wall time regardless of width, and the batch COUNT is what
+        costs. 100 rows at width 96 is 2 batches either way — 50+50 just runs them
+        at lower peak memory than 96+4."""
+        width = max(1, int(self.BATCH_SIZE or 1))
+        groups = []
+        for bucket in self._mlx_length_buckets(entries):
+            n = len(bucket)
+            if n <= width:
+                groups.append(bucket)
+                continue
+            parts = -(-n // width)  # ceil: fewest sub-batches that all fit
+            base, extra = divmod(n, parts)
+            pos = 0
+            for p in range(parts):
+                size = base + (1 if p < extra else 0)
+                groups.append(bucket[pos:pos + size])
+                pos += size
+        return groups
+
     def _generate_mlx_batch_audio(self, texts: list) -> list:
         """Batch-generate raw audio for many (already-cleaned) sentences in ONE
         MLX BatchGenerator pass — continuous batching, ~3.6x the per-sentence
@@ -826,11 +898,12 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
             return results
         # Group prompts into near-uniform-length buckets so no BatchGenerator
         # prefill row gets heavy left-padding (mixed lengths → stochastic short-
-        # row gibberish; see _mlx_length_buckets). Each bucket is its own
-        # BatchGenerator; the model stays loaded so extra prefills are cheap. One
-        # bad bucket must not kill the rest, so each is wrapped independently
-        # (matching the old whole-batch try/except granularity).
-        for bucket in self._mlx_length_buckets(gen):
+        # row gibberish; see _mlx_length_buckets), each capped at BATCH_SIZE rows
+        # (_mlx_batch_groups). Each group is its own BatchGenerator; the model
+        # stays loaded so extra prefills are cheap. One bad group must not kill
+        # the rest, so each is wrapped independently (matching the old whole-batch
+        # try/except granularity).
+        for bucket in self._mlx_batch_groups(gen):
             try:
                 bg = BatchGenerator(
                     self.mlx_model,
@@ -1602,6 +1675,11 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
         ~len(book)/BATCH_SIZE calls, which avoids the steady host-RAM growth the
         per-call path caused over a long book. MLX has its own batched path
         (_convert_mlx_batch); transformers falls back to per-item convert().
+
+        `items` is BATCH_SIZE long on vLLM but batch_pool_size long on MLX (a pool
+        of several BATCH_SIZE chunks — see MLX_BATCH_POOL_MULT); _convert_mlx_batch
+        re-splits the pool itself, so neither backend sees a wider batch than
+        BATCH_SIZE.
         """
         if self.backend == 'mlx' and self.mlx_model:
             return self._convert_mlx_batch(items)
@@ -1731,7 +1809,15 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
         would grow unbounded (~46 GB over one chunk) if not limited — bounded
         once at load via mx.set_cache_limit (_load_mlx_engine), NOT by per-chunk
         flushes. Throughput: 12.4 sent/min at B=16 → 27-28 at B=96 (the knee;
-        B=128 is slower). Sampling follows the class constants
+        B=128 is slower) — i.e. throughput is bought by BATCH WIDTH, which is why
+        `items` is a POOL of several BATCH_SIZE chunks (batch_pool_size /
+        MLX_BATCH_POOL_MULT) rather than exactly one: length bucketing over a
+        96-row chunk fragments it into ~13-42-row buckets on real books and gives
+        back ~12 sent/min, while bucketing over ~384 pooled rows refills near-full
+        batches. _mlx_batch_groups then caps each generated batch at BATCH_SIZE, so
+        the memory numbers above are unchanged by pooling.
+
+        Sampling follows the class constants
         (TEMPERATURE/TOP_P/MIN_P/REP_PENALTY) like the vLLM paths — except
         min_p, which the single-seq MLX path (_generate_mlx) can't apply
         (mlx_audio's generate doesn't plumb it; see the MIN_P comment).
@@ -1759,11 +1845,13 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
 
             # Group prompts into near-uniform-length buckets so no BatchGenerator
             # prefill row gets heavy left-padding (mixed lengths → stochastic
-            # short-row gibberish; see _mlx_length_buckets). Each bucket is its own
-            # BatchGenerator; the model stays loaded so the extra prefills are cheap
-            # relative to generation. A lone short heading falls into its own
-            # bucket of 1 == the proven-clean solo path.
-            for bucket in self._mlx_length_buckets(gen):
+            # short-row gibberish; see _mlx_length_buckets), then cap each bucket at
+            # BATCH_SIZE rows so a pooled call can't build an oversized batch
+            # (_mlx_batch_groups). Each group is its own BatchGenerator; the model
+            # stays loaded so the extra prefills are cheap relative to generation.
+            # A lone short heading falls into its own group of 1 == the proven-clean
+            # solo path.
+            for bucket in self._mlx_batch_groups(gen):
                 try:
                     bg = BatchGenerator(
                         self.mlx_model,

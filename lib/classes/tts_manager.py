@@ -33,6 +33,20 @@ class TTSManager:
     def batch_size(self) -> int:
         return int(getattr(self.engine, 'BATCH_SIZE', 1) or 1)
 
+    @property
+    def batch_pool_size(self) -> int:
+        """How many sentences the caller should accumulate before calling
+        convert_sentences_batch(). Defaults to batch_size; an engine may ask for a
+        DEEPER pool (Orpheus/MLX does, so its internal length-bucketing has enough
+        rows to rebuild full-width batches) while still capping the batches it
+        actually runs. Never smaller than batch_size."""
+        pool = getattr(self.engine, 'batch_pool_size', None)
+        try:
+            pool = int(pool or 0)
+        except (TypeError, ValueError):
+            pool = 0
+        return max(self.batch_size, pool)
+
     def convert_sentences_batch(self, items: list) -> list:
         """items: list of (sentence_index, sentence). Returns list[bool] aligned to items."""
         return self.engine.convert_batch(items)

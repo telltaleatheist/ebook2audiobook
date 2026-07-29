@@ -433,8 +433,21 @@ def run_worker_tts(
             use_batch = tts_manager.supports_batch and tts_manager.batch_size > 1
             if use_batch:
                 batch_size = tts_manager.batch_size
+                # Flush threshold. Usually == batch_size, but an engine may request a
+                # deeper POOL: Orpheus on MLX buckets a batch by prompt length before
+                # generating (padding safety), and bucketing exactly batch_size rows
+                # shatters them into part-width batches — which is where MLX throughput
+                # lives (~12 vs ~28 sent/min). Pooling several batches' worth lets it
+                # rebuild full-width buckets; it still caps each generated batch at
+                # batch_size, so peak memory is unchanged. vLLM keeps flushing at
+                # batch_size (it does its own continuous batching internally).
+                pool_size = max(batch_size, getattr(tts_manager, 'batch_pool_size', batch_size))
                 if take == 0:
-                    print(f"[WORKER] Batched inference enabled (batch size {batch_size})")
+                    if pool_size != batch_size:
+                        print(f"[WORKER] Batched inference enabled (batch size {batch_size}, "
+                              f"pooling {pool_size} sentences per call)")
+                    else:
+                        print(f"[WORKER] Batched inference enabled (batch size {batch_size})")
                 first_logged = False
                 pending = []  # (sentence_index, sentence)
 
@@ -442,6 +455,11 @@ def run_worker_tts(
                     nonlocal processed, first_logged
                     if not pending:
                         return
+                    # in_flight covers the WHOLE pending flush: a cooperative stop
+                    # deletes these outputs so resume re-renders them cleanly. With a
+                    # pool the flush is larger, so a stop discards a bit more finished
+                    # work — correctness is unaffected (they're just re-rendered), and
+                    # the engine gives no per-row completion signal to narrow it.
                     in_flight[:] = [idx for idx, _ in pending]
                     results = tts_manager.convert_sentences_batch(pending)
                     in_flight.clear()
@@ -477,7 +495,7 @@ def run_worker_tts(
                         processed += 1
                         continue
                     pending.append((i, sentence))
-                    if len(pending) >= batch_size:
+                    if len(pending) >= pool_size:
                         _flush_batch()
                 _flush_batch()
             else:
