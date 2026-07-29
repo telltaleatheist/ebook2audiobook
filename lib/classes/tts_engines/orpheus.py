@@ -190,6 +190,21 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
     # (_mlx_token_budget), where a larger value is the safe direction.
     TOKENS_PER_AUDIO_SECOND = 84
 
+    # Truncation-guard rate, in characters of TEXT per second of AUDIO: above this,
+    # the audio is too short for the text and the chunk is re-rendered split
+    # (_needs_resplit). 19.0 is e2a's documented default for an UNCATALOGUED voice;
+    # a catalogued one is given its own value through ORPHEUS_MAX_CHARS_PER_SEC
+    # (BookForge passes e.g. 23.5 for deathstalker), and 0 disables the guard.
+    #
+    # This is the DEFAULT only — never the live value. Read it through
+    # _max_chars_per_sec(), which re-reads the environment on EVERY call: the
+    # resident streaming worker switches voices in-process and rewrites this env var
+    # per voice (electron/scripts/orpheus_stream.py _apply_voice_caps), so a value
+    # captured at import or construction would pin the first voice's threshold onto
+    # every later one. The constant exists so the 19.0 literal lives in exactly one
+    # place instead of being repeated at each of the three call sites.
+    DEFAULT_MAX_CHARS_PER_SEC = '19.0'
+
     # Sampling params at the Orpheus reference values. The spurious leading-syllable
     # artifact once chased here (cooling temperature to 0.5 only flattened prosody and
     # didn't remove it) was a prompt-framing bug — a stray BOS in the vLLM prompt,
@@ -696,6 +711,17 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
             traceback.print_exc()
             raise ValueError(error)
 
+    @classmethod
+    def _max_chars_per_sec(cls) -> float:
+        """The truncation guard's chars/sec threshold, read fresh from the env.
+
+        Single source for both the env var name and its default (see
+        DEFAULT_MAX_CHARS_PER_SEC). Callers keep the '<= 0 disables the guard'
+        semantics themselves — this returns whatever was configured, including 0,
+        rather than deciding for them.
+        """
+        return float(os.environ.get('ORPHEUS_MAX_CHARS_PER_SEC', cls.DEFAULT_MAX_CHARS_PER_SEC))
+
     def _mlx_token_budget(self, text: str) -> int:
         """Per-chunk MLX max_tokens CEILING sized from the text length, so a short
         repetition-primed chunk can't burn the flat MLX_MAX_TOKENS looping one
@@ -711,7 +737,7 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
         slow narration, so we only ever go slower than 12, never faster. The 1.4
         factor is head-room over that worst case — only a runaway (many times the
         text's real token count) exceeds it."""
-        env_rate = float(os.environ.get('ORPHEUS_MAX_CHARS_PER_SEC', '19.0'))
+        env_rate = self._max_chars_per_sec()
         chars_per_sec_floor = min(env_rate, 12.0) if env_rate > 0 else 12.0
         return math.ceil(len(text) / chars_per_sec_floor * self.TOKENS_PER_AUDIO_SECOND * 1.4)
 
@@ -1471,9 +1497,10 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
         splits eagerly before rendering, so the MLX callers pass it as-is.
 
         Guard applies only when clean length > 150 chars (short chunks' rates are
-        noisy) and ORPHEUS_MAX_CHARS_PER_SEC > 0 (default 19.0; set 0 to disable).
+        noisy) and ORPHEUS_MAX_CHARS_PER_SEC > 0 (DEFAULT_MAX_CHARS_PER_SEC when
+        unset; set 0 to disable). Read via _max_chars_per_sec().
 
-        SELF-CALIBRATING RATCHET (self._rate_ceiling): the 19.0 default was
+        SELF-CALIBRATING RATCHET (self._rate_ceiling): that default was
         calibrated on ~15-17 ch/s voices; a faster fine-tune (e.g. one that
         naturally reads ~20 ch/s) trips the guard on every long healthy chunk,
         each false positive costing a full wasted serialized re-render. But the
@@ -1518,7 +1545,7 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
             print(f"Orpheus: sentence {sentence_index} produced no audio — re-rendering split at sentence boundaries")
             self._keep_reject(sentence_index, clean, audio_np, 'empty')
             return 'empty'
-        env_rate = float(os.environ.get('ORPHEUS_MAX_CHARS_PER_SEC', '19.0'))
+        env_rate = self._max_chars_per_sec()
         # A disabled guard (env <= 0) stays disabled — the ratchet must NEVER
         # resurrect it. Only past this gate does the session ceiling apply.
         if env_rate <= 0 or len(clean) <= 150:
@@ -1542,7 +1569,7 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
         ceiling (never lower it) so subsequent healthy fast chunks stop tripping.
         Only ever called for a 'short' verdict — an 'empty' one carries no rate signal.
         """
-        env_rate = float(os.environ.get('ORPHEUS_MAX_CHARS_PER_SEC', '19.0'))
+        env_rate = self._max_chars_per_sec()
         if env_rate <= 0:
             return
         max_rate = max(env_rate, self._rate_ceiling)
@@ -1883,7 +1910,8 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
             # batch prefills, so a short heading batched next to packed prose is
             # safe. Each group is its own BatchGenerator; the model stays loaded so
             # the extra prefills are cheap relative to generation.
-            for bucket, depth in self._mlx_batch_groups(gen):
+            groups = self._mlx_batch_groups(gen)
+            for group_no, (bucket, depth) in enumerate(groups, 1):
                 try:
                     bg = BatchGenerator(
                         self.mlx_model,
@@ -1901,25 +1929,55 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
                     # Heartbeat: a long MLX batch is otherwise SILENT for minutes, which
                     # the BookForge worker watchdog reads as "stuck" and false-kills the
                     # worker (its GENERATION_ACTIVITY_RE only knew vLLM's tqdm). Emit a
-                    # throttled liveness line (~every 15 s) carrying real token progress —
-                    # keeps the watchdog fresh AND gives visibility into the silent batch.
+                    # throttled liveness line carrying real progress — it keeps the
+                    # watchdog fresh AND is the ONLY thing the queue UI can draw a
+                    # within-batch progress bar from (the rendered files all land at
+                    # once when the batch ends, so the chunk bar is frozen until then).
+                    #
+                    # Payload, in the one order that keeps BOTH directions compatible:
+                    #   [ORPHEUS] MLX batch generating: 95 rows, ~1259 tokens
+                    #             (step 1260/3400), 12/95 rows done, batch 1/2
+                    # The leading "<N> rows, ~<T> tokens" is byte-identical to the old
+                    # line, so an OLD BookForge (whose regex ends there) still parses a
+                    # NEW fork; everything after is additive, so a NEW BookForge reads
+                    # the extra fields when they're there and degrades to token-only
+                    # progress when they aren't. `rows done` counts rows RETIRED
+                    # (finish_reason set — 'stop' or the 'length' cap), which each row
+                    # reports exactly once before BatchGenerator filters it out of the
+                    # live set: monotone, and exact at completion. step/depth is the
+                    # token-depth bound the width derivation used, so a fraction is
+                    # computable before any row has retired.
+                    #
+                    # Interval is 10 s, down from 15: the line is now a UI progress
+                    # source, not just a liveness ping, and 10 s is under the "is it
+                    # frozen?" threshold while still costing ~36 log lines per 6-minute
+                    # batch. The watchdog (12 min) has an enormous margin either way.
                     import time as _time
                     _step = 0
-                    _last_hb = _time.time()
+                    _retired = 0
+                    _HB_SECONDS = 10.0
+                    _last_hb = 0.0  # 0 → the first generated step prints immediately
                     # 0.31.3: next() returns (prompt_responses, generation_responses),
                     # so `while responses := bg.next()` would never terminate.
                     # next_generated() yields just the generation list and returns
                     # empty once every row has retired.
                     while responses := bg.next_generated():
                         _step += 1
-                        if _time.time() - _last_hb >= 15.0:
-                            _maxtok = max((len(v) for v in out.values()), default=0)
-                            print(f"[ORPHEUS] MLX batch generating: {len(bucket)} rows, "
-                                  f"~{_maxtok} tokens (step {_step})", flush=True)
-                            _last_hb = _time.time()
                         for r in responses:
+                            if r.finish_reason is not None:
+                                # 'stop' (EOS matched) or 'length' (hit max_tokens) —
+                                # either way this row is done and won't be seen again.
+                                _retired += 1
                             if r.finish_reason != 'stop':  # stop token (128258) is dropped
                                 out[r.uid].append(r.token)
+                        _now = _time.time()
+                        if _now - _last_hb >= _HB_SECONDS:
+                            _maxtok = max((len(v) for v in out.values()), default=0)
+                            print(f"[ORPHEUS] MLX batch generating: {len(bucket)} rows, "
+                                  f"~{_maxtok} tokens (step {_step}/{depth}), "
+                                  f"{_retired}/{len(bucket)} rows done, "
+                                  f"batch {group_no}/{len(groups)}", flush=True)
+                            _last_hb = _now
                     bg.close()
                     # uids come back in insert order == bucket order.
                     for (idx, ptoks, (clean, gap), _budget), uid in zip(bucket, uids):
