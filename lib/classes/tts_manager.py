@@ -37,9 +37,10 @@ class TTSManager:
     def batch_pool_size(self) -> int:
         """How many sentences the caller should accumulate before calling
         convert_sentences_batch(). Defaults to batch_size; an engine may ask for a
-        DEEPER pool (Orpheus/MLX does, so its internal length-bucketing has enough
-        rows to rebuild full-width batches) while still capping the batches it
-        actually runs. Never smaller than batch_size."""
+        DEEPER pool and re-slice it internally while still capping the batches it
+        actually runs. Never smaller than batch_size. (Orpheus/MLX used to ask for
+        4x so length-bucketing could rebuild full-width batches; bucketing and the
+        pool both went away when mlx-lm 0.31.3 fixed batch prefill padding.)"""
         pool = getattr(self.engine, 'batch_pool_size', None)
         try:
             pool = int(pool or 0)

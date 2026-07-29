@@ -433,14 +433,12 @@ def run_worker_tts(
             use_batch = tts_manager.supports_batch and tts_manager.batch_size > 1
             if use_batch:
                 batch_size = tts_manager.batch_size
-                # Flush threshold. Usually == batch_size, but an engine may request a
-                # deeper POOL: Orpheus on MLX buckets a batch by prompt length before
-                # generating (padding safety), and bucketing exactly batch_size rows
-                # shatters them into part-width batches — which is where MLX throughput
-                # lives (~12 vs ~28 sent/min). Pooling several batches' worth lets it
-                # rebuild full-width buckets; it still caps each generated batch at
-                # batch_size, so peak memory is unchanged. vLLM keeps flushing at
-                # batch_size (it does its own continuous batching internally).
+                # Flush threshold. An engine may ask for a POOL deeper than its batch
+                # size and re-slice internally; it never generates a batch wider than
+                # batch_size. No engine currently asks for one (Orpheus/MLX used to,
+                # to refill length buckets — both are gone since mlx-lm 0.31.3 fixed
+                # batch prefill padding), so this is generic plumbing, not a live
+                # behaviour. Absent/smaller values collapse to batch_size.
                 pool_size = max(batch_size, getattr(tts_manager, 'batch_pool_size', batch_size))
                 if take == 0:
                     if pool_size != batch_size:
