@@ -131,7 +131,8 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
     # Max audio tokens per MLX batched generation. Rows that hit this cap without
     # emitting the end-of-audio token would ship CLIPPED audio; the batch paths
     # detect that and re-render the row split at sentence boundaries
-    # (_generate_mlx_safe), mirroring the vLLM ladder below.
+    # (_generate_mlx_safe with force_split, the cap being already proven),
+    # mirroring the vLLM ladder below.
     #
     # 3700 matches MAX_AUDIO_TOKENS (the vLLM cap): ~8 audio tokens/char means the
     # ~450-char packed chunks need ~2500-3400 tokens, so the old 2048 default made
@@ -785,34 +786,83 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
             if len(audio_data) > 0:
                 segments.append(audio_data)
 
+        if not segments:
+            return np.zeros(0, dtype=np.float32)
+        audio = segments[0] if len(segments) == 1 else np.concatenate(segments)
+
         # Visibility: log only when the budget was the binding cap AND generation
         # ran right up to it — an actual runaway-shaped truncation, not a chunk
         # that finished early. tokens-emitted is ESTIMATED from audio duration
-        # (mlx_audio's generate() doesn't surface a token count).
-        if effective_max < max_tokens and segments:
-            est_tokens = sum(len(s) for s in segments) / self.SAMPLE_RATE * self.TOKENS_PER_AUDIO_SECOND
+        # (_mlx_est_tokens; mlx_audio's generate() doesn't surface a token count).
+        if effective_max < max_tokens:
+            est_tokens = self._mlx_est_tokens(audio)
             if est_tokens >= effective_max * 0.95:
                 idx_str = '' if sentence_index is None else f'sentence {sentence_index}: '
                 print(f"[ORPHEUS] {idx_str}MLX per-chunk token budget truncated generation "
                       f"(len={len(text)}, budget={effective_max}, ~{int(est_tokens)} tokens emitted)")
 
-        if not segments:
-            return np.zeros(0, dtype=np.float32)
-        return segments[0] if len(segments) == 1 else np.concatenate(segments)
+        return audio
 
-    def _generate_mlx_safe(self, clean: str, depth: int = 0) -> np.ndarray:
-        """Render a sentence whose batched MLX generation hit the token cap:
-        split at sentence/space boundaries and render each part on its own,
-        concatenating the audio so nothing is clipped — the MLX sibling of
-        _generate_audio_vllm_safe. Recurses a couple of levels for unusually
-        dense text; a part that still can't finish is accepted as-is (same
-        bottom rung as the vLLM ladder)."""
+    def _mlx_est_tokens(self, audio) -> float:
+        """Audio tokens the model must have emitted to produce `audio`, ESTIMATED
+        from its duration — mlx_audio's generate() surfaces no token count, so
+        duration x TOKENS_PER_AUDIO_SECOND is the only signal available. One home
+        for the arithmetic (_generate_mlx's budget log and _mlx_looks_capped)."""
+        if audio is None or len(audio) == 0:
+            return 0.0
+        return len(audio) / self.SAMPLE_RATE * self.TOKENS_PER_AUDIO_SECOND
+
+    def _mlx_looks_capped(self, clean: str, audio) -> bool:
+        """True when a whole-text MLX render ran right up to its token cap, i.e. it
+        was almost certainly CUT mid-sentence rather than finishing — the MLX
+        stand-in for the vLLM ladder's `END_OF_AUDIO_TOKEN in tokens` check, which
+        has no MLX equivalent. The cap is the one _generate_mlx would have applied:
+        min(MLX_MAX_TOKENS, the per-chunk anti-runaway budget); 0.95 of it is
+        'ran to the end' allowing for the estimate's slop.
+
+        EMPTY audio is NOT capped (estimate 0): an empty render is a FAILED render
+        (_guard_truncation's job), not a too-long one, and splitting it would only
+        multiply the failure."""
+        cap = min(self.MLX_MAX_TOKENS, self._mlx_token_budget(clean))
+        return self._mlx_est_tokens(audio) >= cap * 0.95
+
+    def _generate_mlx_safe(self, clean: str, depth: int = 0, force_split: bool = False) -> np.ndarray:
+        """The safe general-purpose SOLO MLX render — MLX sibling of
+        _generate_audio_vllm_safe. Renders `clean` WHOLE first; only if that render
+        hit the token cap (_mlx_looks_capped — it would ship clipped) does it split
+        at the nearest sentence/space boundary and render each half, concatenating
+        the audio. Recurses up to a small depth so even an unusually dense chunk
+        produces complete, un-clipped audio; a part that still can't finish is
+        accepted as-is (same bottom rung as the vLLM ladder).
+
+        It used to split EAGERLY — every text >= 80 chars was halved BEFORE any
+        render — which was harmless for its original proven-cap callers but wrong
+        for the streamed opener, which renders each play action's first sentence
+        through here: every half was voiced as a standalone utterance, so an
+        ordinary sentence came out with a mid-sentence pause and sentence-final
+        prosody. Callers that have already proven the whole render fails ask for the
+        old behaviour explicitly, with force_split.
+
+        force_split=True skips the whole-chunk render and splits IMMEDIATELY, for
+        callers whose whole render ALREADY failed — a proven token-cap hit, or
+        _guard_truncation's clean early EOS. Re-rendering the whole text would very
+        likely fail the same way, and (for a clean early EOS) the accept rung below
+        would then return it unsplit: a re-roll, not a fix. Parts recurse WITHOUT
+        force_split (the normal cap logic applies to them); text that can't be split
+        (parts < 2) falls through to a normal whole render.
+        """
         import numpy as np
-        if depth >= 3 or len(clean) < 80:
-            return self._generate_mlx(clean, max_tokens=self.MLX_MAX_TOKENS)
+        if force_split:
+            parts = self._split_long_text(clean, max_length=max(60, len(clean) // 2))
+            if len(parts) >= 2:
+                return np.concatenate([self._generate_mlx_safe(p, depth + 1) for p in parts])
+        audio = self._generate_mlx(clean, max_tokens=self.MLX_MAX_TOKENS)
+        # Accept what we have once it fits, can't be split sensibly, or we've recursed enough.
+        if not self._mlx_looks_capped(clean, audio) or depth >= 3 or len(clean) < 80:
+            return audio
         parts = self._split_long_text(clean, max_length=max(60, len(clean) // 2))
         if len(parts) < 2:
-            return self._generate_mlx(clean, max_tokens=self.MLX_MAX_TOKENS)
+            return audio
         return np.concatenate([self._generate_mlx_safe(p, depth + 1) for p in parts])
 
     @property
@@ -988,7 +1038,9 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
                             # Cap hit without finishing — re-render split so the
                             # played audio is never clipped mid-sentence.
                             print(f"Orpheus: stream sentence [{i}] hit the MLX audio-token cap; re-rendering split")
-                            results[i] = self._generate_mlx_safe(clean)
+                            # force_split: the cap hit is PROVEN, so skip the whole
+                            # re-render _generate_mlx_safe would otherwise try first.
+                            results[i] = self._generate_mlx_safe(clean, force_split=True)
                             continue
                         ids = mx.array([ptoks + out[uid]])
                         code_lists = self.mlx_model.parse_output(ids)
@@ -1491,10 +1543,10 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
         takes the clean text and returns a numpy waveform — and it must ACTUALLY
         split, not merely re-render: the failure detected here is a CLEAN early
         EOS, so a whole-chunk re-render would most likely clean-EOS (truncated)
-        again. The vLLM callers therefore pass _generate_audio_vllm_safe with
-        force_split=True (its plain form accepts any clean EOS unsplit — that's
-        correct for its token-cap callers, useless here); _generate_mlx_safe
-        splits eagerly before rendering, so the MLX callers pass it as-is.
+        again. Both backends' callers therefore pass their ladder with
+        force_split=True — the plain form renders the whole text first and accepts
+        it when it finishes cleanly, which is correct for its token-cap callers but
+        useless here (it would just re-roll the same clean early EOS).
 
         Guard applies only when clean length > 150 chars (short chunks' rates are
         noisy) and ORPHEUS_MAX_CHARS_PER_SEC > 0 (DEFAULT_MAX_CHARS_PER_SEC when
@@ -1643,7 +1695,13 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
             try:
                 if self.backend == 'mlx':
                     audio_np = self._generate_mlx(clean, sentence_index=sentence_index)
-                    audio_np = self._guard_truncation(sentence_index, clean, audio_np, self._generate_mlx_safe)
+                    # Backstop a silent early-EOS truncation (audio too short for text).
+                    # force_split: a whole-chunk re-render would just clean-EOS
+                    # (truncated) again — the resplit must actually split.
+                    audio_np = self._guard_truncation(
+                        sentence_index, clean, audio_np,
+                        lambda c: self._generate_mlx_safe(c, force_split=True)
+                    )
                 elif self.backend == 'vllm':
                     try:
                         audio_np = self._tokens_to_audio(self._generate_tokens_vllm(clean))
@@ -1999,7 +2057,9 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
                                                   {'tokens_emitted': len(out[uid]),
                                                    'token_cap': depth,
                                                    'backend': 'mlx'})
-                                audio = self._generate_mlx_safe(clean)
+                                # force_split: the cap hit is PROVEN, so skip the whole
+                                # re-render _generate_mlx_safe would otherwise try first.
+                                audio = self._generate_mlx_safe(clean, force_split=True)
                                 results[idx] = self._save_audio(idx, audio, gap[0], gap[1])
                                 continue
                             ids = mx.array([ptoks + out[uid]])
@@ -2018,7 +2078,12 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
                                 audio = np.zeros(0, dtype=np.float32)
                             # Backstop a silent early-EOS truncation (clean stop, audio
                             # too short for the text) the token-cap check can't catch.
-                            audio = self._guard_truncation(idx, clean, audio, self._generate_mlx_safe)
+                            # force_split: a whole-chunk re-render would just clean-EOS
+                            # (truncated) again — the resplit must actually split.
+                            audio = self._guard_truncation(
+                                idx, clean, audio,
+                                lambda c: self._generate_mlx_safe(c, force_split=True)
+                            )
                             results[idx] = self._save_audio(idx, audio, gap[0], gap[1])
                         except Exception as decode_err:
                             print(f"Orpheus MLX batch decode error for sentence {idx}: {decode_err}")
