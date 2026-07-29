@@ -35,3 +35,9 @@ bench_*.log
 
 # Unsloth compiled kernel cache (build artifact)
 /unsloth_compiled_cache/
+
+# Benchmark harnesses, corpora, and their throwaway venvs (bench scripts live
+# untracked by convention — see bench_*.log above)
+bench_*.py
+bench_*.json
+/.venv-*/
