@@ -974,7 +974,37 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
                 groups.append((sub, _depth(sub)))
         return groups
 
-    def _generate_mlx_batch_audio(self, texts: list) -> list:
+    def _resolve_mlx_row(self, i: int, ptoks: list, clean: str, tokens: list, depth: int):
+        """Turn ONE retired BatchGenerator row's tokens into audio (or None).
+
+        Factored out of _generate_mlx_batch_audio so a row can be resolved the
+        moment it retires (per-row streaming emission) using the exact same ladder
+        the end-of-batch loop used to run:
+          - tokens >= depth  -> the row hit the cap and would ship clipped, so
+            re-render it split (force_split: the cap hit is PROVEN, skip the whole
+            re-render _generate_mlx_safe would otherwise try first);
+          - otherwise decode prompt+generated through parse_output/SNAC;
+          - no codes, or a decode error -> None (the caller's failure contract).
+        """
+        import numpy as np
+        import mlx.core as mx
+        from mlx_audio.tts.models.llama.llama import decode_audio_from_codes
+        try:
+            if len(tokens) >= depth:
+                # Cap hit without finishing — re-render split so the played audio is
+                # never clipped mid-sentence.
+                print(f"Orpheus: stream sentence [{i}] hit the MLX audio-token cap; re-rendering split")
+                return self._generate_mlx_safe(clean, force_split=True)
+            ids = mx.array([ptoks + tokens])
+            code_lists = self.mlx_model.parse_output(ids)
+            if code_lists and len(code_lists[0]) > 0:
+                return np.array(decode_audio_from_codes(code_lists[0])[0], dtype=np.float32)
+            return None
+        except Exception as decode_err:
+            print(f"Orpheus _generate_mlx_batch_audio decode error [{i}]: {decode_err}")
+            return None
+
+    def _generate_mlx_batch_audio(self, texts: list, on_row=None) -> list:
         """Batch-generate raw audio for many (already-cleaned) sentences in ONE
         MLX BatchGenerator pass — continuous batching, ~3.6x the per-sentence
         throughput. Returns float32 waveforms aligned to `texts` (None for an
@@ -984,12 +1014,20 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
         streaming server uses this to generate a whole paragraph's sentences in
         parallel so MLX stays ahead of playback instead of dribbling one slow
         sentence at a time. MLX backend only.
+
+        `on_row(i, audio)` — optional. Rows do NOT all finish together: mlx-lm
+        retires each row as it hits its stop token, and the shortest row of a batch
+        typically retires around 70% of the batch's depth. With a callback, each row
+        is decoded (through the full cap/resplit ladder above) and handed over AT
+        RETIREMENT instead of everything landing at the end, which is worth ~12s to
+        the earliest sentences of a 30-43s batch. Called exactly ONCE per non-empty
+        row, in RETIREMENT order (not `texts` order) — `i` is the index into `texts`,
+        so an out-of-order-tolerant caller can reassemble. The full aligned list is
+        still returned either way; callers that used on_row may ignore it.
+        Default None -> byte-identical behaviour to before (audiobook, warmup).
         """
-        import numpy as np
-        import mlx.core as mx
         from mlx_lm.generate import BatchGenerator
         from mlx_lm.sample_utils import make_sampler, make_logits_processors
-        from mlx_audio.tts.models.llama.llama import decode_audio_from_codes
 
         results = [None] * len(texts)
         gen = []  # (index, prompt_tokens, clean_text, token_budget) for non-empty sentences
@@ -1023,6 +1061,8 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
                 )
                 uids = bg.insert([list(p) for _, p, _, _ in bucket])
                 out = {u: [] for u in uids}
+                row_by_uid = dict(zip(uids, bucket))   # uid -> (i, ptoks, clean, budget)
+                pending = set(uids)                    # rows not yet resolved
                 # 0.31.3: next() returns (prompt_responses, generation_responses),
                 # so `while responses := bg.next()` would NEVER terminate.
                 # next_generated() yields just the generation list and returns
@@ -1031,25 +1071,28 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
                     for r in responses:
                         if r.finish_reason != 'stop':  # stop token (128258) is dropped
                             out[r.uid].append(r.token)
+                        # A row reports finish_reason ('stop' or the 'length' cap)
+                        # exactly once, on its LAST response, before BatchGenerator
+                        # drops it from the live set — so its token list is final
+                        # here and it can be resolved (and handed to on_row) now
+                        # rather than after the slowest row of the batch. `pending`
+                        # keeps that a promise, not an assumption: exactly once.
+                        if r.finish_reason is not None and r.uid in pending:
+                            pending.discard(r.uid)
+                            i, ptoks, clean, _budget = row_by_uid[r.uid]
+                            results[i] = self._resolve_mlx_row(i, ptoks, clean, out[r.uid], depth)
+                            if on_row is not None:
+                                on_row(i, results[i])
                 bg.close()
+                # Anything that never reported a finish_reason (shouldn't happen)
+                # still gets resolved — and emitted — exactly once.
                 for (i, ptoks, clean, _budget), uid in zip(bucket, uids):
-                    try:
-                        if len(out[uid]) >= depth:
-                            # Cap hit without finishing — re-render split so the
-                            # played audio is never clipped mid-sentence.
-                            print(f"Orpheus: stream sentence [{i}] hit the MLX audio-token cap; re-rendering split")
-                            # force_split: the cap hit is PROVEN, so skip the whole
-                            # re-render _generate_mlx_safe would otherwise try first.
-                            results[i] = self._generate_mlx_safe(clean, force_split=True)
-                            continue
-                        ids = mx.array([ptoks + out[uid]])
-                        code_lists = self.mlx_model.parse_output(ids)
-                        if code_lists and len(code_lists[0]) > 0:
-                            results[i] = np.array(
-                                decode_audio_from_codes(code_lists[0])[0], dtype=np.float32
-                            )
-                    except Exception as decode_err:
-                        print(f"Orpheus _generate_mlx_batch_audio decode error [{i}]: {decode_err}")
+                    if uid not in pending:
+                        continue
+                    pending.discard(uid)
+                    results[i] = self._resolve_mlx_row(i, ptoks, clean, out[uid], depth)
+                    if on_row is not None:
+                        on_row(i, results[i])
             except Exception as e:
                 print(f"Orpheus._generate_mlx_batch_audio() bucket error: {e}")
                 import traceback
