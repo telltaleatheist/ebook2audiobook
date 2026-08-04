@@ -88,6 +88,76 @@ def _cleanup_on_exit():
 atexit.register(_cleanup_on_exit)
 
 
+# ── MLX LoRA application (stage B2) ──────────────────────────────────────────
+#
+# The two pieces of state that make a LoRA removable from a RESIDENT MLX model.
+# They live at module scope rather than inside Orpheus because both are built on
+# mlx.nn, which must not be imported on a machine that has no MLX at all — hence
+# the lazy class factory below rather than a plain class statement.
+
+class _MlxAdapterState:
+    """What is applied to the resident MLX model right now, and how to take it off.
+
+    `sites` is a list of (path, parent_module, attr_name, original_module): the
+    ORIGINAL projection module for every site the current adapter wrapped. Clearing
+    is therefore exact UNWRAPPING — put each original back where it was — never
+    arithmetic un-fusing, which on bf16 weights would leave a slightly different
+    model behind after every voice switch and drift over a session.
+
+    Deliberately a plain object and not a dict/tuple: mlx's Module.__setattr__ files
+    arrays, dicts, lists and tuples into the module's own parameter dict (a Module IS
+    a dict), so a state object of any of those shapes would be walked by
+    parameters()/eval() as if it were part of the model. Anything else lands as an
+    ordinary Python attribute, which is what this needs to be.
+    """
+
+    __slots__ = ('adapter_dir', 'fingerprint', 'sites')
+
+    def __init__(self, adapter_dir, fingerprint, sites):
+        self.adapter_dir = adapter_dir
+        self.fingerprint = fingerprint
+        self.sites = sites
+
+
+_MLX_LORA_LINEAR = None
+
+
+def _mlx_lora_linear_cls():
+    """The nn.Module that adds one LoRA delta to one projection, built on first use.
+
+    y = base(x) + scale * (x @ A.T) @ B.T
+
+    A PURE FUNCTION OF x, with no state and no shape assumptions beyond the last
+    dimension: that is what keeps it compatible with mlx_lm's BatchGenerator, which
+    calls the model with (batch, tokens) during prefill and (batch, 1) per decode
+    step, at whatever width the batch happens to be. Anything that cached a shape,
+    or that behaved differently on the first call, would produce a model that is
+    correct solo and wrong in a batch — the hardest possible thing to hear.
+
+    The two matmuls are kept SEPARATE (x@A.T then @B.T) rather than folded into a
+    single (B@A) delta matrix: r=64 against 3072x8192 means the pair costs ~2% of
+    the base projection, while materialising B@A would cost a full-size matmul per
+    layer per step AND another 5 GB resident.
+    """
+    global _MLX_LORA_LINEAR
+    if _MLX_LORA_LINEAR is None:
+        import mlx.nn as nn
+
+        class _OrpheusMlxLoRALinear(nn.Module):
+            def __init__(self, base, lora_a, lora_b, scale):
+                super().__init__()
+                self.base = base          # the ORIGINAL nn.Linear, untouched
+                self.lora_a = lora_a      # (r, in_features)
+                self.lora_b = lora_b      # (out_features, r)
+                self.scale = scale        # float: lora_alpha / r
+
+            def __call__(self, x):
+                return self.base(x) + (x @ self.lora_a.T) @ self.lora_b.T * self.scale
+
+        _MLX_LORA_LINEAR = _OrpheusMlxLoRALinear
+    return _MLX_LORA_LINEAR
+
+
 class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
     """
     Orpheus TTS engine - SOTA open-source TTS built on Llama-3b backbone.
@@ -120,13 +190,23 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
     TRANSFORMERS_MODEL = "unsloth/orpheus-3b-0.1-ft"
     SAMPLE_RATE = 24000
 
-    # ---- Adapter mode (vLLM multi-LoRA) -------------------------------------
+    # ---- Adapter mode --------------------------------------------------------
     #
-    # One shared base model + a per-voice LoRA adapter applied PER REQUEST, instead
-    # of one 6.6 GB merged model per voice. Selected by the session keys
-    # orpheus_base_dir (the base) + orpheus_adapter_dir (this voice's adapter);
-    # --fine_tuned carries the voice token the adapter was trained on, which is also
-    # its key in the process-global adapter registry (_register_lora).
+    # One shared base model + a per-voice LoRA adapter, instead of one 6.6 GB merged
+    # model per voice. Selected by the session keys orpheus_base_dir (the base) +
+    # orpheus_adapter_dir (this voice's adapter); --fine_tuned carries the voice token
+    # the adapter was trained on.
+    #
+    # TWO backends apply it, and they are not the same mechanism:
+    #   vLLM  PER REQUEST, as a LoRARequest over a multi-LoRA engine. Several voices
+    #         are servable at once and one batch may mix them. The voice token is also
+    #         its key in the process-global adapter registry (_register_lora), and the
+    #         LORA_* constants below size that engine.
+    #   MLX   APPLIED to the resident model by wrapping its projection modules
+    #         (_apply_mlx_adapter, stage B2). Exactly ONE voice is servable at a time;
+    #         a switch swaps the wrappers, which costs ~a second instead of a 6.2 GB
+    #         reload. None of the LORA_* constants below apply — see
+    #         _validate_adapter_config_mlx for what MLX refuses instead.
     #
     # max_lora_rank must be one of vLLM 0.7.3's legal values (8/16/32/64/128/256)
     # and >= the adapter's own r; every deployed Orpheus adapter is r=64.
@@ -416,9 +496,17 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
                 # branch above takes it verbatim (a fine-tune's token is not in the
                 # allowlist, so validation would drop it to leah), and it is REQUIRED
                 # here: it is also the adapter's registry key, so there is nothing
-                # sane to default to. MLX_MODEL is left alone — adapter mode is
-                # vLLM-only and load_engine refuses any other backend.
+                # sane to default to.
+                #
+                # BOTH model refs point at the base, because on BOTH backends that can
+                # serve an adapter the base is the thing that gets LOADED and the
+                # adapter is applied to it afterwards: vLLM per request (LoRARequest),
+                # MLX by wrapping the projection modules of the resident model
+                # (_apply_mlx_adapter — stage B2). The base dir is an HF-format
+                # bf16 checkpoint, which is exactly what mlx_audio's load_model reads
+                # for the legacy merged Mac voices, so nothing about the load changes.
                 self.TRANSFORMERS_MODEL = self.base_dir
+                self.MLX_MODEL = self.base_dir
                 self.voice = (voice or '').strip().lower()
                 # 'internal' is conf_models.default_fine_tuned — the sentinel both
                 # session builders substitute when --fine_tuned was never passed, so
@@ -444,7 +532,16 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
                 # engine, and switching between them costs a registration instead of a
                 # 6 GB reload plus a possible mid-session HF download.
                 if self.base_dir:
+                    # MLX_MODEL moves with it: the engine cache key is the (merged,
+                    # base) pair, so a stock session naming this base and an adapter
+                    # session naming it are the SAME engine — and they had better be
+                    # the same weights. Leaving MLX pointed at mlx-community's
+                    # converted copy while the key claims the local dir is how a warm
+                    # switch ends up serving a checkpoint nobody named. Same
+                    # fine-tune either way (unsloth/orpheus-3b-0.1-ft), so the audio
+                    # is unchanged; only the honesty of the key is.
                     self.TRANSFORMERS_MODEL = self.base_dir
+                    self.MLX_MODEL = self.base_dir
                     print(f"[ORPHEUS] Stock voice served from local base dir: {self.base_dir}")
 
                 # Handle preset lookups
@@ -533,58 +630,120 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
                 f'Orpheus base dir {self.base_dir} is not a model folder: {base_config} is missing'
             )
         if self.adapter_dir:
+            # UNIVERSAL checks only: the backend has not been detected yet (that happens
+            # in load_engine, which re-validates against it before loading any weights).
+            # An adapter that is broken for everyone should still fail here, at
+            # construction, rather than after a 6 GB load.
             self.validate_adapter_dir(self.adapter_dir)
 
     @classmethod
-    def validate_adapter_dir(cls, adapter_dir: str):
-        """Every check an adapter folder must pass before vLLM is asked to serve it.
+    def validate_adapter_dir(cls, adapter_dir: str, backend: str = None):
+        """Every check an adapter folder must pass before it is asked to serve a voice.
 
         Extracted so ENGINE CONSTRUCTION (_validate_adapter_mode, first adapter) and
-        LATE REGISTRATION (register_adapter, the 2nd..Nth adapter added to a warm
-        engine on the streaming server) run the IDENTICAL validation. They used not
-        to: only __init__ validated, so a bad adapter registered onto a live engine
+        LATE REGISTRATION (register_adapter / set_voice, the 2nd..Nth adapter added to
+        a warm engine on the streaming server) run the IDENTICAL validation. They used
+        not to: only __init__ validated, so a bad adapter registered onto a live engine
         detonated inside engine.generate() — an opaque vLLM error that fails the
         whole batch, at render time, with nothing naming the adapter. A bad adapter
         must fail at REGISTRATION, with the readable reason, every time.
+
+        `backend` selects which BACKEND-SPECIFIC checks run on top of the universal
+        ones. Two backends can now apply a LoRA and they refuse different things, so
+        parroting one's limits at the other is worse than not checking: a Mac told
+        that its adapter exceeds "max_lora_rank, which vLLM 0.7.3 cannot serve" is
+        being read an error from software it does not have installed. None (the
+        default) runs the universal checks alone — that is what __init__ does, before
+        the backend has been detected; load_engine re-validates with the real backend
+        before it loads any weights.
         """
         for name in ('adapter_config.json', 'adapter_model.safetensors'):
             path = os.path.join(adapter_dir, name)
             if not os.path.isfile(path):
                 raise ValueError(f'Orpheus adapter dir {adapter_dir} is missing {name}')
-        cls._validate_adapter_config(os.path.join(adapter_dir, 'adapter_config.json'))
+        path = os.path.join(adapter_dir, 'adapter_config.json')
+        config = cls._read_adapter_config(adapter_dir)
+        cls._validate_adapter_config(path, config)
+        if backend == 'vllm':
+            cls._validate_adapter_config_vllm(path, config)
+        elif backend == 'mlx':
+            cls._validate_adapter_config_mlx(path, config)
+
+    @staticmethod
+    def _read_adapter_config(adapter_dir: str) -> dict:
+        """The adapter's PEFT config as a dict. One reader, so validation and the MLX
+        applier can never disagree about what the file said."""
+        import json as _json
+        with open(os.path.join(adapter_dir, 'adapter_config.json'), 'r', encoding='utf-8') as handle:
+            return _json.load(handle)
 
     @classmethod
-    def _validate_adapter_config(cls, path: str):
-        """Reject adapters vLLM cannot serve, HERE, where the reason is readable.
+    def _validate_adapter_config(cls, path: str, config: dict):
+        """The checks that hold for ANY applier of a LoRA, on any backend.
 
-        vLLM 0.7.3 checks modules_to_save and use_dora in
-        PEFTHelper._validate_features, and rank and bias in PEFTHelper.validate_legal
-        — all deep inside engine startup where the failure surfaces as an opaque
-        worker crash with no mention of the adapter."""
-        import json as _json
-        with open(path, 'r', encoding='utf-8') as handle:
-            config = _json.load(handle)
+        Each one names something that would otherwise be silently DROPPED from the
+        voice — the failure mode this whole file is built against, because dropping
+        part of a fine-tune still produces confident, finished-sounding audio."""
+        if config.get('peft_type', 'LORA') != 'LORA':
+            raise ValueError(
+                f'Orpheus adapter {path}: peft_type={config["peft_type"]!r}. Only plain '
+                'LoRA adapters can be applied — anything else would be ignored.'
+            )
         rank = config.get('r')
-        if not isinstance(rank, int) or rank > cls.LORA_MAX_RANK:
+        if not isinstance(rank, int) or rank <= 0:
+            raise ValueError(f'Orpheus adapter {path}: r={rank!r} is not a positive integer rank')
+        if config.get('modules_to_save') is not None:
+            raise ValueError(
+                f'Orpheus adapter {path}: modules_to_save={config["modules_to_save"]!r}. '
+                'Only the LoRA A/B pairs are applied, so fully-saved modules would be '
+                'silently dropped from the voice.'
+            )
+        if config.get('use_dora'):
+            raise ValueError(
+                f'Orpheus adapter {path}: use_dora=true. DoRA rescales each column of the '
+                'base weight as well as adding the low-rank delta; applying only the '
+                'delta would render a voice that is not the one that was trained.'
+            )
+        bias = config.get('bias', 'none')
+        if bias != 'none':
+            raise ValueError(
+                f"Orpheus adapter {path}: bias={bias!r}. Only the A/B pairs are applied, "
+                'so a trained bias term would be dropped.'
+            )
+
+    @classmethod
+    def _validate_adapter_config_vllm(cls, path: str, config: dict):
+        """What vLLM 0.7.3 in particular refuses, HERE, where the reason is readable.
+
+        PEFTHelper.validate_legal checks the rank against the engine's max_lora_rank
+        deep inside engine startup, where the failure surfaces as an opaque worker
+        crash with no mention of the adapter."""
+        rank = config.get('r')
+        if rank > cls.LORA_MAX_RANK:
             raise ValueError(
                 f'Orpheus adapter {path}: r={rank!r}, which the engine cannot serve at '
                 f'max_lora_rank={cls.LORA_MAX_RANK}'
             )
-        if config.get('modules_to_save') is not None:
-            raise ValueError(
-                f'Orpheus adapter {path}: modules_to_save={config["modules_to_save"]!r}. '
-                'vLLM applies only the LoRA A/B pairs, so fully-saved modules would be '
-                'silently dropped from the voice.'
-            )
-        if config.get('use_dora'):
-            raise ValueError(f'Orpheus adapter {path}: use_dora is not supported by vLLM 0.7.3')
-        bias = config.get('bias', 'none')
-        if bias != 'none':
-            raise ValueError(
-                f'Orpheus adapter {path}: bias={bias!r}. The engine is built without '
-                'enable_lora_bias, so PEFTHelper.validate_legal rejects any bias mode '
-                "other than 'none' at startup."
-            )
+
+    @classmethod
+    def _validate_adapter_config_mlx(cls, path: str, config: dict):
+        """What the MLX applier in particular refuses (see _apply_mlx_adapter).
+
+        No rank ceiling: MLX has no pre-allocated LoRA slots to overflow — the
+        wrappers are sized from the weights themselves, so any rank works.
+
+        Per-module rank/alpha overrides do NOT work: _apply_mlx_adapter resolves ONE
+        scale from r and lora_alpha and applies it to every wrapped projection.
+        Honouring the patterns would be a small change; pretending they are honoured
+        while scaling half the model wrongly is a voice that is subtly not the one
+        that was trained, with nothing to see."""
+        for key in ('rank_pattern', 'alpha_pattern'):
+            if config.get(key):
+                raise ValueError(
+                    f'Orpheus adapter {path}: {key}={config[key]!r}. The MLX applier uses '
+                    'one scale (lora_alpha / r) for every wrapped projection and cannot '
+                    'honour per-module overrides.'
+                )
 
     @staticmethod
     def _evict_global_cache():
@@ -798,6 +957,236 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
 
         model.prepare_input_ids = prepare_input_ids
         print("Orpheus MLX prompt framing patched for fine-tuned voices (SOA+SOS suffix)")
+
+    # ── MLX adapter mode (stage B2) ──────────────────────────────────────────
+    #
+    # ONE base model stays resident and a voice is a LoRA WRAPPED ONTO its
+    # projection modules; switching voices swaps the wrappers instead of reloading
+    # 6.2 GB. This is what makes a mid-article voice switch on a Mac cost ~a second
+    # rather than a minute, and it is why the darwin fuse-at-install preference in
+    # BookForge's resolveOrpheusInstall is gone.
+    #
+    # It is NOT vLLM's per-request multi-LoRA. MLX has exactly ONE adapter attached
+    # at a time, because the adapter is part of the weights the forward pass runs
+    # through — there is no per-row selection to be had. Every caller that could mix
+    # voices in one batch is gated on the vLLM backend (BookForge's
+    # canServeVoicePerRequest, orpheus_stream's _reject_per_request_voice), and
+    # _lora_request is never reached on this backend.
+    #
+    # PEFT stores a LoRA as, per targeted projection:
+    #   base_model.model.model.layers.N.<self_attn|mlp>.<proj>.lora_A.weight  (r, in)
+    #   base_model.model.model.layers.N.<self_attn|mlp>.<proj>.lora_B.weight  (out, r)
+    # and mlx_audio's Orpheus model IS mlx_lm's Llama (mlx_audio.tts.models.llama
+    # .Model extends mlx_lm.models.llama.Model), so stripping the `base_model.model.`
+    # PEFT prefix leaves a path that walks the LIVE object verbatim:
+    # model.model.layers[N].self_attn.q_proj. The remap is a prefix strip and an
+    # attribute walk — no per-name table to fall out of date with either library.
+    MLX_LORA_PREFIX = 'base_model.model.'
+
+    @staticmethod
+    def _mlx_lora_scale(config: dict) -> float:
+        """The one multiplier applied to every LoRA delta: PEFT's own alpha / r
+        (alpha / sqrt(r) under rsLoRA).
+
+        READ FROM THE ADAPTER, never assumed. The three deployed Orpheus voices are
+        r=64 / alpha=64, i.e. exactly 1.0, so a hardcoded scale would work today and
+        silently mis-weight the first voice trained at any other setting — by a
+        factor of 2 or 4, which is not a subtle artifact but it is a plausible-
+        sounding one.
+        """
+        rank = config['r']
+        alpha = config.get('lora_alpha', rank)
+        if config.get('use_rslora'):
+            return float(alpha) / math.sqrt(rank)
+        return float(alpha) / float(rank)
+
+    @classmethod
+    def _mlx_walk(cls, model, path: str):
+        """Resolve a dotted PEFT module path against the live MLX model."""
+        obj = model
+        for part in path.split('.'):
+            if part.isdigit():
+                obj = obj[int(part)]
+            else:
+                obj = getattr(obj, part)
+        return obj
+
+    def _mlx_adapter_plan(self, model, adapter_dir: str, config: dict):
+        """Build every wrapper this adapter needs, WITHOUT touching the model.
+
+        Returns (sites, swap) where `sites` is the new _MlxAdapterState.sites and
+        `swap` is the complete list of (parent, attr, module) assignments that make
+        the model serve this adapter and nothing else — including restoring any site
+        the PREVIOUS adapter wrapped that this one does not.
+
+        Everything that can fail — a missing pair, an unexpected module path, a shape
+        that does not match the base weight — fails HERE, with the model still
+        rendering the voice it was rendering. That is the whole reason this is a
+        separate pass: a half-wrapped model has no name, cannot be reported, and
+        sounds like neither voice.
+        """
+        import mlx.core as mx
+        import mlx.nn as nn
+
+        weights = mx.load(os.path.join(adapter_dir, 'adapter_model.safetensors'))
+        scale = self._mlx_lora_scale(config)
+
+        # Group the flat key list into {module path: {lora_A: …, lora_B: …}}.
+        pairs = {}
+        for key, value in weights.items():
+            if not key.startswith(self.MLX_LORA_PREFIX):
+                raise ValueError(
+                    f'Orpheus adapter {adapter_dir}: key {key!r} does not start with '
+                    f'{self.MLX_LORA_PREFIX!r} — this is not a PEFT LoRA over a '
+                    'transformers causal LM.'
+                )
+            body = key[len(self.MLX_LORA_PREFIX):]
+            if not body.endswith('.weight'):
+                raise ValueError(f'Orpheus adapter {adapter_dir}: unexpected key {key!r}')
+            body = body[:-len('.weight')]
+            module_path, _, which = body.rpartition('.')
+            if which not in ('lora_A', 'lora_B'):
+                raise ValueError(
+                    f'Orpheus adapter {adapter_dir}: key {key!r} is neither a lora_A nor a '
+                    'lora_B weight. Only the A/B pairs are applied, so it would be dropped.'
+                )
+            pairs.setdefault(module_path, {})[which] = value
+
+        # The ORIGINAL module at each site, even when a previous adapter is currently
+        # wrapped around it: the recorded state is the authority, the live object is
+        # only consulted for sites nothing has wrapped.
+        state = getattr(model, '_orpheus_mlx_lora', None)
+        originals = {path: (parent, attr, original)
+                     for path, parent, attr, original in (state.sites if state else [])}
+
+        lora_linear = _mlx_lora_linear_cls()
+        sites = []
+        swap = []
+        for module_path in sorted(pairs):
+            entry = pairs[module_path]
+            lora_a, lora_b = entry.get('lora_A'), entry.get('lora_B')
+            if lora_a is None or lora_b is None:
+                raise ValueError(
+                    f'Orpheus adapter {adapter_dir}: {module_path} has only '
+                    f'{"lora_A" if lora_a is not None else "lora_B"}. Half a LoRA pair '
+                    'cannot be applied.'
+                )
+            if module_path in originals:
+                parent, attr, original = originals[module_path]
+            else:
+                parent_path, _, attr = module_path.rpartition('.')
+                try:
+                    parent = self._mlx_walk(model, parent_path)
+                    original = getattr(parent, attr)
+                except (AttributeError, IndexError, KeyError, TypeError) as err:
+                    raise ValueError(
+                        f'Orpheus adapter {adapter_dir}: {module_path} does not name a module '
+                        f'on the loaded MLX model ({err}). The adapter was trained against a '
+                        'different architecture than the base model this engine loaded.'
+                    )
+            if not isinstance(original, nn.Linear):
+                raise ValueError(
+                    f'Orpheus adapter {adapter_dir}: {module_path} is a '
+                    f'{type(original).__name__}, not an nn.Linear. A LoRA can only be applied '
+                    'to a plain linear projection (a quantized base would need its own path).'
+                )
+            weight = original.weight
+            out_features, in_features = weight.shape
+            if (lora_a.shape[1] != in_features or lora_b.shape[0] != out_features
+                    or lora_a.shape[0] != lora_b.shape[1]):
+                raise ValueError(
+                    f'Orpheus adapter {adapter_dir}: {module_path} shapes do not fit — '
+                    f'A{tuple(lora_a.shape)} B{tuple(lora_b.shape)} against a '
+                    f'{out_features}x{in_features} projection.'
+                )
+            # Cast to the BASE's dtype (bf16). The checkpoint stores fp32, and adding an
+            # fp32 delta to a bf16 projection would promote every activation on the way
+            # through — a different, slower model than the one that was measured.
+            wrapper = lora_linear(original, lora_a.astype(weight.dtype),
+                                  lora_b.astype(weight.dtype), scale)
+            sites.append((module_path, parent, attr, original))
+            swap.append((parent, attr, wrapper))
+
+        # Sites the OLD adapter wrapped and this one does not: restore the original,
+        # or they would keep serving the previous voice's delta on top of the new one.
+        wrapped = {path for path, _, _, _ in sites}
+        for path, parent, attr, original in (state.sites if state else []):
+            if path not in wrapped:
+                swap.append((parent, attr, original))
+        return sites, swap
+
+    def _apply_mlx_adapter(self, model, adapter_dir: str, fingerprint=None) -> None:
+        """Make the resident MLX model render `adapter_dir`'s voice.
+
+        Replaces whatever adapter is currently applied (see _mlx_adapter_plan), so
+        adapter→adapter is one call, not a clear followed by an apply — there is no
+        window in which the model is a bare base under a custom voice's name.
+
+        ALL-OR-NOTHING in both phases. The plan is built first and every failure mode
+        lives there, with the model untouched; the assignment loop that follows is
+        pure setattr, and if one of those ever raised, every site already moved is put
+        back exactly as it was before the exception propagates.
+        """
+        import mlx.core as mx
+
+        config = self._read_adapter_config(adapter_dir)
+        self._validate_adapter_config(os.path.join(adapter_dir, 'adapter_config.json'), config)
+        self._validate_adapter_config_mlx(os.path.join(adapter_dir, 'adapter_config.json'), config)
+        if fingerprint is None:
+            fingerprint = self._adapter_fingerprint(adapter_dir)
+        sites, swap = self._mlx_adapter_plan(model, adapter_dir, config)
+
+        rollback = [(parent, attr, getattr(parent, attr)) for parent, attr, _ in swap]
+        try:
+            for parent, attr, module in swap:
+                setattr(parent, attr, module)
+        except Exception:
+            for parent, attr, previous in rollback:
+                setattr(parent, attr, previous)
+            raise
+        model._orpheus_mlx_lora = _MlxAdapterState(adapter_dir, fingerprint, sites)
+        # Materialise the new weights NOW. mx.load is lazy, so without this the first
+        # sentence of a switched voice pays a 0.4 GB read inside the generation loop —
+        # which is exactly the latency the resident base was supposed to remove.
+        mx.eval(model.parameters())
+        print(f'[ORPHEUS] MLX adapter applied: {adapter_dir} '
+              f'({len(sites)} projections, scale {self._mlx_lora_scale(config):g})')
+
+    def _clear_mlx_adapter(self, model) -> None:
+        """Put the resident MLX model back to the bare base.
+
+        Exact unwrapping: every original module goes back where it was. Nothing is
+        subtracted from any weight, so the base after a hundred voice switches is the
+        same object it was after the load."""
+        state = getattr(model, '_orpheus_mlx_lora', None)
+        if state is None:
+            return
+        for _path, parent, attr, original in state.sites:
+            setattr(parent, attr, original)
+        model._orpheus_mlx_lora = None
+        print(f'[ORPHEUS] MLX adapter cleared: {state.adapter_dir}')
+
+    def _sync_mlx_adapter(self, model, adapter_dir: str) -> None:
+        """Make the resident MLX model serve exactly `adapter_dir` (None = bare base).
+
+        A no-op when the SAME adapter content is already applied — same dir AND same
+        fingerprint. The fingerprint half is not paranoia: re-installing a retrained
+        voice overwrites the same folder, and a dir-only comparison would keep the old
+        training run applied for the life of the process (the identical trap
+        _register_lora's fingerprint defends against on vLLM)."""
+        if model is None:
+            raise ValueError('Orpheus: no MLX model is loaded — cannot apply an adapter to it.')
+        state = getattr(model, '_orpheus_mlx_lora', None)
+        if not adapter_dir:
+            self._clear_mlx_adapter(model)
+            return
+        fingerprint = self._adapter_fingerprint(adapter_dir)
+        if state is not None and state.adapter_dir == adapter_dir and state.fingerprint == fingerprint:
+            return
+        if state is not None and state.adapter_dir == adapter_dir:
+            print(f"[ORPHEUS] MLX adapter at {adapter_dir} changed on disk; re-applying "
+                  'so the live model cannot keep serving the previous training run.')
+        self._apply_mlx_adapter(model, adapter_dir, fingerprint)
 
     def _load_snac(self):
         """Load the SNAC audio decoder (not needed for MLX - it handles decoding internally)."""
@@ -1017,7 +1406,7 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
         return next_id
 
     @classmethod
-    def register_adapter(cls, voice: str, adapter_dir: str) -> int:
+    def register_adapter(cls, voice: str, adapter_dir: str, backend: str = None) -> int:
         """PUBLIC: make `voice` servable as a per-request LoRA on the live engine.
 
         The BookForge streaming server calls this when it loads an adapter voice onto
@@ -1033,6 +1422,12 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
         Registration alone does NOT change which voice a bare generate() renders —
         that is `set_voice`. Both are needed for a default-voice switch; only this one
         is needed to make a voice available to a per-item mixed-voice batch.
+
+        vLLM ONLY, and there is no MLX counterpart on purpose: an int id keying a
+        weight cache inside the engine is meaningful only where several adapters can
+        be resident at once. MLX attaches exactly one adapter to the model itself, so
+        set_voice applies it directly (_sync_mlx_adapter) and there is nothing to
+        register in advance.
         """
         if not voice:
             raise ValueError('Orpheus.register_adapter() requires a voice token')
@@ -1040,7 +1435,7 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
             raise ValueError(
                 f"Orpheus.register_adapter({voice!r}) requires the voice's adapter dir"
             )
-        cls.validate_adapter_dir(adapter_dir)
+        cls.validate_adapter_dir(adapter_dir, backend)
         return cls._register_lora(voice, adapter_dir,
                                   cls._adapter_fingerprint(adapter_dir))
 
@@ -1060,12 +1455,21 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
         Callers that need a different base (or to leave/enter merged mode) must tear
         the engine down and rebuild; this method refuses rather than pretending.
 
-        Within ONE LoRA-capable engine (built with a base_dir), adapter↔adapter AND
+        Within ONE adapter-capable engine (built with a base_dir), adapter↔adapter AND
         adapter↔stock are both free: passing an adapter_dir attaches that adapter,
         passing none detaches it and serves an allowlisted stock token on the bare
         base. Only the streaming server and the audiobook worker ever reach this, and
         both validate the token before calling — a custom voice can never arrive here
         with adapter_dir=None (see _validate_adapter_mode's safety argument).
+
+        The two backends attach an adapter differently and the difference is real, not
+        cosmetic. On vLLM "attach" is a REGISTRATION: the adapter becomes servable per
+        request and the previous one stays servable too. On MLX it is an
+        APPLICATION: the wrappers on the resident model are swapped, so exactly one
+        voice is servable at a time and the previous one stops being renderable the
+        moment this returns. Callers that track which voices an engine can serve must
+        therefore REPLACE their record on MLX rather than add to it — orpheus_stream's
+        engine_voices does.
         """
         if not voice:
             raise ValueError('Orpheus.set_voice() requires a voice token')
@@ -1074,14 +1478,24 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
                 f'Orpheus is serving the merged model {self.custom_model_dir}, whose voice IS '
                 f"its weights — it cannot be re-pointed at '{voice}' in place; reload the engine."
             )
-        if adapter_dir and not self.lora_capable:
+        if adapter_dir and not self.adapter_capable:
             raise ValueError(
-                f"Orpheus.set_voice({voice!r}): this engine was built WITHOUT LoRA support "
-                f'(base_dir={self.base_dir!r}, backend={self.backend!r}) and can never serve '
-                'an adapter voice in place; reload the engine against the shared base.'
+                f"Orpheus.set_voice({voice!r}): this engine cannot serve an adapter voice in "
+                f'place (base_dir={self.base_dir!r}, backend={self.backend!r}); reload the '
+                'engine against the shared base.'
             )
+        if self.backend == 'mlx':
+            # Apply (or detach) BEFORE moving self.voice/self.adapter_dir. _sync is
+            # all-or-nothing, so a failure here leaves the model rendering the voice it
+            # was rendering AND this instance still describing that same voice — the
+            # two cannot disagree. Validation happens inside, before the model is
+            # touched at all.
+            self._sync_mlx_adapter(self.mlx_model, adapter_dir)
+            self.adapter_dir = adapter_dir
+            self.voice = voice
+            return
         if adapter_dir:
-            self.register_adapter(voice, adapter_dir)
+            self.register_adapter(voice, adapter_dir, self.backend)
         # Lockstep: self.adapter_dir is what _lora_request serves the INSTANCE's own
         # voice from, so it has to move with self.voice in both directions. Leaving a
         # stale adapter attached while switching to a stock token is the right prompt
@@ -1090,15 +1504,23 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
         self.voice = voice
 
     @property
-    def lora_capable(self) -> bool:
-        """True when the LIVE engine was built with vLLM multi-LoRA, i.e. it can serve
-        a per-request adapter.
+    def adapter_capable(self) -> bool:
+        """True when the LIVE engine can be re-pointed at an adapter voice WITHOUT
+        being reloaded.
 
-        Same condition _load_vllm_engine builds on: a base_dir, on the vLLM backend.
-        It is deliberately NOT `bool(self.adapter_dir)` — a stock-from-local-base
-        engine has no adapter attached and is still fully LoRA-capable, which is the
-        entire point of the key collapse."""
-        return bool(self.base_dir) and self.backend == 'vllm'
+        Same condition both loaders build on: a base_dir, on a backend that can apply
+        a LoRA. vLLM applies it per request (enable_lora, a construction-time
+        property); MLX applies it to the resident model's projection modules
+        (_apply_mlx_adapter). transformers has no PEFT wiring here and is excluded —
+        load_engine refuses adapter mode there outright.
+
+        Deliberately NOT `bool(self.adapter_dir)` — a stock-from-local-base engine has
+        no adapter attached and is still fully capable, which is the entire point of
+        the key collapse.
+
+        NOT the same question as "can this engine serve a voice PER REQUEST", which is
+        vLLM-only: see _lora_request and BookForge's canServeVoicePerRequest."""
+        return bool(self.base_dir) and self.backend in ('vllm', 'mlx')
 
     def _lora_request(self, voice: str = None):
         """The LoRARequest that renders `voice` (default: this instance's voice), or
@@ -1266,6 +1688,15 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
                 self.mlx_model = loaded_tts.get('orpheus_mlx_model', None)
                 print(f"Orpheus already loaded (backend: {self.backend}, model_dir: {cached_dir}, "
                       f"base_dir: {cached_base})")
+                # A cached MLX model carries whatever adapter the PREVIOUS instance
+                # applied to it — the weights are shared, so "same engine" does not
+                # mean "same voice". Bring it to this session's adapter (or to the bare
+                # base) before returning it, or a second instance over the same base
+                # would render its own voice's prompt token through the first voice's
+                # LoRA. No-op when they already agree.
+                if self.backend == 'mlx' and (self.adapter_dir or
+                                              getattr(self.mlx_model, '_orpheus_mlx_lora', None)):
+                    self._sync_mlx_adapter(self.mlx_model, self.adapter_dir)
                 return engine
             if engine:
                 # A different model is cached (switching custom voices, custom<->stock,
@@ -1277,19 +1708,33 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
             # Detect and load appropriate backend
             self.backend = self._detect_backend()
 
-            # Adapter mode is vLLM-only. mlx_audio's load_model takes no adapter
-            # argument and the transformers path has no PEFT wiring, so either would
-            # serve the BARE BASE under the voice's name — a render that sounds
-            # finished and is in the wrong voice.
-            if self.adapter_dir and self.backend != 'vllm':
+            # Adapter mode needs a backend that can actually APPLY a LoRA. vLLM does it
+            # per request; MLX does it by wrapping the resident model's projections
+            # (_apply_mlx_adapter, stage B2). The transformers path has no PEFT wiring
+            # at all, so it would serve the BARE BASE under the voice's name — a render
+            # that sounds finished and is in the wrong voice.
+            if self.adapter_dir and self.backend not in ('vllm', 'mlx'):
                 raise ValueError(
-                    f"Orpheus adapter mode is not yet supported on the '{self.backend}' "
-                    f"backend; it requires vLLM."
+                    f"Orpheus adapter mode is not supported on the '{self.backend}' backend: "
+                    'there is no PEFT wiring there, so the adapter would be silently ignored '
+                    'and the base rendered under this voice\'s name. Use vLLM (CUDA) or MLX '
+                    '(Apple Silicon), or install this voice as a merged model.'
                 )
+            # Now that the backend is known, re-validate the adapter against ITS limits.
+            # __init__ ran the universal checks before anything loaded; this is the pass
+            # that knows whether the rank ceiling or the per-module-pattern rule applies,
+            # and it still runs BEFORE a single byte of the base is read.
+            if self.adapter_dir:
+                self.validate_adapter_dir(self.adapter_dir, self.backend)
 
             if self.backend == 'mlx':
                 engine = self._load_mlx_engine()
                 self.mlx_model = engine
+                # The base is loaded; the voice is the LoRA on top of it. Applied here
+                # rather than lazily at first generate, so a broken adapter fails the
+                # LOAD — the one moment a caller is prepared for a voice to be refused.
+                if self.adapter_dir:
+                    self._apply_mlx_adapter(engine, self.adapter_dir)
             elif self.backend == 'vllm':
                 engine = self._load_vllm_engine()
                 self._load_snac()
@@ -1313,7 +1758,12 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
             # be gone. Without this the first registration would happen lazily on the
             # first request, with no fingerprint — and a later re-install of the same
             # voice would then have nothing to compare against.
-            if self.adapter_dir:
+            #
+            # vLLM only: the registry maps a voice to the int id vLLM caches its weights
+            # under, and MLX has no such cache — its adapter is applied to the model and
+            # its content identity is tracked by _MlxAdapterState.fingerprint instead.
+            # A registry entry there would describe a request shape MLX never serves.
+            if self.adapter_dir and self.backend == 'vllm':
                 self._register_lora(self.voice, self.adapter_dir,
                                     self._adapter_fingerprint(self.adapter_dir))
 
