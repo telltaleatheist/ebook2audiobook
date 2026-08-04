@@ -222,12 +222,12 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
     # (BookForge passes e.g. 23.5 for deathstalker), and 0 disables the guard.
     #
     # This is the DEFAULT only — never the live value. Read it through
-    # _max_chars_per_sec(), which re-reads the environment on EVERY call: the
-    # resident streaming worker switches voices in-process and rewrites this env var
-    # per voice (electron/scripts/orpheus_stream.py _apply_voice_caps), so a value
-    # captured at import or construction would pin the first voice's threshold onto
-    # every later one. The constant exists so the 19.0 literal lives in exactly one
-    # place instead of being repeated at each of the three call sites.
+    # _max_chars_per_sec(), which resolves per voice on EVERY call (registered cap
+    # -> env -> this default; see VOICE_CAP_SOURCES): the resident streaming worker
+    # switches voices in-process, so a value captured at import or construction
+    # would pin the first voice's threshold onto every later one. The constant
+    # exists so the 19.0 literal lives in exactly one place instead of being
+    # repeated at each of the three call sites.
     DEFAULT_MAX_CHARS_PER_SEC = '19.0'
 
     # Sampling params at the Orpheus reference values. The spurious leading-syllable
@@ -272,10 +272,62 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
     # chunk's expected token count (derived from text length), so it cannot
     # truncate speech that hasn't been spoken yet. Past that point the bias
     # ramps with the overrun. Default 0 = OFF; enable per-voice via
-    # models.json backends.vllm.eosBoost -> ORPHEUS_EOS_BOOST. vLLM paths
-    # only. Gate any tuning with eos_gate.py + an endings ear-check.
+    # models.json backends.vllm.eosBoost, which reaches this either as the
+    # registered 'eosBoost' cap (streaming) or as ORPHEUS_EOS_BOOST (audiobook
+    # worker spawn env). vLLM paths only. Gate any tuning with eos_gate.py +
+    # an endings ear-check.
     EOS_BOOST = float(os.environ.get('ORPHEUS_EOS_BOOST', '0.0'))
     EOS_BOOST_START = float(os.environ.get('ORPHEUS_EOS_BOOST_START', '1.2'))
+
+    # ── Per-voice tuning caps ────────────────────────────────────────────────
+    # Every constant above is a DEFAULT, never the live value. One process can
+    # serve more than one voice — the BookForge streaming worker switches voices
+    # in-process against a resident engine, and per-character casting will mix
+    # voices inside a single batch — while each fine-tune wants its own numbers
+    # (deathstalker reads ~23.5 ch/s where the default guard is 19.0; the
+    # bed-free voices need an EOS boost the stock ones must not get). Reading a
+    # class attribute bound at IMPORT pins whichever voice happened to be loaded
+    # first onto every later one, which is exactly the bug the streaming server
+    # worked around by rewriting os.environ per voice (process-global state that
+    # cannot describe a mixed-voice batch at all).
+    #
+    # So the live value is resolved per call by _voice_cap(), in this order:
+    #   1. a cap registered for that voice (register_voice_caps)
+    #   2. the process environment (ORPHEUS_*) — how the AUDIOBOOK worker is
+    #      configured: parallel-tts-bridge spawns one process per voice and
+    #      exports the catalog's values into it, so that path is unchanged
+    #   3. the class default above
+    #
+    # Keys are the camelCase names BookForge's catalog already uses
+    # (orpheusVoiceCapsForModel in electron/orpheus-models.ts), so a caps payload
+    # crosses the process boundary verbatim. Value = (env var, class attr).
+    VOICE_CAP_SOURCES = {
+        'temperature':    ('ORPHEUS_TEMPERATURE',       'TEMPERATURE'),
+        'topP':           ('ORPHEUS_TOP_P',             'TOP_P'),
+        'minP':           ('ORPHEUS_MIN_P',             'MIN_P'),
+        'repPenalty':     ('ORPHEUS_REP_PENALTY',       'REP_PENALTY'),
+        'eosBoost':       ('ORPHEUS_EOS_BOOST',         'EOS_BOOST'),
+        'eosBoostStart':  ('ORPHEUS_EOS_BOOST_START',   'EOS_BOOST_START'),
+        'maxCharsPerSec': ('ORPHEUS_MAX_CHARS_PER_SEC', 'DEFAULT_MAX_CHARS_PER_SEC'),
+    }
+
+    # Catalog caps that are NOT generation tuning and are consumed elsewhere:
+    # maxChars is a PREP concern (how core.py packs sentences into chunks) and
+    # sentenceGap is an ASSEMBLY concern (_classify_gap / ORPHEUS_SENTENCE_GAP).
+    # They ride the same catalog payload, so register_voice_caps accepts and
+    # ignores them by NAME rather than swallowing anything it doesn't recognise —
+    # an unknown key is a typo or a catalog/e2a version skew and must be loud.
+    VOICE_CAP_IGNORED = ('maxChars', 'sentenceGap')
+
+    # voice token -> {cap key: float}. CLASS-level, not an instance attribute and
+    # deliberately NOT in loaded_tts: the streaming worker rebuilds its Orpheus
+    # instance whenever the model changes, and loaded_tts is the MODEL cache —
+    # lib/core.cleanup_models_cache() deletes every key in it that doesn't name an
+    # active model, which would drop the caps and silently revert every voice to
+    # the defaults. Caps hold no weights, so keeping them for the life of the
+    # process costs nothing. (The LoRA registry lives in loaded_tts because its
+    # ids are meaningful only against a live vLLM engine.)
+    _voice_caps = {}
 
     # Special token IDs
     END_OF_AUDIO_TOKEN = 128258
@@ -821,6 +873,68 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
                 raise ValueError(f"Orpheus has no registered adapter for voice '{voice}'")
         return LoRARequest(voice, self._register_lora(voice, adapter_dir), adapter_dir)
 
+    @classmethod
+    def register_voice_caps(cls, voice: str, caps: dict) -> dict:
+        """Register `voice`'s per-voice generation tuning (see VOICE_CAP_SOURCES).
+
+        This is the API the BookForge streaming worker calls on every voice load:
+        it is RESIDENT and switches voices without respawning, so its caps cannot
+        ride the spawn environment the way the audiobook worker's do. Registering
+        them per voice — instead of rewriting os.environ, which is one global slot
+        for the whole process — is also what makes a mixed-voice batch possible:
+        every sampling value is resolved from the voice of the ITEM.
+
+        Registration REPLACES whatever the voice had, so a cap the new payload
+        omits reverts to env/class default rather than lingering from an earlier
+        one. Values must be numeric; a key that is neither a cap nor one of the
+        explicitly-ignored non-tuning keys (VOICE_CAP_IGNORED) raises — silently
+        dropping it would mean a mis-tuned voice renders a whole book with no
+        sign anything was wrong. Returns the normalised caps actually stored.
+        """
+        if not voice:
+            raise ValueError('Orpheus.register_voice_caps() requires a voice token')
+        stored = {}
+        for key, value in (caps or {}).items():
+            if key in cls.VOICE_CAP_IGNORED:
+                continue
+            if key not in cls.VOICE_CAP_SOURCES:
+                raise ValueError(
+                    f"Orpheus.register_voice_caps({voice!r}): unknown cap '{key}'. "
+                    f'Known: {", ".join(sorted(cls.VOICE_CAP_SOURCES))} '
+                    f'(ignored: {", ".join(cls.VOICE_CAP_IGNORED)}).'
+                )
+            if value is None:
+                continue
+            try:
+                stored[key] = float(value)
+            except (TypeError, ValueError):
+                raise ValueError(
+                    f"Orpheus.register_voice_caps({voice!r}): cap '{key}' must be a "
+                    f'number, got {value!r}'
+                )
+        cls._voice_caps[voice] = stored
+        return stored
+
+    def _voice_cap(self, key: str, voice: str = None) -> float:
+        """The LIVE value of one tuning cap for `voice` (default: this instance's
+        voice): registered per-voice cap -> ORPHEUS_* env var -> class default.
+        See VOICE_CAP_SOURCES for the full rationale.
+
+        The env var is re-read on every call by design — it is the audiobook
+        worker's channel (one voice per process, exported at spawn) and reading it
+        here rather than at import is what lets the same lookup serve both paths.
+        """
+        env_name, attr = self.VOICE_CAP_SOURCES[key]
+        if voice is None:
+            voice = self.voice
+        registered = self._voice_caps.get(voice)
+        if registered is not None and key in registered:
+            return registered[key]
+        raw = os.environ.get(env_name)
+        if raw is not None:
+            return float(raw)
+        return float(getattr(self, attr))
+
     def _load_transformers_engine(self):
         """Load model using transformers backend."""
         from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -939,16 +1053,23 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
             traceback.print_exc()
             raise ValueError(error)
 
-    @classmethod
-    def _max_chars_per_sec(cls) -> float:
-        """The truncation guard's chars/sec threshold, read fresh from the env.
+    def _max_chars_per_sec(self, voice: str = None) -> float:
+        """The truncation guard's chars/sec threshold for `voice` (default: this
+        instance's voice), resolved fresh on every call.
 
         Single source for both the env var name and its default (see
         DEFAULT_MAX_CHARS_PER_SEC). Callers keep the '<= 0 disables the guard'
         semantics themselves — this returns whatever was configured, including 0,
         rather than deciding for them.
+
+        Was a @classmethod reading os.environ directly; it now goes through
+        _voice_cap so a registered per-voice cap wins over the env (the resident
+        streaming worker registers one per voice instead of rewriting the
+        process-global env). The env branch is unchanged, so the audiobook
+        worker — one voice per process, caps exported at spawn — resolves exactly
+        the same number it always did.
         """
-        return float(os.environ.get('ORPHEUS_MAX_CHARS_PER_SEC', cls.DEFAULT_MAX_CHARS_PER_SEC))
+        return self._voice_cap('maxCharsPerSec', voice)
 
     def _mlx_token_budget(self, text: str) -> int:
         """Per-chunk MLX max_tokens CEILING sized from the text length, so a short
@@ -999,9 +1120,9 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
         for result in self.mlx_model.generate(
             text,
             voice=self.voice,
-            temperature=self.TEMPERATURE,
-            top_p=self.TOP_P,
-            repetition_penalty=self.REP_PENALTY,
+            temperature=self._voice_cap('temperature'),
+            top_p=self._voice_cap('topP'),
+            repetition_penalty=self._voice_cap('repPenalty'),
             max_tokens=effective_max
         ):
             audio_data = result.audio
@@ -1281,8 +1402,11 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
                     # 0.31.3: stop SEQUENCES, not a set of ints. A set iterates
                     # without raising and silently fails to stop.
                     stop_tokens=[[self.END_OF_AUDIO_TOKEN]],
-                    sampler=make_sampler(self.TEMPERATURE, top_p=self.TOP_P, min_p=self.MIN_P),
-                    logits_processors=make_logits_processors(None, self.REP_PENALTY, 20),
+                    sampler=make_sampler(self._voice_cap('temperature'),
+                                         top_p=self._voice_cap('topP'),
+                                         min_p=self._voice_cap('minP')),
+                    logits_processors=make_logits_processors(
+                        None, self._voice_cap('repPenalty'), 20),
                     completion_batch_size=len(bucket),
                     prefill_batch_size=len(bucket),
                 )
@@ -1354,17 +1478,21 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
         body = self.tokenizer(f"{voice}: {text}").input_ids   # includes leading BOS
         return [128259] + list(body) + [128009, 128260, 128261, 128257]
 
-    def _eos_boost_processor(self, n_chars: int):
+    def _eos_boost_processor(self, n_chars: int, voice: str = None):
         """Per-request vLLM logits processor implementing the EOS boost (see the
         EOS_BOOST comment at the top of the class). Returns None when disabled.
         Expected token count uses the file's own anchors: ~18.4 chars/sec of
-        speech and TOKENS_PER_AUDIO_SECOND audio tokens/sec."""
-        if self.EOS_BOOST <= 0:
+        speech and TOKENS_PER_AUDIO_SECOND audio tokens/sec.
+
+        `voice` is per-request because the boost is a property of the FINE-TUNE
+        (only the bed-free voices carry the thin greedy EOS margin it corrects),
+        and a batch may eventually mix voices."""
+        base = self._voice_cap('eosBoost', voice)
+        if base <= 0:
             return None
         expected = max(300.0, n_chars / 18.4 * self.TOKENS_PER_AUDIO_SECOND)
-        start = self.EOS_BOOST_START * expected
+        start = self._voice_cap('eosBoostStart', voice) * expected
         eos = self.END_OF_AUDIO_TOKEN
-        base = self.EOS_BOOST
 
         def _boost(token_ids, logits):
             n = len(token_ids)
@@ -1374,16 +1502,22 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
             return logits
         return _boost
 
-    def _vllm_sampling_params(self, n_chars: int, max_tokens: int = None):
+    def _vllm_sampling_params(self, n_chars: int, max_tokens: int = None, voice: str = None):
         """The ONE place vLLM SamplingParams are built, so every path carries
-        identical sampling config + the (optional) per-request EOS boost."""
+        identical sampling config + the (optional) per-request EOS boost.
+
+        Every value is resolved for `voice` (default: this instance's voice) —
+        see VOICE_CAP_SOURCES. That is what lets a single batch carry per-item
+        voices, and it is why the BookForge streaming server must build its batch
+        params HERE instead of assembling its own SamplingParams (which silently
+        dropped the EOS boost for every streamed voice)."""
         from vllm import SamplingParams
-        proc = self._eos_boost_processor(n_chars)
+        proc = self._eos_boost_processor(n_chars, voice)
         return SamplingParams(
-            temperature=self.TEMPERATURE,
-            top_p=self.TOP_P,
-            min_p=self.MIN_P,
-            repetition_penalty=self.REP_PENALTY,
+            temperature=self._voice_cap('temperature', voice),
+            top_p=self._voice_cap('topP', voice),
+            min_p=self._voice_cap('minP', voice),
+            repetition_penalty=self._voice_cap('repPenalty', voice),
             max_tokens=max_tokens if max_tokens is not None else self.MAX_AUDIO_TOKENS,
             stop_token_ids=[self.END_OF_AUDIO_TOKEN],
             logits_processors=[proc] if proc else None,
@@ -1510,9 +1644,9 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
             outputs = self.engine.generate(
                 input_ids,
                 max_new_tokens=max_tokens,
-                temperature=self.TEMPERATURE,
-                top_p=self.TOP_P,
-                repetition_penalty=self.REP_PENALTY,
+                temperature=self._voice_cap('temperature'),
+                top_p=self._voice_cap('topP'),
+                repetition_penalty=self._voice_cap('repPenalty'),
                 do_sample=True,
                 pad_token_id=self.tokenizer.pad_token_id or self.tokenizer.eos_token_id,
                 eos_token_id=self.END_OF_AUDIO_TOKEN
@@ -2233,9 +2367,9 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
         (batch_pool_size) — the old 4x pool existed only to refill length buckets,
         and both are gone now that 0.31.3 right-pads prefills.
 
-        Sampling follows the class constants
-        (TEMPERATURE/TOP_P/MIN_P/REP_PENALTY) like the vLLM paths — except
-        min_p, which the single-seq MLX path (_generate_mlx) can't apply
+        Sampling follows the per-voice caps
+        (temperature/topP/minP/repPenalty, see VOICE_CAP_SOURCES) like the vLLM
+        paths — except min_p, which the single-seq MLX path (_generate_mlx) can't apply
         (mlx_audio's generate doesn't plumb it; see the MIN_P comment).
         """
         try:
@@ -2274,8 +2408,11 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
                         # 0.31.3: stop SEQUENCES, not a set of ints — a set iterates
                         # without raising and silently fails to stop.
                         stop_tokens=[[self.END_OF_AUDIO_TOKEN]],
-                        sampler=make_sampler(self.TEMPERATURE, top_p=self.TOP_P, min_p=self.MIN_P),
-                        logits_processors=make_logits_processors(None, self.REP_PENALTY, 20),
+                        sampler=make_sampler(self._voice_cap('temperature'),
+                                             top_p=self._voice_cap('topP'),
+                                             min_p=self._voice_cap('minP')),
+                        logits_processors=make_logits_processors(
+                            None, self._voice_cap('repPenalty'), 20),
                         completion_batch_size=len(bucket),
                         prefill_batch_size=len(bucket),
                     )
