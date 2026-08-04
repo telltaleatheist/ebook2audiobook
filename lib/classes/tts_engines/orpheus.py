@@ -347,7 +347,12 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
                 # vLLM-only and load_engine refuses any other backend.
                 self.TRANSFORMERS_MODEL = self.base_dir
                 self.voice = (voice or '').strip().lower()
-                if not self.voice:
+                # 'internal' is conf_models.default_fine_tuned — the sentinel both
+                # session builders substitute when --fine_tuned was never passed, so
+                # an empty check alone can never fire. Rendering with "internal: "
+                # would apply the right LoRA under a prompt token the adapter was
+                # never trained on: audio that sounds plausible and is wrong.
+                if self.voice in ('', 'internal'):
                     raise ValueError(
                         f'Orpheus adapter mode ({self.adapter_dir}) needs --fine_tuned: '
                         'the voice token the adapter was trained on.'
@@ -423,9 +428,10 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
     def _validate_adapter_config(self, path: str):
         """Reject adapters vLLM cannot serve, HERE, where the reason is readable.
 
-        vLLM 0.7.3 checks the same three properties in PEFTHelper._validate_features,
-        but deep inside engine startup where the failure surfaces as an opaque worker
-        crash with no mention of the adapter."""
+        vLLM 0.7.3 checks modules_to_save and use_dora in
+        PEFTHelper._validate_features, and rank and bias in PEFTHelper.validate_legal
+        — all deep inside engine startup where the failure surfaces as an opaque
+        worker crash with no mention of the adapter."""
         import json as _json
         with open(path, 'r', encoding='utf-8') as handle:
             config = _json.load(handle)
@@ -443,6 +449,13 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
             )
         if config.get('use_dora'):
             raise ValueError(f'Orpheus adapter {path}: use_dora is not supported by vLLM 0.7.3')
+        bias = config.get('bias', 'none')
+        if bias != 'none':
+            raise ValueError(
+                f'Orpheus adapter {path}: bias={bias!r}. The engine is built without '
+                'enable_lora_bias, so PEFTHelper.validate_legal rejects any bias mode '
+                "other than 'none' at startup."
+            )
 
     @staticmethod
     def _evict_global_cache():
