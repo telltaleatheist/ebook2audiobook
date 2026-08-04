@@ -325,12 +325,16 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
     # lib/core.cleanup_models_cache() deletes every key in it that doesn't name an
     # active model, which would drop the caps and silently revert every voice to
     # the defaults. Caps hold no weights, so keeping them for the life of the
-    # process costs nothing. (The LoRA registry stays in loaded_tts, where
-    # cleanup_models_cache DOES wipe it on every convert_ebook entry — a known
-    # hazard on the single-process GUI path: a wipe while vLLM still caches
-    # adapter weights under the old lora_int_ids could hand a recycled id to a
-    # different voice. The worker and streaming processes never call
-    # cleanup_models_cache; revisit when streaming gains adapter mode.)
+    # process costs nothing.
+    #
+    # The LoRA registry, by contrast, BELONGS in loaded_tts: its ids key a cache
+    # that lives inside the vLLM engine object, so it must die exactly when the
+    # engine does. _evict_global_cache drops both together, and
+    # cleanup_models_cache (the single-process GUI path) deletes every non-active
+    # key — which includes 'orpheus' itself, so the registry and the engine it
+    # describes are wiped in the same sweep and the next engine renumbers from 1
+    # against an empty adapter cache. A recycled id can therefore never reach a
+    # live engine that has different weights cached under it.
     _voice_caps = {}
 
     # Special token IDs
@@ -351,10 +355,15 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
             self.mlx_model = None  # For MLX backend
 
             # Session-scoped self-calibrating ceiling for the truncation guard's
-            # chars/sec threshold (see _guard_truncation). Starts at 0.0 (no
+            # chars/sec threshold (see _guard_truncation). Starts empty (no
             # ratchet); the guard only ever raises it, and only from rates
             # measured on force-split re-renders (which cannot be truncated).
-            self._rate_ceiling = 0.0
+            #
+            # Keyed BY VOICE, because the thing it calibrates is one voice's natural
+            # speaking rate: a resident streaming engine serves several voices, and a
+            # ceiling ratcheted up by a fast fine-tune (deathstalker ~23.5 ch/s) would
+            # otherwise disarm the guard for a slow one still reading at ~15.
+            self._rate_ceilings = {}
 
             # Try to load presets, but don't fail if they're missing
             try:
@@ -520,13 +529,21 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
         orpheus_base_dir and on cleanup, so a custom voice's weights actually free
         instead of being reused.
 
-        The LoRA registry (orpheus_lora_ids / orpheus_lora_paths) is deliberately
-        NOT dropped: those ids must stay stable for the life of the process (see
-        _register_lora), and they hold no weights, so keeping them across an engine
-        reload costs nothing."""
+        The LoRA registry (orpheus_lora_ids / orpheus_lora_paths / the id counter)
+        goes WITH the engine. lora_int_ids only ever need to be unique for the life
+        of the ENGINE that caches weights under them — the cache is vLLM-internal
+        and dies with the LLM object — so an engine reload starts from an empty
+        adapter cache and ids may safely restart at 1.
+
+        Keeping the registry across a reload was worse than useless: it made
+        _register_lora refuse to re-point a voice at a different adapter dir
+        (retraining a voice would have needed a process restart on the resident
+        streaming server), while protecting an id space that no longer had anything
+        cached under it."""
         for k in ('orpheus', 'orpheus_mlx_model', 'orpheus_snac', 'orpheus_tokenizer',
                   'orpheus_backend', 'orpheus_device', 'orpheus_model_dir',
-                  'orpheus_base_dir'):
+                  'orpheus_base_dir', 'orpheus_lora_ids', 'orpheus_lora_paths',
+                  'orpheus_lora_next_id'):
             if k in loaded_tts:
                 try:
                     del loaded_tts[k]
@@ -827,13 +844,28 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
 
     @staticmethod
     def _register_lora(voice: str, adapter_dir: str) -> int:
-        """Stable process-global int id for `voice`'s adapter.
+        """The int id `voice`'s adapter is served under, registering it if new.
 
-        vLLM caches an adapter's weights under lora_int_id, so the SAME voice must
-        always present the SAME id (otherwise its weights are re-read from disk on
-        every request) and two voices must NEVER share one (the second would be
-        served the first's cached weights — a silent wrong-voice render). Ids start
-        at 1 because 0 means "no adapter" to vLLM.
+        vLLM caches an adapter's weights under lora_int_id, so within one ENGINE the
+        same voice must always present the same id (otherwise its weights are re-read
+        from disk on every request) and two voices must NEVER share one (the second
+        would be served the first's cached weights — a silent wrong-voice render).
+        Ids start at 1 because 0 means "no adapter" to vLLM.
+
+        Engine LIFETIME, not process lifetime: the cache the ids key into lives
+        inside the LLM object, so _evict_global_cache drops this registry along with
+        the engine and the next engine starts numbering from 1 against an empty
+        cache. Within one engine the counter only ever moves FORWARD
+        (orpheus_lora_next_id) — an id is never reused, even for a voice that has
+        been re-pointed.
+
+        RE-POINTING a voice (same token, different adapter dir — a retrained voice
+        reloaded on the resident streaming server) mints a FRESH id rather than
+        raising. The old id may still have the old weights cached inside the live
+        engine, so reusing it would keep serving the previous training run; a new id
+        is a cache miss by construction and loads the new adapter. (It also leaks the
+        old id's slot in the host-side cache until the engine is torn down, which is
+        what max_cpu_loras is sized for.)
 
         Process-global, not per-instance: the streaming worker switches voices
         in-process against ONE engine, and the ids must line up across those
@@ -846,16 +878,73 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
             loaded_tts['orpheus_lora_ids'] = ids
             loaded_tts['orpheus_lora_paths'] = paths
         registered = paths.get(voice)
-        if registered is not None and registered != adapter_dir:
+        if voice in ids and registered == adapter_dir:
+            return ids[voice]
+        next_id = int(loaded_tts.get('orpheus_lora_next_id', 1))
+        loaded_tts['orpheus_lora_next_id'] = next_id + 1
+        if registered is not None:
+            print(f"[ORPHEUS] Voice '{voice}' re-pointed from adapter {registered} to "
+                  f'{adapter_dir}; issuing a fresh lora id {next_id} (was {ids.get(voice)}) '
+                  'so the live engine cannot serve the old cached weights.')
+        ids[voice] = next_id
+        paths[voice] = adapter_dir
+        return next_id
+
+    @classmethod
+    def register_adapter(cls, voice: str, adapter_dir: str) -> int:
+        """PUBLIC: make `voice` servable as a per-request LoRA on the live engine.
+
+        The BookForge streaming server calls this when it loads an adapter voice onto
+        an engine that is already up: a 'load' in adapter mode registers weights, it
+        does not build anything, so switching between two adapters over the same base
+        costs no vLLM reload and no CUDA-graph recapture. Returns the lora_int_id.
+
+        Registration alone does NOT change which voice a bare generate() renders —
+        that is `set_voice`. Both are needed for a default-voice switch; only this one
+        is needed to make a voice available to a per-item mixed-voice batch.
+        """
+        if not voice:
+            raise ValueError('Orpheus.register_adapter() requires a voice token')
+        if not adapter_dir:
             raise ValueError(
-                f"Orpheus voice '{voice}' is already registered to adapter {registered}; "
-                f'refusing to re-point it at {adapter_dir} — vLLM would keep serving the '
-                'weights already cached under this id.'
+                f"Orpheus.register_adapter({voice!r}) requires the voice's adapter dir"
             )
-        if voice not in ids:
-            ids[voice] = len(ids) + 1
-            paths[voice] = adapter_dir
-        return ids[voice]
+        return cls._register_lora(voice, adapter_dir)
+
+    def set_voice(self, voice: str, adapter_dir: str = None) -> None:
+        """Re-point THIS resident engine's default voice, without reloading weights.
+
+        The streaming server keeps one Orpheus instance alive across voice switches,
+        so the instance's own idea of its voice has to move with it — and in adapter
+        mode `self.adapter_dir` must move with `self.voice` in LOCKSTEP, because
+        _lora_request() serves the instance's own voice straight from self.adapter_dir
+        (skipping the registry). Setting `voice` alone would leave the previous
+        voice's adapter attached to the new token: the right prompt prefix over the
+        wrong LoRA, which renders as plausible audio in the wrong voice.
+
+        The mode may not change here — an engine built without enable_lora can never
+        serve an adapter, and a merged voice IS its weights. Callers that need a
+        different mode (or a different base) must tear the engine down and rebuild;
+        this method refuses rather than pretending it can.
+        """
+        if not voice:
+            raise ValueError('Orpheus.set_voice() requires a voice token')
+        if self.custom_model_dir:
+            raise ValueError(
+                f'Orpheus is serving the merged model {self.custom_model_dir}, whose voice IS '
+                f"its weights — it cannot be re-pointed at '{voice}' in place; reload the engine."
+            )
+        if bool(adapter_dir) != bool(self.adapter_dir):
+            raise ValueError(
+                f"Orpheus.set_voice({voice!r}): this engine was built "
+                f'{"WITH" if self.adapter_dir else "WITHOUT"} LoRA support '
+                f'(adapter_dir={self.adapter_dir!r}) and cannot switch to a '
+                f'{"stock" if self.adapter_dir else "adapter"} voice in place; reload the engine.'
+            )
+        if adapter_dir:
+            self.register_adapter(voice, adapter_dir)
+            self.adapter_dir = adapter_dir
+        self.voice = voice
 
     def _lora_request(self, voice: str = None):
         """The LoRARequest that renders `voice` (default: this instance's voice), or
@@ -1549,7 +1638,8 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
 
         return tokens
 
-    def _generate_audio_vllm_safe(self, clean: str, depth: int = 0, force_split: bool = False):
+    def _generate_audio_vllm_safe(self, clean: str, depth: int = 0, force_split: bool = False,
+                                  voice: str = None):
         """Render audio for `clean`; if the model hits the token cap before emitting the
         end-of-audio token (the chunk is too long to finish), split it at the nearest
         sentence/space boundary and render each half, concatenating the audio. Recurses
@@ -1564,19 +1654,27 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
         reliable zone. Parts recurse WITHOUT force_split (the normal cap logic
         applies to them); text that can't be split (parts < 2) falls through to a
         normal render.
+
+        `voice` (default: this instance's voice) selects the prompt token, the
+        sampling caps AND the adapter, so a mixed-voice batch's per-row retakes
+        re-render in the row's OWN voice. Every recursion carries it: a retake that
+        silently dropped back to the default voice would swap the narrator
+        mid-sentence, on exactly the rows that already needed help.
         """
         from vllm import SamplingParams, TokensPrompt
         import numpy as np
+        if voice is None:
+            voice = self.voice
         if force_split:
             parts = self._split_long_text(clean, max_length=max(60, len(clean) // 2))
             if len(parts) >= 2:
-                return np.concatenate(self._generate_parts_batched(parts, depth + 1))
-        sampling_params = self._vllm_sampling_params(len(clean))
-        prompt = TokensPrompt(prompt_token_ids=self._format_prompt_ids(clean))
+                return np.concatenate(self._generate_parts_batched(parts, depth + 1, voice))
+        sampling_params = self._vllm_sampling_params(len(clean), voice=voice)
+        prompt = TokensPrompt(prompt_token_ids=self._format_prompt_ids(clean, voice))
         # lora_request goes on BOTH calls: the fallback exists only for a vLLM build
         # that doesn't take use_tqdm, and a retry without the adapter would render the
         # base voice while reporting success.
-        lora_request = self._lora_request()
+        lora_request = self._lora_request(voice)
         try:
             outputs = self.engine.generate([prompt], sampling_params, use_tqdm=False,
                                            lora_request=lora_request)
@@ -1592,9 +1690,9 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
         parts = self._split_long_text(clean, max_length=max(60, len(clean) // 2))
         if len(parts) < 2:
             return self._tokens_to_audio(tokens)
-        return np.concatenate(self._generate_parts_batched(parts, depth + 1))
+        return np.concatenate(self._generate_parts_batched(parts, depth + 1, voice))
 
-    def _generate_parts_batched(self, parts: list, depth: int) -> list:
+    def _generate_parts_batched(self, parts: list, depth: int, voice: str = None) -> list:
         """Render many text parts in ONE vLLM generate() call. Returns waveforms
         aligned to `parts`.
 
@@ -1609,11 +1707,14 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
         exact recursion/accept behaviour matters more than batching it.
         """
         from vllm import TokensPrompt
-        sampling_params = [self._vllm_sampling_params(len(p)) for p in parts]
-        prompts = [TokensPrompt(prompt_token_ids=self._format_prompt_ids(p)) for p in parts]
-        # Every part is the same voice, so one LoRARequest covers the call — vLLM
-        # applies a scalar lora_request to all prompts (_validate_and_add_requests).
-        lora_request = self._lora_request()
+        if voice is None:
+            voice = self.voice
+        sampling_params = [self._vllm_sampling_params(len(p), voice=voice) for p in parts]
+        prompts = [TokensPrompt(prompt_token_ids=self._format_prompt_ids(p, voice)) for p in parts]
+        # Every part is the same voice (they are pieces of ONE sentence), so one
+        # LoRARequest covers the call — vLLM applies a scalar lora_request to all
+        # prompts (_validate_and_add_requests).
+        lora_request = self._lora_request(voice)
         try:
             outputs = self.engine.generate(prompts, sampling_params, use_tqdm=False,
                                            lora_request=lora_request)
@@ -1629,7 +1730,7 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
                     continue
                 except TokenStreamMisaligned as align_err:
                     print(f"Orpheus: split part token stream misaligned ({align_err}); re-rendering once")
-            waves.append(self._generate_audio_vllm_safe(part, depth))
+            waves.append(self._generate_audio_vllm_safe(part, depth, voice=voice))
         return waves
 
     def _generate_tokens_transformers(self, prompt: str, max_tokens: int = None) -> list:
@@ -1965,7 +2066,8 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
         except Exception as err:
             print(f'Orpheus: could not keep the rejected render for sentence {sentence_index} ({err})')
 
-    def _guard_truncation(self, sentence_index: int, clean: str, audio_np, resplit):
+    def _guard_truncation(self, sentence_index: int, clean: str, audio_np, resplit,
+                          voice: str = None):
         """Backstop for silent early-EOS truncation (see _speech_rate). If the
         rendered clip is too short for the text, re-render it split at sentence
         boundaries via `resplit` (the backend's _generate_*_safe ladder). `resplit`
@@ -1981,7 +2083,7 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
         noisy) and ORPHEUS_MAX_CHARS_PER_SEC > 0 (DEFAULT_MAX_CHARS_PER_SEC when
         unset; set 0 to disable). Read via _max_chars_per_sec().
 
-        SELF-CALIBRATING RATCHET (self._rate_ceiling): that default was
+        SELF-CALIBRATING RATCHET (self._rate_ceiling(voice)): that default was
         calibrated on ~15-17 ch/s voices; a faster fine-tune (e.g. one that
         naturally reads ~20 ch/s) trips the guard on every long healthy chunk,
         each false positive costing a full wasted serialized re-render. But the
@@ -2004,16 +2106,26 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
         is a definite failure, not a noisy metric, so it gets its one re-render
         regardless of the 150-char floor. If the retake is empty too, the empty
         result flows back to the caller — _save_audio rejects it (row fails
-        loudly) and the streaming worker emits 'No audio generated'."""
-        reason = self._needs_resplit(sentence_index, clean, audio_np)
+        loudly) and the streaming worker emits 'No audio generated'.
+
+        `voice` (default: this instance's voice) is the row's own voice, so a
+        mixed-voice batch judges each row against ITS fine-tune's rate threshold."""
+        reason = self._needs_resplit(sentence_index, clean, audio_np, voice)
         if reason is None:
             return audio_np
         audio_np = resplit(clean)
         if reason == 'short':
-            self._ratchet_after_resplit(clean, audio_np)
+            self._ratchet_after_resplit(clean, audio_np, voice)
         return audio_np
 
-    def _needs_resplit(self, sentence_index: int, clean: str, audio_np):
+    def _rate_ceiling(self, voice: str = None) -> float:
+        """This session's ratcheted chars/sec ceiling for `voice` (0.0 = never
+        ratcheted). See the _rate_ceilings note in __init__ for why it is per-voice."""
+        if voice is None:
+            voice = self.voice
+        return self._rate_ceilings.get(voice, 0.0)
+
+    def _needs_resplit(self, sentence_index: int, clean: str, audio_np, voice: str = None):
         """DECISION half of _guard_truncation. Returns 'empty', 'short', or None.
 
         Split out from the re-render so the BATCH path can defer the expensive half:
@@ -2021,17 +2133,21 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
         a batch can be judged immediately and their re-renders pooled into one call
         (see _render_deferred_resplits). The log lines still fire here, at detection
         time, so the reason a chunk gets re-rendered is visible where it happens.
+
+        `voice` (default: this instance's voice) picks BOTH the configured threshold
+        and the ratchet, because how many chars a second is "too fast to be real" is a
+        property of the fine-tune, not of the process.
         """
         if (audio_np is None or len(audio_np) == 0) and clean and clean.strip():
             print(f"Orpheus: sentence {sentence_index} produced no audio — re-rendering split at sentence boundaries")
             self._keep_reject(sentence_index, clean, audio_np, 'empty')
             return 'empty'
-        env_rate = self._max_chars_per_sec()
+        env_rate = self._max_chars_per_sec(voice)
         # A disabled guard (env <= 0) stays disabled — the ratchet must NEVER
         # resurrect it. Only past this gate does the session ceiling apply.
         if env_rate <= 0 or len(clean) <= 150:
             return None
-        max_rate = max(env_rate, self._rate_ceiling)
+        max_rate = max(env_rate, self._rate_ceiling(voice))
         rate = self._speech_rate(clean, audio_np)
         if rate is None or rate <= max_rate:
             return None
@@ -2042,7 +2158,7 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
                            'threshold_chars_per_second': round(max_rate, 2)})
         return 'short'
 
-    def _ratchet_after_resplit(self, clean: str, audio_np) -> None:
+    def _ratchet_after_resplit(self, clean: str, audio_np, voice: str = None) -> None:
         """RATCHET half of _guard_truncation — see its docstring for the full rationale.
 
         The split render is un-truncatable, so if its rate STILL exceeds the threshold
@@ -2050,15 +2166,17 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
         ceiling (never lower it) so subsequent healthy fast chunks stop tripping.
         Only ever called for a 'short' verdict — an 'empty' one carries no rate signal.
         """
-        env_rate = self._max_chars_per_sec()
+        if voice is None:
+            voice = self.voice
+        env_rate = self._max_chars_per_sec(voice)
         if env_rate <= 0:
             return
-        max_rate = max(env_rate, self._rate_ceiling)
+        max_rate = max(env_rate, self._rate_ceiling(voice))
         rate2 = self._speech_rate(clean, audio_np)
         if rate2 is not None and rate2 > max_rate:
             new_ceiling = rate2 + 0.5
-            self._rate_ceiling = new_ceiling
-            print(f"Orpheus: voice's measured natural rate {rate2:.1f} ch/s exceeds guard "
+            self._rate_ceilings[voice] = new_ceiling
+            print(f"Orpheus: voice '{voice}' measured natural rate {rate2:.1f} ch/s exceeds guard "
                   f"threshold {max_rate:.1f} — recalibrating threshold to {new_ceiling:.1f} for this session")
 
     def _save_audio(self, sentence_index: int, audio_np, lead_gap: float = 0.0, trail_gap: float = 0.0) -> bool:
