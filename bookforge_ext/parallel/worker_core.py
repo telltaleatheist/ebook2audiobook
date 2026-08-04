@@ -419,12 +419,21 @@ def run_worker_tts(
 
             # Per-take temperature (BookForge "Correct Sentences" entropy): give each take
             # a different sampling temperature IN THE SAME model load, so re-rolls are
-            # genuinely varied rather than near-identical. make_sampler reads
-            # engine.TEMPERATURE fresh per batch, so setting it here takes effect for this
-            # take. Orpheus exposes TEMPERATURE; engines that don't just use their default.
+            # genuinely varied rather than near-identical.
             if take_temperatures and take < len(take_temperatures):
                 _temp = float(take_temperatures[take])
-                if hasattr(tts_manager.engine, 'TEMPERATURE'):
+                if hasattr(tts_manager.engine, 'register_voice_caps'):
+                    # Orpheus resolves sampling caps registry -> env -> class attr, so a
+                    # bare TEMPERATURE assignment loses to an inherited ORPHEUS_TEMPERATURE
+                    # env var and the takes all render alike. The registry is the top of
+                    # that order. Registration REPLACES the voice's caps dict — safe here
+                    # because the audiobook worker supplies every other cap via env vars,
+                    # never the registry.
+                    tts_manager.engine.register_voice_caps(
+                        tts_manager.engine.voice, {'temperature': _temp})
+                    print(f"[WORKER] Take {take}: sampling temperature = {_temp}")
+                elif hasattr(tts_manager.engine, 'TEMPERATURE'):
+                    # Engines whose samplers read engine.TEMPERATURE fresh per batch.
                     tts_manager.engine.TEMPERATURE = _temp
                     print(f"[WORKER] Take {take}: sampling temperature = {_temp}")
                 else:

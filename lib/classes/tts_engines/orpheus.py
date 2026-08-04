@@ -325,8 +325,12 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
     # lib/core.cleanup_models_cache() deletes every key in it that doesn't name an
     # active model, which would drop the caps and silently revert every voice to
     # the defaults. Caps hold no weights, so keeping them for the life of the
-    # process costs nothing. (The LoRA registry lives in loaded_tts because its
-    # ids are meaningful only against a live vLLM engine.)
+    # process costs nothing. (The LoRA registry stays in loaded_tts, where
+    # cleanup_models_cache DOES wipe it on every convert_ebook entry — a known
+    # hazard on the single-process GUI path: a wipe while vLLM still caches
+    # adapter weights under the old lora_int_ids could hand a recycled id to a
+    # different voice. The worker and streaming processes never call
+    # cleanup_models_cache; revisit when streaming gains adapter mode.)
     _voice_caps = {}
 
     # Special token IDs
