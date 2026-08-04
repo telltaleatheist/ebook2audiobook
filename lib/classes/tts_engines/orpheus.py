@@ -2075,7 +2075,7 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
             print(f"Orpheus _generate_mlx_batch_audio decode error [{i}]: {decode_err}")
             return None
 
-    def _generate_mlx_batch_audio(self, texts: list, on_row=None) -> list:
+    def _generate_mlx_batch_audio(self, texts: list, on_row=None, should_stop=None) -> list:
         """Batch-generate raw audio for many (already-cleaned) sentences in ONE
         MLX BatchGenerator pass — continuous batching, ~3.6x the per-sentence
         throughput. Returns float32 waveforms aligned to `texts` (None for an
@@ -2096,6 +2096,25 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
         so an out-of-order-tolerant caller can reassemble. The full aligned list is
         still returned either way; callers that used on_row may ignore it.
         Default None -> byte-identical behaviour to before (audiobook, warmup).
+
+        `should_stop()` — optional. Checked once per DECODE STEP (and once before
+        each bucket), which is cheap next to a forward pass over the batch. When it
+        goes true the generation is ABANDONED where it stands: the live
+        BatchGenerator is closed, no further bucket is started, and every row that
+        had not yet retired is left as None — deliberately NOT handed to on_row, so
+        a caller streaming rows cannot mistake an abandoned row for a finished one.
+        Rows that already retired through on_row stay delivered; they were real
+        audio before the stop arrived.
+
+        This exists because the streaming worker is SERIAL and a read-ahead batch is
+        30-43s long: when the listener switches voice or presses play, everything in
+        flight is stale the instant they act, and without a way out the new voice's
+        load and the new block's batch queue behind ~40s of renders nobody will ever
+        hear. Default None -> the audiobook path is untouched and uninterruptible,
+        which is what it wants.
+
+        The model itself is never touched: each bucket builds its own
+        BatchGenerator, so an abandoned one leaves nothing behind for the next call.
         """
         from mlx_lm.generate import BatchGenerator
         from mlx_lm.sample_utils import make_sampler, make_logits_processors
@@ -2117,7 +2136,13 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
         # prefills are cheap. One bad group must not kill the rest, so each is
         # wrapped independently (matching the old whole-batch try/except
         # granularity).
+        stopped = False
         for bucket, depth in self._mlx_batch_groups(gen):
+            # A stop between buckets: start nothing new. The rows of every remaining
+            # bucket stay None, which is the caller's "not rendered" contract.
+            if should_stop is not None and should_stop():
+                stopped = True
+                break
             try:
                 bg = BatchGenerator(
                     self.mlx_model,
@@ -2157,7 +2182,20 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
                             results[i] = self._resolve_mlx_row(i, ptoks, clean, out[r.uid], depth)
                             if on_row is not None:
                                 on_row(i, results[i])
+                    # Once per decode step — a dict lookup against a forward pass over
+                    # the whole batch. Rows that retired above are already delivered;
+                    # the rest are abandoned unresolved.
+                    if should_stop is not None and should_stop():
+                        stopped = True
+                        break
                 bg.close()
+                if stopped:
+                    # stderr, not stdout: the streaming worker's stdout IS the
+                    # JSON-lines protocol, and this line lands mid-batch.
+                    print(f"[ORPHEUS] MLX batch abandoned on request "
+                          f"({len(pending)} of {len(bucket)} rows unrendered)",
+                          file=sys.stderr, flush=True)
+                    break
                 # Anything that never reported a finish_reason (shouldn't happen)
                 # still gets resolved — and emitted — exactly once.
                 for (i, ptoks, clean, _budget), uid in zip(bucket, uids):
