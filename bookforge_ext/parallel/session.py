@@ -75,6 +75,8 @@ def save_session_state(session_id: str, args: dict, prep_result: dict, core_modu
             'custom_model': session.get('custom_model'),
             'custom_model_dir': session.get('custom_model_dir'),
             'orpheus_model_dir': session.get('orpheus_model_dir'),
+            'orpheus_adapter_dir': session.get('orpheus_adapter_dir'),
+            'orpheus_base_dir': session.get('orpheus_base_dir'),
             'tts_engine': session.get('tts_engine'),
             'device': args.get('device', default_device),
             'output_format': args.get('output_format', default_output_format),
@@ -419,6 +421,10 @@ def prep_ebook_info(args: dict, core_module) -> dict | None:
         session['custom_model'] = args.get('custom_model')
         # Folder-discovered custom Orpheus model (folder name = voice token).
         session['orpheus_model_dir'] = args.get('orpheus_model_dir')
+        # Orpheus adapter mode: shared base + per-voice LoRA adapter. Recorded in
+        # session state so a worker or a resume renders the SAME voice the prep ran with.
+        session['orpheus_adapter_dir'] = args.get('orpheus_adapter_dir')
+        session['orpheus_base_dir'] = args.get('orpheus_base_dir')
         session['output_format'] = args.get('output_format', default_output_format)
 
         # XTTS settings - save to session-state.json so workers use them instead of defaults
