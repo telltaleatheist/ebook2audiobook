@@ -200,6 +200,10 @@ def create_worker_session(state: dict, args: dict) -> dict:
         # Folder-discovered custom Orpheus model: absolute path to the model dir,
         # folder name = voice token. None → built-in Orpheus model.
         'orpheus_model_dir': args.get('orpheus_model_dir') or state.get('orpheus_model_dir'),
+        # Orpheus adapter mode: shared base + this voice's LoRA adapter, applied per
+        # request. Both come as a pair — the engine refuses one without the other.
+        'orpheus_adapter_dir': args.get('orpheus_adapter_dir') or state.get('orpheus_adapter_dir'),
+        'orpheus_base_dir': args.get('orpheus_base_dir') or state.get('orpheus_base_dir'),
         'audiobooks_dir': args.get('output_dir') or state.get('audiobooks_dir'),
         'session_dir': state['session_dir'],
         'process_dir': state['process_dir'],

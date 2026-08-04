@@ -115,6 +115,12 @@ def main():
     parser.add_argument('--orpheus_model_dir', type=str, default=None,
                        help='Absolute path to a folder-discovered custom Orpheus model; '
                             'its folder name is the voice token (default: from session state)')
+    parser.add_argument('--orpheus_adapter_dir', type=str, default=None,
+                       help='Absolute path to an Orpheus LoRA voice adapter (adapter mode). '
+                            'Requires --orpheus_base_dir; --fine_tuned carries the voice token')
+    parser.add_argument('--orpheus_base_dir', type=str, default=None,
+                       help='Absolute path to the shared Orpheus base model that '
+                            '--orpheus_adapter_dir is applied to (adapter mode)')
     parser.add_argument('--sentences_dir', type=str, default=None,
                        help='Override the folder where sentence audio is written and '
                             'read for skip/resume. When set, this is the single '
@@ -189,6 +195,8 @@ def main():
         'custom_model': args.custom_model,
         'custom_model_dir': args.custom_model_dir,
         'orpheus_model_dir': args.orpheus_model_dir,
+        'orpheus_adapter_dir': args.orpheus_adapter_dir,
+        'orpheus_base_dir': args.orpheus_base_dir,
         'sentences_dir': args.sentences_dir,
     }
 

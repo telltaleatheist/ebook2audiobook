@@ -12,7 +12,8 @@ PARALLEL_OPTIONS = [
     '--resume_session', '--list_sessions', '--no_split', '--chapters', '--skip_deps',
     '--bilingual', '--bilingual_pause', '--bilingual_gap', '--skip_assembly',
     '--sentence_per_paragraph', '--skip_headings', '--session_dir', '--custom_model_dir',
-    '--sentences_dir', '--orpheus_model_dir', '--post_render_filter'
+    '--sentences_dir', '--orpheus_model_dir', '--orpheus_adapter_dir',
+    '--orpheus_base_dir', '--post_render_filter'
 ]
 
 
@@ -166,6 +167,26 @@ def add_arguments(parser):
              'Orpheus engine points every backend at this dir, bypassing the built-in '
              'voice allowlist. Stored in session-state so workers reuse it. Mirrors '
              'the same flag on worker.py.'
+    )
+
+    parallel_group.add_argument(
+        '--orpheus_adapter_dir', type=str, default=None,
+        help='(BookForge) Absolute path to an Orpheus LoRA VOICE ADAPTER (adapter '
+             'mode). The adapter is applied per request over the shared base model '
+             'given by --orpheus_base_dir, so switching voices costs no engine '
+             'reload. --fine_tuned carries the voice token the adapter was trained '
+             'on, which is also its key in the engine\'s adapter registry. Mutually '
+             'exclusive with --orpheus_model_dir (a merged voice). vLLM only. '
+             'Stored in session-state so workers reuse it. Mirrors the same flag on '
+             'worker.py.'
+    )
+
+    parallel_group.add_argument(
+        '--orpheus_base_dir', type=str, default=None,
+        help='(BookForge) Absolute path to the shared Orpheus base model that '
+             '--orpheus_adapter_dir is applied to. Required by, and only meaningful '
+             'with, adapter mode — the engine refuses either flag without the other '
+             'rather than downloading a base or rendering the wrong voice.'
     )
 
     parallel_group.add_argument(
