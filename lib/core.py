@@ -1443,6 +1443,118 @@ def _apply_near_dup_split(chunks: list) -> list:
     return out
 
 
+def _strip_escaped_sml(s:str)->str:
+    return ''.join(c for c in s if ord(c) < sml_escape_tag)
+
+
+def _sentence_min_chars()->int:
+    """Minimum engine-read length (in chars) a text row may have before
+    _apply_min_chars_floor merges it into a neighbour. SENTENCE_MIN_CHARS
+    overrides the 25-char default and 0 disables the pass; an invalid value
+    raises (NO FALLBACK), same handling style as ORPHEUS_MAX_CHARS."""
+    _mn = os.environ.get('SENTENCE_MIN_CHARS')
+    min_chars = int(_mn) if _mn else 25
+    if min_chars < 0:
+        raise ValueError(f'SENTENCE_MIN_CHARS must be >= 0, got {min_chars}')
+    return min_chars
+
+
+def _split_sml_edges(row:str)->tuple:
+    """Split a row into (leading SML tokens, plain core, trailing SML tokens).
+    An escaped SML token is ONE char with ord >= sml_escape_tag — escape_sml
+    replaces each <break>/<pause>/… block with chr(sml_escape_tag + i) — so the
+    edges are found by walking off the SML chars and whitespace at both ends.
+    The core is returned verbatim, mid-row tokens included, so callers can refuse
+    it: orpheus.py's _classify_gap realizes only the LEADING and TRAILING tokens
+    of a row as silence, and a token left mid-row is stripped before TTS with its
+    pause silently discarded."""
+    i, j = 0, len(row)
+    while i < j and (row[i].isspace() or ord(row[i]) >= sml_escape_tag):
+        i += 1
+    while j > i and (row[j - 1].isspace() or ord(row[j - 1]) >= sml_escape_tag):
+        j -= 1
+    lead = ''.join(c for c in row[:i] if ord(c) >= sml_escape_tag)
+    trail = ''.join(c for c in row[j:] if ord(c) >= sml_escape_tag)
+    return lead, row[i:j].strip(), trail
+
+
+def _has_escaped_sml(s:str)->bool:
+    return any(ord(c) >= sml_escape_tag for c in s)
+
+
+def _apply_min_chars_floor(rows:list, clean_len, max_chars:int, min_chars:int)->list:
+    """Merge every row whose engine-read text is shorter than min_chars into a
+    neighbour, so a one-word paragraph ('No.') is never handed to TTS as its own
+    ultra-short prompt. FORWARD first (the tiny row leads into the sentence that
+    follows it); BACKWARD only when the forward merge would break max_chars.
+
+    RATIFIED TRADE-OFF: the SML tokens sitting AT THE JOIN — the tiny row's
+    trailing token, any SML-only rows between the two, and the neighbour's
+    leading token — are DROPPED and the pause they encode is lost. They cannot be
+    carried into the merged row: a token in the middle of a row is stripped
+    before TTS anyway (only edge tokens are realized as silence), so keeping it
+    would lose the same pause while hiding the loss. The pause INTO the merged
+    row survives on its leading edge and the pause out of it on its trailing
+    edge; every dropped join is logged.
+
+    Rows with no plain text (SML-only) are never themselves 'tiny': they are join
+    fuel when consumed between two merged rows, and left untouched otherwise.
+
+    clean_len measures what the engine will actually read (SML stripped, and for
+    Orpheus through the digit/scripture transform), so it must be passed in by
+    the caller that owns that transform."""
+    if min_chars <= 0:
+        return rows
+    out = list(rows)
+    i = 0
+    while i < len(out):
+        lead, core, trail = _split_sml_edges(out[i])
+        if not core or clean_len(out[i]) >= min_chars:
+            i += 1
+            continue
+        if _has_escaped_sml(core):
+            print(f'get_sentences() min-chars floor: mid-row SML token, cannot merge short row: {_strip_escaped_sml(out[i])!r}')
+            i += 1
+            continue
+        # FORWARD — the next row carrying text; every row stepped over on the way
+        # is SML-only and is consumed as join fuel.
+        j = i + 1
+        while j < len(out) and not _split_sml_edges(out[j])[1]:
+            j += 1
+        if j < len(out):
+            next_lead, next_core, next_trail = _split_sml_edges(out[j])
+            if not _has_escaped_sml(next_core):
+                merged = f'{lead}{core} {next_core}{next_trail}'
+                if clean_len(merged) <= max_chars:
+                    dropped = len(trail) + len(next_lead) + sum(
+                        len(_split_sml_edges(r)[0]) + len(_split_sml_edges(r)[2]) for r in out[i + 1:j]
+                    )
+                    out[i:j + 1] = [merged]
+                    print(f'get_sentences() min-chars floor: merged short row forward, {dropped} join pause token(s) dropped: {_strip_escaped_sml(core)!r}')
+                    continue
+        # BACKWARD — symmetric: prev's trailing token and this row's leading token
+        # are the join and are dropped; this row's trailing token is hoisted to the
+        # merged row's trailing edge so the pause out of it still plays.
+        k = i - 1
+        while k >= 0 and not _split_sml_edges(out[k])[1]:
+            k -= 1
+        if k >= 0:
+            prev_lead, prev_core, prev_trail = _split_sml_edges(out[k])
+            if not _has_escaped_sml(prev_core):
+                merged = f'{prev_lead}{prev_core} {core}{trail}'
+                if clean_len(merged) <= max_chars:
+                    dropped = len(prev_trail) + len(lead) + sum(
+                        len(_split_sml_edges(r)[0]) + len(_split_sml_edges(r)[2]) for r in out[k + 1:i]
+                    )
+                    out[k:i + 1] = [merged]
+                    print(f'get_sentences() min-chars floor: merged short row backward, {dropped} join pause token(s) dropped: {_strip_escaped_sml(core)!r}')
+                    i = k
+                    continue
+        print(f'get_sentences() min-chars floor: NO merge fits under {max_chars} chars, short row kept: {_strip_escaped_sml(core)!r}')
+        i += 1
+    return out
+
+
 def get_sentences(text:str, session_id:str)->list|None:
 
     def split_inclusive(text:str, pattern:re.Pattern[str])->list[str]:
@@ -1474,8 +1586,7 @@ def get_sentences(text:str, session_id:str)->list|None:
                 parts.append(tail)
         return parts
 
-    def strip_escaped_sml(s:str)->str:
-        return ''.join(c for c in s if ord(c) < sml_escape_tag)
+    strip_escaped_sml = _strip_escaped_sml
 
     def clean_len(s:str)->int:
         # Length of what the ENGINE will actually read: SML tokens don't count,
@@ -1602,6 +1713,11 @@ def get_sentences(text:str, session_id:str)->list|None:
             _mc = os.environ.get('ORPHEUS_MAX_CHARS')
             max_chars = int(_mc) if _mc else 350
 
+        # Floor for the last pass before each return (_apply_min_chars_floor):
+        # rows shorter than this get merged into a neighbour rather than becoming
+        # their own starved TTS prompt.
+        min_chars = _sentence_min_chars()
+
         # Orpheus rows are stored/displayed BOOK-EXACT; the scripture+digit
         # expansion happens at the engine boundary (_clean_sentence_for_tts).
         # tts_form is that same transform, used HERE only so clean_len measures
@@ -1671,7 +1787,13 @@ def get_sentences(text:str, session_id:str)->list|None:
             if i + 1 < n:
                 next_s = hard_list[i + 1].strip()
                 next_clean = strip_escaped_sml(next_s)
-                if next_clean and sum(c.isalnum() for c in next_clean) < 3:
+                # _plain BOTH SIDES: this mini-merge used to glue an almost-empty
+                # hard row onto its predecessor on length alone, which could bury
+                # an SML token mid-row — where it is stripped before TTS and its
+                # pause silently lost. Token-carrying fragments now fall through
+                # to the min-chars floor pass, which merges at the EDGES.
+                if (next_clean and sum(c.isalnum() for c in next_clean) < 3
+                        and _plain(s) and _plain(next_s)):
                     s = f"{s} {next_s}"
                     i += 2
                 else:
@@ -1806,7 +1928,7 @@ def get_sentences(text:str, session_id:str)->list|None:
                         packed[-1] = packed[-1].rstrip() + ' ' + s.lstrip()
                     else:
                         packed.append(s)
-                return packed
+                return _apply_min_chars_floor(packed, clean_len, max_chars, min_chars)
             if tts_engine == 'orpheus':
                 # PASS 5 (Orpheus) — greedily pack adjacent sentences up to max_chars so
                 # each generation spans 2-3 sentences: coherent timbre/prosody across a
@@ -1851,10 +1973,15 @@ def get_sentences(text:str, session_id:str)->list|None:
                     else:
                         packed.append(s)
                 if max_sents is None:
+                    # MIN-CHARS FLOOR runs BEFORE PASS 6: anti-runaway trumps the
+                    # floor, so if a near-duplicate re-split breaks a floored merge
+                    # back apart, near-dup wins.
                     # PASS 6 — repetition-primed split (anti-runaway). See
                     # _apply_near_dup_split: keeps a near-duplicate sentence pair
                     # out of one generation. No-op for non-repetitive prose.
-                    return _apply_near_dup_split(packed)
+                    return _apply_near_dup_split(
+                        _apply_min_chars_floor(packed, clean_len, max_chars, min_chars)
+                    )
                 def _split_to_cap(t):
                     parts, last = [], 0
                     for m in re.finditer(r'[.!?…]["\'”’)\]]*\s+', t):
@@ -1877,9 +2004,12 @@ def get_sentences(text:str, session_id:str)->list|None:
                         capped.extend(_split_to_cap(item))
                     else:
                         capped.append(item)
-                # PASS 6 — repetition-primed split (anti-runaway); see above.
-                return _apply_near_dup_split(capped)
-            return final_list
+                # MIN-CHARS FLOOR then PASS 6 — repetition-primed split
+                # (anti-runaway); see above.
+                return _apply_near_dup_split(
+                    _apply_min_chars_floor(capped, clean_len, max_chars, min_chars)
+                )
+            return _apply_min_chars_floor(final_list, clean_len, max_chars, min_chars)
     except Exception as e:
         print(f'get_sentences() error: {e}')
         return None
