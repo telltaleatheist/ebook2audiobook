@@ -955,23 +955,92 @@ YOU CAN IMPROVE IT OR ASK TO A TRAINING MODEL EXPERT.
         DependencyError(error)
         return []
 
+def _edge_chars(tag:Any)->tuple:
+    """(first char, last char) of a Tag's VERBATIM text — ('', '') when it has
+    none. bs4's .strings yields the source NavigableStrings untouched, so unlike
+    get_text(strip=True) this still knows whether the markup put whitespace at
+    the tag's edges. Used ONLY to answer that question in _tuple_row."""
+    first = last = ''
+    for s in tag.strings:
+        if s:
+            if not first:
+                first = s[0]
+            last = s[-1]
+    return first, last
+
+
+def _collapse_glue(rows:list)->list:
+    """Resolve the ('glue', payload) markers _tuple_row emits where two pieces of
+    text ABUT in the markup with NO whitespace between them.
+
+    Two text rows either side of a glue are concatenated with NOTHING between
+    them, because that is what the document says: a drop cap
+    (`<span class="cic">W</span>e have freedom.`) is one word, and so is
+    `<i>Fu</i>ture`. Every other case restores exactly what the walk emitted
+    before the marker existed — payload is the [break] that was suppressed, or
+    None where the walk emitted nothing — so no other boundary moves.
+
+    This is deliberately NOT a drop-cap detector: it never looks at letter case
+    or word length. `<span>A</span>braham Lincoln` joins because the markup has
+    no space; `<span>I</span> can hardly say` keeps its space because the markup
+    has one; and a plain "A man walked" was never two rows to begin with."""
+    out = []
+    glued = False
+    suppressed = None
+    for typ, payload in rows:
+        if typ == 'glue':
+            glued = True
+            suppressed = payload if suppressed is None else suppressed
+            continue
+        if glued:
+            glued = False
+            pending, suppressed = suppressed, None
+            if typ == 'text' and out and out[-1][0] == 'text':
+                out[-1] = ('text', out[-1][1] + payload)
+                continue
+            if pending is not None:
+                out.append(('break', pending))
+        out.append((typ, payload))
+    return out
+
+
 def filter_chapter(idx:int, doc:EpubHtml, session_id:str, stanza_nlp:Pipeline, is_num2words_compat:bool)->list|None:
 
     def _tuple_row(node:Any, last_text_char:str|None=None)->Generator[tuple[str, Any], None, None]|None:
         try:
             prev_child_had_data = False
+            # WHITESPACE FIDELITY (see _collapse_glue): True when the SOURCE markup
+            # puts whitespace between the last text character emitted at this level
+            # and whatever comes next. The walk used to answer that question with
+            # prev_child_had_data alone — "the previous sibling had text" — and so
+            # separated EVERY pair of adjacent inline pieces, even ones the document
+            # writes with nothing between them. That is what turns a drop cap
+            # (`<span class="cic">W</span>e have freedom.`) into the spoken "W e have
+            # freedom." and `<i>Fu</i>ture` into "Fu ture".
+            ws_pending = False
             for idx, child in enumerate(node.children):
                 current_child_had_data = False
                 if isinstance(child, NavigableString):
+                    raw = str(child)
                     text = child.strip()
                     if text:
                         if prev_child_had_data:
-                            yield ('break', sml_token("break"))
+                            if ws_pending or raw[:1].isspace():
+                                yield ('break', sml_token("break"))
+                            else:
+                                yield ('glue', sml_token("break"))
                         yield ('text', text)
                         last_text_char = text[-1]
                         current_child_had_data = True
+                        ws_pending = raw[-1:].isspace()
+                    elif raw:
+                        # A whitespace-only string is not data, but it IS whitespace:
+                        # `<span>W</span> <i>ord</i>` must not glue.
+                        ws_pending = True
                 elif isinstance(child, Tag):
                     name = child.name.lower()
+                    first_char, last_char = _edge_chars(child)
+                    lead_ws = ws_pending or first_char.isspace()
                     if name in heading_tags:
                         title = child.get_text(strip=True)
                         if title:
@@ -990,7 +1059,13 @@ def filter_chapter(idx:int, doc:EpubHtml, session_id:str, stanza_nlp:Pipeline, i
                         if name in proc_tags:
                             is_header = False
                             if prev_child_had_data and name in break_tags:
-                                yield ('break', sml_token("break"))
+                                # A <span> is INLINE: only the markup's own whitespace
+                                # separates it from what precedes it. <br>/<p> are boxes
+                                # and always separate.
+                                if name == 'span' and not lead_ws:
+                                    yield ('glue', sml_token("break"))
+                                else:
+                                    yield ('break', sml_token("break"))
                             for inner in _tuple_row(child, last_text_char):
                                 return_data = True
                                 yield inner
@@ -1006,8 +1081,25 @@ def filter_chapter(idx:int, doc:EpubHtml, session_id:str, stanza_nlp:Pipeline, i
                                 elif name in heading_tags or name in pause_tags:
                                     yield ('pause', sml_token("pause"))
                         else:
+                            # Transparent inline tag (<em>, <i>, <b>, <a>, <sup>…): no
+                            # break is emitted here, so the separator these rows get is
+                            # the ' ' of the join in filter_chapter. Glue with a None
+                            # payload says "restore NOTHING if this cannot be merged",
+                            # which is exactly what the walk emitted before.
+                            if prev_child_had_data and not lead_ws:
+                                yield ('glue', None)
                             yield from _tuple_row(child, last_text_char)
                             current_child_had_data = True
+                    # Whitespace state AFTER this tag. Block-level boxes always end the
+                    # run; an inline tag carries its own trailing whitespace, and one
+                    # that emitted nothing must not clear a space already pending.
+                    if (name in heading_tags or name == 'table' or name in pause_tags
+                            or (name in break_tags and name != 'span')):
+                        ws_pending = True
+                    elif current_child_had_data:
+                        ws_pending = last_char.isspace()
+                    else:
+                        ws_pending = ws_pending or last_char.isspace()
                 if current_child_had_data:
                     prev_child_had_data = True
         except Exception as e:
@@ -1075,7 +1167,10 @@ def filter_chapter(idx:int, doc:EpubHtml, session_id:str, stanza_nlp:Pipeline, i
             # remove scripts/styles
             for tag in soup(['script', 'style']):
                 tag.decompose()
-            tuples_list = list(_tuple_row(body))
+            # Resolve the whitespace-fidelity markers before anything reads the
+            # rows: what leaves _collapse_glue is the same ('text'|'heading'|
+            # 'break'|'pause'|'table') stream the loop below has always consumed.
+            tuples_list = _collapse_glue(list(_tuple_row(body)))
             if not tuples_list:
                 error = 'No tuples_list from body created!'
                 print(error)
