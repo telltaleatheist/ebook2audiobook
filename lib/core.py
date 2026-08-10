@@ -1695,10 +1695,11 @@ def get_sentences(text:str, session_id:str)->list|None:
     def _plain(s:str)->bool:
         # A row is "plain prose" only when it carries NO escaped SML token: the
         # escaped tag chars have ord >= sml_escape_tag, so strip_escaped_sml
-        # shortens the string exactly when a token is present. Used to refuse
-        # merging/packing across a [break]/[pause]/… (PASS 4 and PASS 5) — merging
-        # over one silently discards that paragraph/section pause (orpheus.py
-        # strips the token before TTS, so the only record of it is the row split).
+        # shortens the string exactly when a token is present. Used by PASS 2 and
+        # PASS 4 to refuse a merge that would BURY a [break]/[pause]/… mid-row,
+        # where orpheus.py strips it before TTS and its pause is silently lost.
+        # (PASS 5 no longer uses it: that pack merges at the EDGES with
+        # _split_sml_edges and drops the join's tokens explicitly, counted.)
         # NOTE: compares strip_escaped_sml directly, NOT clean_len — clean_len is
         # transform-aware for Orpheus and would misread any digit-bearing row as
         # "carries SML".
@@ -2031,14 +2032,35 @@ def get_sentences(text:str, session_id:str)->list|None:
                 # sentence-start artifact was traced to a prompt-framing/stray-BOS bug
                 # in orpheus.py, not the packing itself.)
                 #
-                # BOUNDARY-AWARE, unlike Voxtral: a sentence carrying an SML token
-                # ([break]/[pause]/…) is NEVER merged. orpheus.py inserts inter-clip
-                # silence per returned item via _classify_gap and strips those tokens
-                # before TTS (_clean_sentence_for_tts), so merging across one would
-                # SILENTLY DROP that paragraph/section pause. A sentence has SML when
-                # its escaped form is shorter than its raw form (strip_escaped_sml drops
-                # the escaped tag chars). Only plain-prose runs pack; every pause is kept.
-                # (_plain is defined once up top and shared with PASS 4.)
+                # PACKS ACROSS PARAGRAPH PAUSES (2026-08-10). The pack used to refuse
+                # any row carrying an SML token, so every paragraph started a fresh
+                # chunk — and since e2a puts a [break] on the LEADING edge of each
+                # paragraph's first sentence, that sentence could never join either its
+                # predecessor or its own successor and was rendered ALONE. Measured on
+                # "Killing America" (540-char deathstalker cap): 53% of chunks were a
+                # single sentence and the mean chunk was 200 of 540 available chars,
+                # with 83% of the single-sentence chunks carrying a token — one starved
+                # "take" per paragraph, which is exactly the prosody break Owen hears.
+                #
+                # RATIFIED TRADE-OFF (same one _apply_min_chars_floor makes): packing
+                # beats the pause. The join's tokens — the accumulating chunk's TRAILING
+                # token and the incoming row's LEADING token — are dropped and counted
+                # (one summary line per chapter, not one per join). They cannot be
+                # carried: orpheus.py's _classify_gap realizes only a row's LEADING and
+                # TRAILING token as silence and _clean_sentence_for_tts strips the rest,
+                # so a token buried mid-row loses its pause anyway while hiding the loss.
+                # The cost is small by construction: for Orpheus _classify_gap collapses
+                # the auto [break] and the valueless auto [pause] to the SAME sentence-gap
+                # floor every chunk already gets (the paragraph/section tiers were removed
+                # 2026-07-17), so a dropped auto token costs no measurable silence.
+                # The chunk's own leading edge keeps its leading token and its trailing
+                # edge takes the newly absorbed row's trailing token, so the pause INTO
+                # and OUT OF the chunk still play and no mid-row token is ever produced.
+                # Rows with a token in the MIDDLE, and SML-only rows, are never packed.
+                # Sentence boundaries inside a pack are untouched, max_chars is unchanged,
+                # and _apply_near_dup_split still runs LAST (anti-runaway outranks packing).
+                # (_plain is still used by PASS 4; _split_sml_edges is shared with the
+                # min-chars floor pass.)
                 # SENTENCE-COUNT CAP — OFF by default (2026-07-12). The cap was added
                 # the same day, A/B-calibrated against rohan-v2's per-internal-boundary
                 # silence attractor (3 sents: 4/9 runaways, 6: 3/3) — but rohan-v2 was
@@ -2056,17 +2078,36 @@ def get_sentences(text:str, session_id:str)->list|None:
                 def _nsent(t):
                     return max(1, len(re.findall(r'[.!?…]["\'”’)\]]*(?:\s|$)', t)))
                 packed = []
+                # Edges of each packed row, parallel to `packed`: (lead, core, trail),
+                # or None for a row that must never be packed into (SML-only, or a token
+                # buried mid-row that a merge would have to discard silently).
+                edges = []
+                dropped_join_tokens = 0
                 for s in final_list:
                     s = s.strip()
                     if not s:
                         continue
-                    if (packed and _plain(packed[-1]) and _plain(s)
-                            and clean_len(packed[-1]) + 1 + clean_len(s) <= max_chars
-                            and (max_sents is None
-                                 or _nsent(packed[-1]) + _nsent(s) <= max_sents)):
-                        packed[-1] = packed[-1].rstrip() + ' ' + s.lstrip()
-                    else:
+                    lead, core, trail = _split_sml_edges(s)
+                    if not core or _has_escaped_sml(core):
                         packed.append(s)
+                        edges.append(None)
+                        continue
+                    if packed and edges[-1] is not None:
+                        prev_lead, prev_core, prev_trail = edges[-1]
+                        merged_core = prev_core.rstrip() + ' ' + core.lstrip()
+                        merged = f'{prev_lead}{merged_core}{trail}'
+                        if (clean_len(merged) <= max_chars
+                                and (max_sents is None
+                                     or _nsent(prev_core) + _nsent(core) <= max_sents)):
+                            packed[-1] = merged
+                            edges[-1] = (prev_lead, merged_core, trail)
+                            dropped_join_tokens += len(prev_trail) + len(lead)
+                            continue
+                    packed.append(s)
+                    edges.append((lead, core, trail))
+                if dropped_join_tokens:
+                    print(f'get_sentences() Orpheus pack: {dropped_join_tokens} join pause token(s) dropped '
+                          f'packing {len(final_list)} rows into {len(packed)} chunks (packing > pause)')
                 if max_sents is None:
                     # MIN-CHARS FLOOR runs BEFORE PASS 6: anti-runaway trumps the
                     # floor, so if a near-duplicate re-split breaks a floored merge
