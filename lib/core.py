@@ -3182,8 +3182,25 @@ def combine_audio_chapters(session_id:str)->list[str]|None:
                         '-progress', 'pipe:2',
                         '-y', ffmpeg_final_file
                     ]
-            proc_pipe = SubprocessPipe(cmd, is_gui_process=session['is_gui_process'], total_duration=get_audio_duration(ffmpeg_combined_audio), msg='Export')
+            source_duration = get_audio_duration(ffmpeg_combined_audio)
+            proc_pipe = SubprocessPipe(cmd, is_gui_process=session['is_gui_process'], total_duration=source_duration, msg='Export')
             if proc_pipe:
+                # ffmpeg can stop mid-encode and still FINALIZE a valid, playable,
+                # truncated file (moov written, exit clean) — e.g. when it loses its
+                # progress-pipe reader. exit-0 + file-exists proves nothing about
+                # completeness, so hold the export to the same standard as the
+                # chapter concat: the output must carry the whole input's duration.
+                # (Nuremberg 2026-08-11: a 20.12h source exported as a valid 14.72h
+                # m4b, silently — this guard is that incident's fix.)
+                final_duration = get_audio_duration(ffmpeg_final_file)
+                if source_duration and abs(final_duration - source_duration) > 2.0:
+                    error = (
+                        f'export_audio() Output duration mismatch → {ffmpeg_final_file}: '
+                        f'source is {source_duration:.2f}s, exported file is {final_duration:.2f}s. '
+                        f'ffmpeg finalized a truncated export; refusing to ship it.'
+                    )
+                    print(error)
+                    return False
                 if os.path.exists(ffmpeg_final_file) and os.path.getsize(ffmpeg_final_file) > 0:
                     if session['output_format'] in ['mp3', 'm4a', 'm4b', 'mp4']:
                         if session['cover'] is not None:
