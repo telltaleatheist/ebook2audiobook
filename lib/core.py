@@ -2251,13 +2251,39 @@ def year2words(year_str:str, lang:str, lang_iso1:str, is_num2words_compat:bool)-
         last_two = int(year_str[2:])
         lang_iso1 = lang_iso1 if lang in language_math_phonemes.keys() else default_language_code
         lang_iso1 = lang_iso1.replace('zh', 'zh_CN')
-        if not year_str.isdigit() or len(year_str) != 4 or last_two < 10:
+        # Shapes with no year reading at all: not four digits, or a first pair too
+        # low for the pair form to be idiomatic ('1042' is 'ten forty-two' by the
+        # rule and 'one thousand forty two' by ear). Those stay cardinal.
+        # A year ending 00-09 keeps the OLD cardinal in every language but English,
+        # because the readings below ('oh', 'hundred') are English words and a
+        # German or French year has its own conventions. Anglicizing them quietly
+        # would be worse than the reading this replaces.
+        english = lang_iso1.startswith('en')
+        if (not year_str.isdigit() or len(year_str) != 4 or first_two < 11
+                or (last_two < 10 and not english)):
             if is_num2words_compat:
                 return num2words(year, lang=lang_iso1)
             else:
                 return ' '.join(language_math_phonemes[lang].get(ch, ch) for ch in year_str)
         if is_num2words_compat:
-            return f'{num2words(first_two, lang=lang_iso1)} {num2words(last_two, lang=lang_iso1)}' 
+            # A year ending 00-09 has its own readings, and the old code fell back
+            # to the plain cardinal for all of them — which is where every
+            # remaining wrong year came from (measured 2026-08-13):
+            #   1900 -> 'one thousand, nine hundred'          now 'nineteen hundred'
+            #   1905 -> 'one thousand, nine hundred and five' now 'nineteen oh five'
+            #   1607 -> 'one thousand, six hundred and seven' now 'sixteen oh seven'
+            #   2006 -> 'two thousand and six'                now 'two thousand six'
+            # The 2000s are the one century not read as a pair, which is why they
+            # are tested before the 'oh' form: 'twenty oh six' is nobody's reading.
+            if last_two < 10:
+                if first_two == 20:
+                    tail = f' {num2words(last_two, lang=lang_iso1)}' if last_two else ''
+                    return f'{num2words(first_two * 100, lang=lang_iso1)}{tail}'
+                if last_two == 0:
+                    return f'{num2words(first_two, lang=lang_iso1)} hundred'
+                return (f'{num2words(first_two, lang=lang_iso1)} oh '
+                        f'{num2words(last_two, lang=lang_iso1)}')
+            return f'{num2words(first_two, lang=lang_iso1)} {num2words(last_two, lang=lang_iso1)}'
         else:
             return ' '.join(language_math_phonemes[lang].get(ch, ch) for ch in first_two) + ' ' + ' '.join(language_math_phonemes[lang].get(ch, ch) for ch in last_two)
     except Exception as e:
@@ -2702,9 +2728,20 @@ def normalize_text(text:str, lang:str, lang_iso1:str, tts_engine:str)->str:
     #  * inside a DOTTED ACRONYM ('D.C.', 'C.I.A.'). The Orpheus branch above
     #    deliberately skips de-dotting so these read book-exact; splitting them to
     #    'D. C.' here silently undid that, and changes how they are spoken.
+    #  * INSIDE A NUMBER. A mark flanked on both sides by digits is not punctuation
+    #    at all — it is a thousands separator, a decimal point, or the divider in a
+    #    clock time or a chapter:verse reference. Spacing it broke every one of
+    #    them: '10,000' -> '10, 000', '9.1-magnitude' -> '9. 1-magnitude',
+    #    '7:59 a.m.' -> '7: 59 a.m.'. Orpheus feels this hardest because its
+    #    book-exact branch is the one that still HAS digits by the time this runs
+    #    (the acoustic engines have already had math2words turn them into words),
+    #    and because normalize_scripture matches '\d+:\d+' with no space — a
+    #    spaced colon put every scripture reference out of its reach as well.
+    #    Measured on Killing America, 2026-08-13: 47 split thousands separators,
+    #    94 split colons and 3 split decimals in one narration.
     #
-    # Both were latent until 2026-07-28, masked by foreign2latin having already
-    # stripped the spaces this rule then re-inserted.
+    # The first two were latent until 2026-07-28, masked by foreign2latin having
+    # already stripped the spaces this rule then re-inserted.
     closing = '"\'’”»)]}'
 
     def _collapse(m: re.Match) -> str:
@@ -2719,7 +2756,14 @@ def normalize_text(text:str, lang:str, lang_iso1:str, tts_engine:str)->str:
         mark = run if (run and not any(c.isspace() for c in run)) else m.group(2)
         src = m.string
         nxt = src[m.end():m.end() + 1]
+        prv = src[m.start() - 1:m.start()] if m.start() > 0 else ''
         if nxt == '' or nxt in closing:
+            return mark
+        # A whitespace-free mark with a digit on each side belongs to the number,
+        # not to the sentence. Whitespace anywhere in the run means the author
+        # already ended something there ('It cost him. 3 people died'), so that
+        # case still collapses normally.
+        if run == mark and prv.isdigit() and nxt.isdigit():
             return mark
         if mark == '.' and nxt.isalpha():
             # Inside an acronym the dot is followed by a LONE letter that itself
@@ -2733,10 +2777,37 @@ def normalize_text(text:str, lang:str, lang_iso1:str, tts_engine:str)->str:
                 return mark
         return mark + ' '
 
-    pattern = '|'.join(map(re.escape, punctuation_split_hard_set))
-    text = re.sub(rf'(\s*({pattern})\s*)+', _collapse, text).strip()
-    pattern = '|'.join(map(re.escape, punctuation_split_soft_set))
-    text = re.sub(rf'(\s*({pattern})\s*)+', _collapse, text).strip()
+    # ORPHEUS IS NOT ROUTED THROUGH THIS RULE AT ALL.
+    #
+    # Owen, 2026-08-13: "we should just ignore the splitting logic that adds spaces
+    # after punctuation. we should assume the punctuation spacing will be correct
+    # when the book goes in… dont delete it, just dont route orpheus text through
+    # that pipeline."
+    #
+    # The rule is XTTS-era: an acoustic model fed 'wars.Heritage' as one token
+    # mispronounces it, so the pipeline pried every mark apart and re-spaced it. An
+    # LLM TTS reads 'when she looked,she was disturbed' correctly, so there is
+    # nothing to buy — and a space the book never wrote is a token sequence the
+    # fine-tune never saw. Measured on Killing America (378k chars of book-exact
+    # text): of ~1,500 insertions, 645 split a DOMAIN NAME ('Heritage.org' ->
+    # 'Heritage. org'), 306 split a URL ('https://www.' -> 'https: //www.'), 104
+    # split a scripture reference and 138 split a number. Ordinary prose is
+    # untouched either way, because the book already spaces its own commas.
+    #
+    # SKIPPED WHOLESALE rather than made a no-op inside _collapse: the pattern
+    # swallows the whitespace AROUND a mark as well as the mark, so a version that
+    # merely withheld the trailing space would still delete the space the book
+    # wrote before one ('Ibid. , "RULE' -> 'Ibid.,"RULE'). Not running it is the
+    # only way "the book's spacing is what the model sees" is actually true.
+    #
+    # The splitter does not need it: it splits on a mark followed by whitespace,
+    # and every sentence boundary in real prose already has that whitespace. What
+    # stops splitting is a URL, which should never have been split.
+    if tts_engine != TTS_ENGINES['ORPHEUS']:
+        pattern = '|'.join(map(re.escape, punctuation_split_hard_set))
+        text = re.sub(rf'(\s*({pattern})\s*)+', _collapse, text).strip()
+        pattern = '|'.join(map(re.escape, punctuation_split_soft_set))
+        text = re.sub(rf'(\s*({pattern})\s*)+', _collapse, text).strip()
     # Pattern 1: Add a space between UTF-8 characters and numbers.
     # NOT for Orpheus: its kept-digit forms ('1930s', '7th', '76ers') appear
     # exactly like that in the training transcripts — spacing them ('1930 s')

@@ -12,6 +12,12 @@ vice versa).
 Style notes that matter:
 - num_to_words is cardinal, no hyphens, no 'and': 1923 ->
   'one thousand nine hundred twenty three' (NOT num2words style).
+- YEARS are the one place this file no longer matches the corpora it was ported
+  from: a bare 4-digit year goes through lib.core.year2words ('nineteen
+  forty-three') instead of the cardinal. See year_words for the measurement and
+  the argument. The cost is the ordinary year/quantity ambiguity — '1200 people'
+  reads as 'twelve hundred people' — which is the same trade lib/core.py:1429
+  already makes for every acoustic engine, with the same heuristic.
 - expand_digits only touches a whitespace-delimited token that is
   punctuation + a bare 1-4 digit integer + punctuation. Everything else stays
   as printed: '5,000', '1930s', '7th', '$5.50', '160299', 'Henry VIII', 'Mr.'.
@@ -52,6 +58,40 @@ def num_to_words(n: int) -> list[str] | None:
     return w
 
 
+_YEAR_RE = re.compile(r'1\d{3}|20\d{2}')
+
+
+def year_words(token: str) -> str | None:
+    """A four-digit YEAR as a year is read, through e2a's OWN year heuristic.
+
+    ── Why a year needs its own reading, and why this is not a new rule ───────
+
+    Every training corpus on disk expands a bare year through num_to_words, so
+    the text the fine-tunes were trained on says 'one thousand nine hundred
+    thirty three' where the narrator's audio says 'nineteen thirty three'
+    (measured across all of E:/training, 2026-08-13: tr_ae8h_v2 has 426
+    word-years to 14 digit-years, and every corpus holding a year matches). The
+    pairing was meant to teach the model the year reading; it did not take —
+    Owen hears years read out as quantities — and matching that distribution
+    more exactly cannot fix a mapping the training never learned. So the model
+    is handed the words it should SPEAK, because literal reading is an LLM TTS's
+    most reliable behaviour.
+
+    The reading itself is `lib.core.year2words`, the SAME heuristic every
+    acoustic engine has used all along (Owen, 2026-08-13: "we shouldnt have to
+    build out date naming logic - it should already be present in e2a"). The
+    import is deferred because lib.core imports this module.
+
+    Range and shape match the acoustic branch's own call (core.py ~1429):
+    `1\\d{3}` or `20\\d{2}`, bare. A year RANGE ('1914-1918'), a comma'd number
+    and anything else never reach here — the caller's token shape excludes them.
+    """
+    if not _YEAR_RE.fullmatch(token):
+        return None
+    from lib.core import year2words   # deferred: lib.core imports this module
+    return year2words(token, 'eng', 'en', True)
+
+
 def expand_digits(text: str) -> str:
     # Port of orpheus-finetune cut_excerpts.expand_digits, made whitespace-safe:
     # the original split()/join collapsed ALL whitespace (fine on single
@@ -60,6 +100,12 @@ def expand_digits(text: str) -> str:
     # by whitespace. Any digit-bearing token that does not match is left
     # exactly as printed — the fine-tunes were TRAINED on those as digits.
     def repl(m: re.Match) -> str:
+        # A four-digit year is read as a year; everything else is the quantity it
+        # looks like. '50 people' -> 'fifty people' is right and stays;
+        # '1943' -> 'one thousand nine hundred forty three' never was.
+        year = year_words(m.group(2))
+        if year is not None:
+            return m.group(1) + year + m.group(3)
         words = num_to_words(int(m.group(2)))
         if not words:
             return m.group(0)
