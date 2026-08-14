@@ -13,7 +13,7 @@ PARALLEL_OPTIONS = [
     '--bilingual', '--bilingual_pause', '--bilingual_gap', '--skip_assembly',
     '--sentence_per_paragraph', '--skip_headings', '--session_dir', '--custom_model_dir',
     '--sentences_dir', '--orpheus_model_dir', '--orpheus_adapter_dir',
-    '--orpheus_base_dir', '--post_render_filter'
+    '--orpheus_base_dir', '--post_render_filter', '--encoded_chapters_dir'
 ]
 
 
@@ -198,4 +198,21 @@ def add_arguments(parser):
              'present filter also disables the stream-copy shortcut so it always takes '
              'effect. Passed as one argument (may contain |, :, /, quotes). BookForge '
              'reads it from the Orpheus voice\'s models.json entry.'
+    )
+
+    parallel_group.add_argument(
+        '--encoded_chapters_dir', type=str, default=None,
+        help='(assemble_only, BookForge) Directory of chapters BookForge ALREADY '
+             'encoded to AAC while the GPU was still rendering, named <N>.m4a where N '
+             'is the 1-indexed chapter number (the same numbering as <N>.flac in the '
+             'session\'s chapters dir). The set may be partial or empty. Each such '
+             'chapter skips both its sentence-to-chapter concat and the final AAC '
+             'encode: it is stream-copied into the audiobook verbatim, which takes the '
+             'whole encode off assembly\'s critical path. Only honoured on the parallel '
+             'export path (MP4-family output, no pre-loudnorm filters, no --no_split '
+             'parts, over the 2h loudnorm cutoff); otherwise it is ignored with a '
+             'printed reason and every chapter is rebuilt from sentences as usual. '
+             'BookForge validates each file against its own staleness stamp before '
+             'passing the directory, so a file that is present but unreadable, empty '
+             'or unmeasurable ABORTS assembly rather than being quietly rebuilt.'
     )

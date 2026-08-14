@@ -3207,6 +3207,123 @@ def audio_duration_seconds(filepath:str)->float:
         return read_flac_duration(filepath)
     return get_audio_duration(filepath)
 
+def parallel_export_unsupported_reason(session:dict, source_duration:float)->str|None:
+    """
+    Why the per-chapter parallel encode may NOT stand in for the single serial encode,
+    or None when it may. Every condition is about producing a BYTE-EQUIVALENT-IN-INTENT
+    result, not about convenience — if any holds we take the serial path.
+
+      - MP4-family output only. Each chunk is a self-contained .m4a whose edit list
+        records its encoder delay, which is why concatenating them is gapless
+        (measured: 0.179 ms drift across 77 joins on a 20.07 h book). MP3 needs LAME
+        gapless tags and Opus/Vorbis carry pre-skip per stream; neither survives a
+        naive concat, so they keep the serial encode.
+      - No pre-loudnorm filters. FINAL_DENOISE / post_render_filter are applied
+        per-stream; running them per chunk would restart the filter's internal state
+        78 times instead of once.
+      - Not split into parts. The split branch of combine_audio_chapters() merges each
+        part's chapters into one intermediate FLAC and hands that to export_audio();
+        it never reaches the parallel encoder at all.
+      - Longer than the 2 h loudnorm cutoff. Below it the serial path applies
+        loudnorm=…:linear=true, which MEASURES THE WHOLE FILE and cannot be computed
+        per chunk without changing the result. Above it the serial path already skips
+        loudnorm, so the two paths agree — and a sub-2 h book encodes serially in a
+        few minutes anyway.
+
+    This lives at module scope, not inside combine_audio_chapters(), because
+    assemble_audiobook() has to ask the SAME question BEFORE it decides whether a
+    chapter's sentences still need concatenating into a chapter FLAC. Two copies of
+    this policy that drifted apart would leave assembly with neither a chapter FLAC
+    nor a usable pre-encoded chapter, so there is exactly one copy.
+    """
+    out_fmt = session['output_format']
+    if out_fmt not in ('m4b', 'm4a', 'mp4', 'mov'):
+        return f'output format {out_fmt} is not MP4-family (a naive concat is not gapless there)'
+    if os.environ.get('FINAL_DENOISE', '0') == '1':
+        return 'FINAL_DENOISE is active and must run once over the whole stream'
+    if session.get('post_render_filter'):
+        return 'a post_render_filter is active and must run once over the whole stream'
+    if session.get('output_split'):
+        return 'the output is split into parts, which merges chapters before encoding'
+    if not source_duration:
+        return 'the total duration is unknown'
+    if source_duration <= 7200:
+        return (
+            f'the book is {source_duration:.0f}s, at or under the 7200s cutoff below which '
+            f'loudnorm(linear=true) measures the whole file and cannot be split'
+        )
+    return None
+
+def load_encoded_chapters(session:dict, expected_chapter_nums:list[int])->dict[int, dict]:
+    """
+    The chapters BookForge already encoded to AAC while the GPU was still rendering,
+    handed over as <N>.m4a in session['encoded_chapters_dir'] (N = e2a's 1-indexed
+    chapter number, the same number as <N>.flac in chapters_dir). The set may be
+    partial or empty; a chapter that is present is one BookForge has already checked
+    against its own staleness stamp, so assembly's job is to USE it, not re-derive it.
+
+    Returns {chapter_num: {'path': str, 'duration': float}}, empty when the flag is
+    not in play. Idempotent and side-effect free — both assemble_audiobook() (to
+    decide which sentence concats to skip) and combine_audio_chapters() (to place
+    them in the final concat) call it, and they must see the identical set.
+
+    Every failure here ABORTS rather than quietly rebuilding the chapter from its
+    sentences. BookForge vouched for these files; a silent rebuild would repair the
+    symptom of a corrupt hand-off and destroy the evidence of the bug that caused it,
+    while shipping an audiobook whose chapters came from somewhere the caller did not
+    intend.
+    """
+    encoded_dir = session.get('encoded_chapters_dir')
+    if not encoded_dir:
+        return {}
+    if not os.path.isdir(encoded_dir):
+        raise RuntimeError(
+            f'load_encoded_chapters(): --encoded_chapters_dir is not a directory: {encoded_dir}'
+        )
+    expected = set(expected_chapter_nums)
+    entries = {}
+    for name in sorted(os.listdir(encoded_dir)):
+        if not name.lower().endswith('.m4a'):
+            continue
+        stem = name[:-len('.m4a')]
+        path = os.path.join(encoded_dir, name)
+        if not stem.isdigit():
+            raise RuntimeError(
+                f'load_encoded_chapters(): {path} is not named <chapter_number>.m4a. The file '
+                f'name IS the chapter mapping — a name we cannot resolve to a chapter number '
+                f'would place its audio at an arbitrary point in the book.'
+            )
+        num = int(stem)
+        if num not in expected:
+            raise RuntimeError(
+                f'load_encoded_chapters(): {path} claims chapter {num}, which is not one of the '
+                f'{len(expected)} chapters this assembly is building '
+                f'({min(expected) if expected else "-"}..{max(expected) if expected else "-"}). '
+                f'Refusing to assemble: the directory and the session disagree about what the '
+                f'book is.'
+            )
+        if os.path.getsize(path) == 0:
+            raise RuntimeError(
+                f'load_encoded_chapters(): pre-encoded chapter {num} is 0 bytes: {path}'
+            )
+        entries[num] = {'path': path, 'duration': None}
+    if not entries:
+        return {}
+    # One batched mediainfo call for the whole set: get_audiolist_duration() raises
+    # (naming the file) if any of them is unreadable, which is exactly the outcome we
+    # want for a chapter we are about to copy verbatim into the audiobook.
+    paths = [entries[n]['path'] for n in sorted(entries)]
+    durations = get_audiolist_duration(paths)
+    for num in sorted(entries):
+        duration = durations[os.path.realpath(entries[num]['path'])]
+        if duration <= 0:
+            raise RuntimeError(
+                f'load_encoded_chapters(): pre-encoded chapter {num} reports a duration of '
+                f'{duration}s: {entries[num]["path"]}'
+            )
+        entries[num]['duration'] = duration
+    return entries
+
 def combine_audio_sentences(session_id:str, file:str, start:int, end:int)->bool:
     try:
         session = context.get_session(session_id)
@@ -3293,6 +3410,20 @@ final_denoise_filter = 'afftdn=nr=12:nf=-50:tn=1'
 
 def combine_audio_chapters(session_id:str)->list[str]|None:
 
+    def chapter_source_path(filename:str)->str:
+        # Where chapter <filename> actually lives. Normally chapters_dir/<N>.flac,
+        # the FLAC this assembly just concatenated from sentences — but a chapter
+        # BookForge pre-encoded has no FLAC at all (assemble_audiobook() skipped its
+        # concat on purpose) and is served from encoded_chapters_dir/<N>.m4a instead.
+        # Everything downstream — the completeness check, the durations behind the
+        # chapter markers and the export guard, the concat list — must resolve the
+        # chapter through here or it will look for a file that was never built.
+        chapter_num = int(re.search(r'\d+', filename).group())
+        entry = encoded_chapters.get(chapter_num)
+        if entry:
+            return entry['path']
+        return os.path.join(session['chapters_dir'], filename)
+
     def generate_ffmpeg_metadata(part_chapters:list[tuple[str,str]], output_metadata_path:str, default_audio_proc_format:str)->str|bool:
         try:
             out_fmt = session['output_format']
@@ -3343,11 +3474,14 @@ def combine_audio_chapters(session_id:str)->list[str]|None:
                     msg = 'Cancel requested'
                     print(msg)
                     return False
-                filepath = os.path.join(session['chapters_dir'], filename)
+                filepath = chapter_source_path(filename)
                 # Read the length from the container header. AudioSegment.from_file()
                 # used to decode the ENTIRE chapter to PCM in memory just to call len()
                 # on it — 27s and multiple GB of churn on a 20-hour book, to learn a
                 # number that is sitting in the first 42 bytes of the file.
+                # For a pre-encoded chapter this reads the .m4a, which is the right
+                # source anyway: it is the exact stream that lands in the audiobook,
+                # so the marker tiles against what the listener will actually hear.
                 duration_ms = int(round(audio_duration_seconds(filepath) * 1000))
                 clean_title = re.sub(r'(^#)|[=\\]|(-$)', lambda m: '\\' + (m.group(1) or m.group(0)), sanitize_meta_chapter_title(chapter_title))
                 ffmpeg_metadata += '[CHAPTER]\nTIMEBASE=1/1000\n'
@@ -3533,36 +3667,12 @@ def combine_audio_chapters(session_id:str)->list[str]|None:
         return False
 
     def parallel_export_supported(source_duration:float)->bool:
-        """
-        Whether the per-chapter parallel encode may stand in for the single serial
-        encode. Every condition here is about producing a BYTE-EQUIVALENT-IN-INTENT
-        result, not about convenience — if any fails we take the serial path.
+        # The policy itself lives at module scope (see the docstring there) so that
+        # assemble_audiobook() can ask the identical question before it decides to
+        # skip a chapter's sentence concat. One copy, two callers.
+        return parallel_export_unsupported_reason(session, source_duration) is None
 
-          - MP4-family output only. Each chunk is a self-contained .m4a whose edit
-            list records its encoder delay, which is why concatenating them is
-            gapless (measured: 0.6 ms drift across 77 joins on a 20.07 h book).
-            MP3 needs LAME gapless tags and Opus/Vorbis carry pre-skip per stream;
-            neither survives a naive concat, so they keep the serial encode.
-          - No pre-loudnorm filters. FINAL_DENOISE / post_render_filter are applied
-            per-stream; running them per chunk would restart the filter's internal
-            state 78 times instead of once.
-          - Longer than the 2 h loudnorm cutoff. Below it the serial path applies
-            loudnorm=…:linear=true, which MEASURES THE WHOLE FILE and cannot be
-            computed per chunk without changing the result. Above it the serial
-            path already skips loudnorm, so the two paths agree — and a sub-2 h
-            book encodes serially in a few minutes anyway.
-        """
-        if session['output_format'] not in ('m4b', 'm4a', 'mp4', 'mov'):
-            return False
-        if os.environ.get('FINAL_DENOISE', '0') == '1':
-            return False
-        if session.get('post_render_filter'):
-            return False
-        if not source_duration or source_duration <= 7200:
-            return False
-        return True
-
-    def export_audio_parallel(chapter_paths:list[str], ffmpeg_metadata_file:str, ffmpeg_final_file:str, source_duration:float)->bool:
+    def export_audio_parallel(chapter_paths:list[str], already_encoded:set[int], ffmpeg_metadata_file:str, ffmpeg_final_file:str, source_duration:float)->bool:
         """
         Encode each chapter to AAC concurrently, then concatenate with -c copy.
 
@@ -3575,6 +3685,15 @@ def combine_audio_chapters(session_id:str)->list[str]|None:
 
         The chapter split is free: assembly has ALREADY produced one FLAC per chapter,
         and they are exactly the units the serial path was about to concatenate.
+
+        `already_encoded` holds the INDEXES into chapter_paths whose entry is not a
+        FLAC to encode but an .m4a BookForge encoded itself during generation, with
+        the same settings this function uses. Those go straight into the concat list:
+        the whole point is that their encode happened while the GPU was still busy
+        rendering the book, so it costs assembly nothing at all. They are the only
+        entries whose path is outside chunk_dir, which is why the cleanup below drops
+        chunk_dir rather than the individual chunks — deleting by path would delete
+        BookForge's originals.
         """
         cpu_count = os.cpu_count()
         if cpu_count is None:
@@ -3607,11 +3726,23 @@ def combine_audio_chapters(session_id:str)->list[str]|None:
                 return idx, out_path, 'encoder exited 0 but produced no output'
             return idx, out_path, None
 
-        print(f'[assembly] Parallel encode: {len(chapter_paths)} chapters across {workers} workers')
-        items = list(enumerate(chapter_paths))
-        chunk_paths = [None] * len(items)
+        # A pre-encoded chapter enters the concat list as itself; only the rest are
+        # handed to the encoder pool.
+        chunk_paths = [None] * len(chapter_paths)
+        for idx in sorted(already_encoded):
+            chunk_paths[idx] = chapter_paths[idx]
+        items = [(i, p) for i, p in enumerate(chapter_paths) if i not in already_encoded]
+        print(
+            f'[assembly] Parallel encode: {len(items)} chapters across {workers} workers'
+            f'{f"; {len(already_encoded)} already encoded by BookForge" if already_encoded else ""}'
+        )
         completed = 0
         failures = []
+        # BookForge's progress parser reads the "Export - N%" lines below. With every
+        # chapter pre-encoded there is no encode to report on at all, so say so once
+        # rather than leaving the bar parked at whatever it last showed.
+        if not items:
+            print('Export - 100.0%', flush=True)
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
             futures = [pool.submit(encode_chunk, it) for it in items]
             for fut in concurrent.futures.as_completed(futures):
@@ -3621,8 +3752,6 @@ def combine_audio_chapters(session_id:str)->list[str]|None:
                 else:
                     chunk_paths[idx] = out_path
                 completed += 1
-                # BookForge's progress parser reads these "Export - N%" lines; keep
-                # emitting them so the UI bar behaves exactly as on the serial path.
                 print(f'Export - {completed / len(items) * 100:.1f}%', flush=True)
                 if session['cancellation_requested']:
                     for f in futures:
@@ -3679,12 +3808,45 @@ def combine_audio_chapters(session_id:str)->list[str]|None:
                 chapter_files = [f for f in chapter_files if int(re.search(r'\d+', f).group()) in selected_chapters]
                 print(f'[ASSEMBLE] Filtered to {len(chapter_files)} selected chapters')
 
+            chapters_data = session.get('chapters', [])
+            # The chapter set this assembly believes it is building:
+            #   - session['selected_chapters'] when set (assemble_audiobook always sets
+            #     it — 1-indexed; includes the designed partial-assembly path, where the
+            #     selection itself is the already-narrowed chapter list);
+            #   - otherwise one 0-indexed file per chapter in session['chapters']
+            #     (legacy finalize_audiobook/convert_chapters2audio flow).
+            if selected_chapters:
+                expected_chapter_nums = list(selected_chapters)
+            else:
+                expected_chapter_nums = list(range(len(chapters_data)))
+
+            # Chapters BookForge already encoded to AAC while the GPU was still
+            # rendering (--encoded_chapters_dir). assemble_audiobook() skipped their
+            # sentence→chapter concat, so there is no FLAC for them in chapters_dir;
+            # splice them into the ordered chapter list under their own .m4a name so
+            # every step below still sees exactly one entry per chapter, in chapter
+            # order. Where a stale FLAC from an earlier run happens to survive, the
+            # pre-encoded chapter wins — it is the one the caller asked us to ship.
+            encoded_chapters = load_encoded_chapters(session, expected_chapter_nums)
+            if encoded_chapters:
+                chapter_files = [
+                    f for f in chapter_files
+                    if int(re.search(r'\d+', f).group()) not in encoded_chapters
+                ]
+                chapter_files = sorted(
+                    chapter_files + [f'{n}.m4a' for n in encoded_chapters],
+                    key=lambda x: int(re.search(r'\d+', x).group())
+                )
+                print(
+                    f'[ASSEMBLE] {len(encoded_chapters)} of {len(chapter_files)} chapters arrive '
+                    f'pre-encoded from BookForge; they will be copied into the audiobook as-is'
+                )
+
             # Chapter marker titles are bound to chapters by DOCUMENT IDENTITY.
             # NEVER by position: the TOC and the chapter list describe different sets
             # (a part-title page has a TOC entry but yields no audio; leading front
             # matter yields audio but has no TOC entry) and the counts can coincidentally
             # match while the sets differ, so a length check cannot detect the skew.
-            chapters_data = session.get('chapters', [])
             # Assembly can run in a different process than prepare (and under a
             # front-end that persists its own session-state.json), so recover the
             # provenance from process_dir when this session dict does not carry it.
@@ -3734,26 +3896,17 @@ def combine_audio_chapters(session_id:str)->list[str]|None:
                     return None
                 chapter_titles = [chapter_titles[ch-1] for ch in selected_chapters]
             # INVARIANT: the files about to be concatenated must cover EXACTLY the
-            # chapter set this function believes it is assembling. The glob above
-            # collects whatever files happen to exist, so a missing (or 0-byte)
-            # chapter file would otherwise produce a silently SHORTER audiobook
-            # with misaligned chapter titles. The intended set is:
-            #   - session['selected_chapters'] when set (assemble_audiobook always
-            #     sets it — 1-indexed; includes the designed partial-assembly path,
-            #     where the selection itself is the already-narrowed chapter list);
-            #   - otherwise one 0-indexed file per chapter in session['chapters']
-            #     (legacy finalize_audiobook/convert_chapters2audio flow).
+            # chapter set this function believes it is assembling (expected_chapter_nums,
+            # computed above). The glob above collects whatever files happen to exist,
+            # so a missing (or 0-byte) chapter file would otherwise produce a silently
+            # SHORTER audiobook with misaligned chapter titles.
             # Every intended chapter file must exist and be non-empty, else abort.
-            if selected_chapters:
-                expected_chapter_nums = list(selected_chapters)
-            else:
-                expected_chapter_nums = list(range(len(chapters_data)))
             if expected_chapter_nums:
                 files_by_num = {int(re.search(r'\d+', f).group()): f for f in chapter_files}
                 missing_chapter_nums = [n for n in expected_chapter_nums if n not in files_by_num]
                 empty_chapter_nums = [
                     n for n in expected_chapter_nums
-                    if n in files_by_num and os.path.getsize(os.path.join(session['chapters_dir'], files_by_num[n])) == 0
+                    if n in files_by_num and os.path.getsize(chapter_source_path(files_by_num[n])) == 0
                 ]
                 if missing_chapter_nums or empty_chapter_nums:
                     error = 'combine_audio_chapters(): refusing to assemble an incomplete audiobook.'
@@ -3770,17 +3923,40 @@ def combine_audio_chapters(session_id:str)->list[str]|None:
             chunks_size = 892
             total_duration = 0.0
             durations = []  # Track per-file durations for output_split mode
+            # total_duration is what finalize_export() holds the finished m4b against
+            # (the 2026-08-11 truncated-export guard), so it must be the sum of the
+            # ACTUAL sources, not of the FLACs we happen to have built this run. A
+            # pre-encoded chapter contributes its .m4a's duration — chapter_source_path()
+            # is what makes that automatic. Measuring the .m4a is also strictly more
+            # honest than measuring a FLAC would have been: the .m4a is the very stream
+            # that gets copied into the audiobook.
             for i in range(0, len(chapter_files), chunks_size):
-                filepaths = [
-                    os.path.join(session['chapters_dir'], f)
-                    for f in chapter_files[i:i + chunks_size]
-                ]
+                filepaths = [chapter_source_path(f) for f in chapter_files[i:i + chunks_size]]
                 chunk_durations = get_audiolist_duration(filepaths)
                 total_duration += sum(chunk_durations.values())
-                # Append durations in order
-                for f in chapter_files[i:i + chunks_size]:
-                    fp = os.path.join(session['chapters_dir'], f)
-                    durations.append(chunk_durations.get(os.path.realpath(fp), 0.0))
+                # Append durations in order. Indexed, not .get(…, 0.0): a chapter whose
+                # duration went missing must raise here, because a 0.0 reads downstream
+                # as a chapter of silence and would both mis-size the split parts and
+                # slacken the export guard by exactly that chapter's length.
+                for fp in filepaths:
+                    durations.append(chunk_durations[os.path.realpath(fp)])
+            if encoded_chapters:
+                # The pre-encoded chapters have no FLAC to fall back to — assembly
+                # deliberately never built one. So if the parallel export is not on the
+                # table after all, there is no way to ship them and no honest way to
+                # continue; the two decisions (here and in assemble_audiobook, which
+                # asks the same question through the same function) have disagreed and
+                # that is a bug to surface, not to paper over by re-concatenating
+                # sentences we were told not to.
+                reason = parallel_export_unsupported_reason(session, total_duration)
+                if reason:
+                    error = (
+                        f'combine_audio_chapters(): {len(encoded_chapters)} pre-encoded chapter(s) were '
+                        f'accepted but the parallel export path is unavailable — {reason}. Those chapters '
+                        f'have no chapter FLAC to rebuild from. Refusing to assemble.'
+                    )
+                    print(error)
+                    return None
             exported_files = []
             concat_dir = session['process_dir']
             if session['output_split']:
@@ -3816,7 +3992,7 @@ def combine_audio_chapters(session_id:str)->list[str]|None:
                                 msg = 'Cancel requested'
                                 print(msg)
                                 return None
-                            path = Path(session['chapters_dir']) / file
+                            path = Path(chapter_source_path(file))
                             f.write(f"file '{path.as_posix()}'\n")
                     merged_audio = Path(session['process_dir']) / f"{get_sanitized(session['metadata']['title'])}_part{part_idx+1}.{default_audio_proc_format}"
                     result = assemble_audio_chunks(str(concat_list), str(merged_audio), is_gui_process)
@@ -3835,13 +4011,19 @@ def combine_audio_chapters(session_id:str)->list[str]|None:
                 chapters_zip = list(zip(chapter_files, chapter_titles))
                 generate_ffmpeg_metadata(chapters_zip, metadata_file, default_audio_proc_format)
                 final_file = os.path.join(session['audiobooks_dir'], session['final_name'])
-                chapter_paths = [os.path.join(session['chapters_dir'], f) for f in chapter_files]
+                chapter_paths = [chapter_source_path(f) for f in chapter_files]
+                # Indexes into chapter_paths that are already AAC and only need placing
+                # in the concat list.
+                already_encoded = {
+                    i for i, f in enumerate(chapter_files)
+                    if int(re.search(r'\d+', f).group()) in encoded_chapters
+                }
                 if parallel_export_supported(total_duration):
                     # Encode chapters concurrently and stream-copy them together.
                     # This also skips building the whole-book intermediate FLAC —
                     # nothing else reads it, and on a 20 h book that alone was a 29 s
                     # write of 1.5 GB purely to hand one file to a single encoder.
-                    if export_audio_parallel(chapter_paths, metadata_file, final_file, total_duration):
+                    if export_audio_parallel(chapter_paths, already_encoded, metadata_file, final_file, total_duration):
                         exported_files.append(final_file)
                 else:
                     concat_list = os.path.join(concat_dir, f'concat_list_chapters_1.txt')
@@ -3852,7 +4034,7 @@ def combine_audio_chapters(session_id:str)->list[str]|None:
                                 msg = 'Cancel requested'
                                 print(msg)
                                 return None
-                            path = os.path.join(session['chapters_dir'], file).replace("\\", "/")
+                            path = chapter_source_path(file).replace("\\", "/")
                             f.write(f"file '{path}'\n")
                     if is_gui_process:
                         progress_bar = gr.Progress(track_tqdm=False)

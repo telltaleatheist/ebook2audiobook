@@ -786,6 +786,53 @@ def detect_completed_chapters(session: dict, state: dict) -> list[int]:
     return completed
 
 
+def measure_assembly_duration(session: dict, selected_chapters: list[int],
+                              encoded_chapters: dict, core_module) -> float:
+    """
+    Total playing time of the audiobook about to be assembled, measured BEFORE a
+    single chapter FLAC exists.
+
+    combine_audio_chapters() gets this number for free by summing the chapter files,
+    but the decision this feeds is upstream of those files: whether the parallel
+    export path will be taken, and therefore whether a pre-encoded chapter may skip
+    its sentence concat. Asking after the concat would be asking too late.
+
+    A chapter's FLAC is a pure concat of its sentence FLACs — combine_audio_sentences()
+    inserts nothing between them — so the sum of the sentence headers IS the chapter's
+    duration to sample precision. Pre-encoded chapters contribute their .m4a's measured
+    duration instead, since they have no sentences of their own to sum here.
+
+    Every sentence must be present. A silently skipped one would shorten this total
+    and could tip the 2 h loudnorm cutoff, and the same file is about to be demanded
+    by the concat anyway.
+    """
+    selected = set(selected_chapters)
+    total = 0.0
+    sentence_offset = 0
+    for i, chapter in enumerate(session['chapters']):
+        chapter_num = i + 1
+        if chapter_num not in selected:
+            sentence_offset += len(chapter)
+            continue
+        entry = encoded_chapters.get(chapter_num)
+        if entry:
+            total += entry['duration']
+        else:
+            for j in range(len(chapter)):
+                path = os.path.join(
+                    session['sentences_dir'],
+                    f'{sentence_offset + j}.{default_audio_proc_format}'
+                )
+                if not os.path.exists(path):
+                    raise RuntimeError(
+                        f'measure_assembly_duration(): chapter {chapter_num} is missing '
+                        f'sentence audio {path}'
+                    )
+                total += core_module.audio_duration_seconds(path)
+        sentence_offset += len(chapter)
+    return total
+
+
 def build_vtt_file(session_id: str, all_sentences: list, core_module) -> bool:
     """
     Build a VTT (WebVTT) subtitle file from sentence audio files.
@@ -955,6 +1002,14 @@ def assemble_audiobook(args: dict, core_module) -> dict:
         # BookForge: per-voice ffmpeg filter chain applied at the final encode (see
         # export_audio in lib/core.py). None → no post-render filtering.
         session['post_render_filter'] = args.get('post_render_filter')
+        # BookForge: chapters already encoded to AAC while the GPU was still rendering.
+        # Recorded here so it travels with the session; whether it is actually HONOURED
+        # is decided further down, once we know which chapters we are building and how
+        # long the book is — see the --encoded_chapters_dir block below.
+        encoded_chapters_dir = args.get('encoded_chapters_dir')
+        session['encoded_chapters_dir'] = (
+            os.path.abspath(encoded_chapters_dir) if encoded_chapters_dir else None
+        )
 
         # Language ISO
         try:
@@ -1078,6 +1133,16 @@ def assemble_audiobook(args: dict, core_module) -> dict:
 
         # Check for bilingual mode
         if args.get('bilingual'):
+            # Bilingual assembly re-cuts the whole book into ONE chapter of interleaved
+            # source/target sentences with inserted pauses, so nothing BookForge could
+            # have pre-encoded per chapter survives that re-cut.
+            if session['encoded_chapters_dir']:
+                print(
+                    '[ASSEMBLE] --encoded_chapters_dir ignored: bilingual mode rebuilds the book '
+                    'as a single interleaved chapter, so per-chapter encodes do not apply.'
+                )
+                session['encoded_chapters_dir'] = None
+
             # Bilingual assembly: pair source/target sentences with pauses
             from .bilingual import combine_bilingual_audio, build_bilingual_vtt
 
@@ -1129,6 +1194,40 @@ def assemble_audiobook(args: dict, core_module) -> dict:
 
         else:
             # Normal (non-bilingual) assembly
+            # BookForge --encoded_chapters_dir: chapters it already encoded to AAC while
+            # the GPU was still rendering. Resolve them BEFORE the concat loop, because
+            # the whole point is that those chapters never get a chapter FLAC built at
+            # all — on a 78-chapter book that concat is 57s of work whose only consumer
+            # is an encode we are also skipping.
+            #
+            # The pre-encoded chunks are only usable where the parallel export path is,
+            # so ask combine_audio_chapters' own gate (one shared function, so the two
+            # decisions cannot drift). Where it says no, this is not a degraded mode to
+            # limp along in: the chunks are genuinely unusable there — a non-MP4 output
+            # cannot concat them gaplessly, a pre-loudnorm filter has to see the whole
+            # stream, and under the 2 h cutoff loudnorm measures the entire book. Stand
+            # the directory down and rebuild every chapter exactly as before.
+            encoded_chapters = core_module.load_encoded_chapters(session, selected_chapters)
+            if encoded_chapters:
+                total_duration = measure_assembly_duration(
+                    session, selected_chapters, encoded_chapters, core_module
+                )
+                reason = core_module.parallel_export_unsupported_reason(session, total_duration)
+                if reason:
+                    print(
+                        f'[ASSEMBLE] --encoded_chapters_dir ignored ({len(encoded_chapters)} '
+                        f'pre-encoded chapter(s) available): {reason}. Every chapter will be '
+                        f'rebuilt from its sentences.'
+                    )
+                    session['encoded_chapters_dir'] = None
+                    encoded_chapters = {}
+                else:
+                    print(
+                        f'[ASSEMBLE] {len(encoded_chapters)} of {len(selected_chapters)} chapters '
+                        f'already encoded by BookForge; skipping their sentence concat '
+                        f'({total_duration:.1f}s book total)'
+                    )
+
             # Combine sentences into chapters (only for selected chapters)
             sentence_offset = 0
             for i, chapter in enumerate(session['chapters']):
@@ -1136,6 +1235,16 @@ def assemble_audiobook(args: dict, core_module) -> dict:
 
                 # Skip chapters not in selection
                 if chapter_num not in selected_chapters:
+                    sentence_offset += len(chapter)
+                    continue
+
+                # A pre-encoded chapter needs no chapter FLAC — combine_audio_chapters()
+                # copies its .m4a straight into the audiobook. The offset must STILL
+                # advance by this chapter's sentence count: it is the only thing mapping
+                # chapters onto sentence ranges, and an increment missed here would slide
+                # every later chapter onto the wrong sentences, silently.
+                if chapter_num in encoded_chapters:
+                    print(f"[ASSEMBLE] Chapter {chapter_num}: pre-encoded, skipping sentence concat")
                     sentence_offset += len(chapter)
                     continue
 
