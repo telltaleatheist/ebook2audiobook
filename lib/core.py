@@ -1853,7 +1853,37 @@ def get_sentences(text:str, session_id:str)->list|None:
         #
         # The range matches _strip_escaped_sml's own test (ord >= sml_escape_tag)
         # rather than assuming the tokens stay inside the Private Use Area.
-        row_end = rf'(?=\s|$|[{chr(sml_escape_tag)}-\U0010FFFF])'
+        tok_class = rf'[{chr(sml_escape_tag)}-\U0010FFFF]'
+        row_end = rf'(?=\s|$|{tok_class})'
+
+        # A ROW ALSO ENDS IMMEDIATELY BEFORE A TOKEN, PUNCTUATION OR NOT.
+        #
+        # row_end lets a row end at a mark that is FOLLOWED by a token. It cannot
+        # help text that reaches a paragraph boundary without a mark at all, and
+        # two common shapes do exactly that:
+        #
+        #   HEADINGS. 'Chapter 8: State of Confusion' ends in a letter, so the row
+        #   ran on through the heading's own token into the prose and came out as
+        #   'Chapter 8: State of Confusion. Some consider Franklin D. Roosevelt…' —
+        #   the title welded to the first sentence. True of a real <h2> as much as
+        #   of a styled <p>, so it was broken for every book.
+        #
+        #   THE ABBREVIATION GUARD. The dot after 'D.C.' or 'etc.' is deliberately
+        #   not a sentence end (so 'Mr. Darcy' never breaks mid-name), so a
+        #   paragraph ending in one swallowed the next paragraph's token. Measured
+        #   on Killing America: 69 of the 97 short one-sentence chunks (71%).
+        #
+        # Both leave the token BURIED mid-row, where PASS 5 refuses to pack and
+        # orpheus.py strips it before TTS. Terminating on whichever comes first —
+        # a sentence end or a token — is what makes "no token is ever buried" true
+        # by construction rather than by luck.
+        #
+        # ONE lazy scan with two terminators rather than an alternation of two
+        # patterns: alternation is ordered, so a token-first branch would swallow
+        # whole paragraphs (no sentence splitting inside them) and a marks-first
+        # branch would never reach the token. Laziness is what picks the EARLIER
+        # of the two. The leading `{tok_class}*` lets a row start on its own
+        # token(s) without the terminator matching empty at position zero.
 
         # A sentence that ends inside quotes ends AT THE CLOSING QUOTE, not at the
         # mark. Without this the lookahead lands on the '"' of '"Are you sure?"',
@@ -1890,12 +1920,12 @@ def get_sentences(text:str, session_id:str)->list|None:
             guarded_dot = rf'(?<!\b[A-Za-z]){guards}\.'
             others = [re.escape(p) for p in punctuation_split_hard_set if p != '.']
             hard_pattern = re.compile(
-                rf"(.*?(?:{'|'.join([guarded_dot] + others)}){closing_run}){row_end}",
+                rf"{tok_class}*.*?(?:(?:{'|'.join([guarded_dot] + others)}){closing_run}{row_end}|(?={tok_class}))",
                 re.DOTALL
             )
         else:
             hard_pattern = re.compile(
-                rf"(.*?(?:{'|'.join(map(re.escape, punctuation_split_hard_set))}){closing_run}){row_end}",
+                rf"{tok_class}*.*?(?:(?:{'|'.join(map(re.escape, punctuation_split_hard_set))}){closing_run}{row_end}|(?={tok_class}))",
                 re.DOTALL
             )
         hard_list = split_inclusive(text, hard_pattern)
