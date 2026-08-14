@@ -1855,6 +1855,20 @@ def get_sentences(text:str, session_id:str)->list|None:
         # rather than assuming the tokens stay inside the Private Use Area.
         row_end = rf'(?=\s|$|[{chr(sml_escape_tag)}-\U0010FFFF])'
 
+        # A sentence that ends inside quotes ends AT THE CLOSING QUOTE, not at the
+        # mark. Without this the lookahead lands on the '"' of '"Are you sure?"',
+        # refuses to break, and the row runs on THROUGH the paragraph token that
+        # follows — burying it mid-row, where PASS 5 refuses to pack the row at all
+        # and it becomes its own one-sentence chunk.
+        #
+        # This is why DIALOGUE fragments while exposition does not: every turn
+        # ending in ?" or !" or ." blocks its own split. Measured on Deathstalker
+        # Honor — 6328 of 15067 rows (42%) carried a buried token, 78% of runs were
+        # a single row, and chunks filled 48% of the cap against Killing America's
+        # 74%. Hard marks only: a soft mark inside quotes ('"No," she said') is
+        # mid-sentence and must not end a row.
+        closing_run = r'["\'’”»)\]]*'
+
         # PASS 1 — hard punctuation
         if tts_engine == 'orpheus':
             # Abbreviations stay unexpanded for Orpheus (book-exact text), so
@@ -1876,12 +1890,12 @@ def get_sentences(text:str, session_id:str)->list|None:
             guarded_dot = rf'(?<!\b[A-Za-z]){guards}\.'
             others = [re.escape(p) for p in punctuation_split_hard_set if p != '.']
             hard_pattern = re.compile(
-                rf"(.*?(?:{'|'.join([guarded_dot] + others)})){row_end}",
+                rf"(.*?(?:{'|'.join([guarded_dot] + others)}){closing_run}){row_end}",
                 re.DOTALL
             )
         else:
             hard_pattern = re.compile(
-                rf"(.*?(?:{'|'.join(map(re.escape, punctuation_split_hard_set))})){row_end}",
+                rf"(.*?(?:{'|'.join(map(re.escape, punctuation_split_hard_set))}){closing_run}){row_end}",
                 re.DOTALL
             )
         hard_list = split_inclusive(text, hard_pattern)
@@ -2099,34 +2113,118 @@ def get_sentences(text:str, session_id:str)->list|None:
                 max_sents = int(_ms) if _ms else None
                 def _nsent(t):
                     return max(1, len(re.findall(r'[.!?…]["\'”’)\]]*(?:\s|$)', t)))
-                packed = []
-                # Edges of each packed row, parallel to `packed`: (lead, core, trail),
-                # or None for a row that must never be packed into (SML-only, or a token
-                # buried mid-row that a merge would have to discard silently).
-                edges = []
-                dropped_join_tokens = 0
+                # BALANCED, not greedy-to-the-brim (Owen, 2026-08-13: "if a
+                # paragraph is 900 characters … instead of creating a 500 character
+                # chunk and a 100 character chunk, we split it in half and create two
+                # 300-character chunks").
+                #
+                # Greedy filling emits a starved tail: a 600-char run at a 540 cap
+                # becomes 540 + 60, and that 60-char chunk is its own generation, with
+                # its own take of the voice. Balancing costs NOTHING — the run needs
+                # the same number of chunks either way, since k is fixed by the run's
+                # total length — so the only question is where the boundaries fall, and
+                # even is better than lopsided on both axes that matter: no starved
+                # take, and a lower PEAK length, which is the one that flirts with the
+                # EOS/token cliff (500 chars already spends ~93% of the 3700-token
+                # budget at the measured worst-case rate).
+                #
+                # Measured on Killing America at deathstalker's real 540 cap: greedy
+                # gives 924 chunks with 110 under 150 chars; balanced gives 895 with 12
+                # under 150. Chunk COUNT barely moves, which is the point — this buys
+                # evenness, not throughput.
+                #
+                # Boundaries are still only ever SENTENCE boundaries (the rows handed
+                # in), so a run whose sentences do not divide evenly stays lopsided and
+                # some chunks are a single sentence. That is expected and fine.
+                def _group_run(run, limit):
+                    # Greedy grouping of one run at `limit`, returning index lists.
+                    # clean_len is measured on the merged CORE: lead/trail are SML and
+                    # contribute nothing to it, exactly as the old merged check relied on.
+                    groups, cur, cur_core = [], [], ''
+                    for i, core in enumerate(r[1] for r in run):
+                        if not cur:
+                            cur, cur_core = [i], core
+                            continue
+                        merged_core = cur_core.rstrip() + ' ' + core.lstrip()
+                        if (clean_len(merged_core) <= limit
+                                and (max_sents is None
+                                     or _nsent(cur_core) + _nsent(core) <= max_sents)):
+                            cur.append(i)
+                            cur_core = merged_core
+                        else:
+                            groups.append(cur)
+                            cur, cur_core = [i], core
+                    if cur:
+                        groups.append(cur)
+                    return groups
+
+                def _balanced_groups(run):
+                    # k is what greedy needs at the real cap — the floor on chunks for
+                    # this run. Then find the SMALLEST limit that still fits in k, which
+                    # is the evenest split reachable at sentence boundaries. Binary
+                    # search is exact here because feasibility is monotone in the limit.
+                    at_cap = _group_run(run, max_chars)
+                    if len(at_cap) <= 1:
+                        return at_cap
+                    k = len(at_cap)
+                    lo = max(clean_len(r[1]) for r in run)
+                    hi, best = max_chars, max_chars
+                    while lo <= hi:
+                        mid = (lo + hi) // 2
+                        if len(_group_run(run, mid)) <= k:
+                            best, hi = mid, mid - 1
+                        else:
+                            lo = mid + 1
+                    return _group_run(run, best)
+
+                # Rows as (original, edges) — edges None for a row that must never be
+                # packed into (SML-only, or a token buried mid-row that a merge would
+                # have to discard silently). Those break the run they sit in.
+                items = []
                 for s in final_list:
                     s = s.strip()
                     if not s:
                         continue
                     lead, core, trail = _split_sml_edges(s)
-                    if not core or _has_escaped_sml(core):
-                        packed.append(s)
-                        edges.append(None)
-                        continue
-                    if packed and edges[-1] is not None:
-                        prev_lead, prev_core, prev_trail = edges[-1]
-                        merged_core = prev_core.rstrip() + ' ' + core.lstrip()
-                        merged = f'{prev_lead}{merged_core}{trail}'
-                        if (clean_len(merged) <= max_chars
-                                and (max_sents is None
-                                     or _nsent(prev_core) + _nsent(core) <= max_sents)):
-                            packed[-1] = merged
-                            edges[-1] = (prev_lead, merged_core, trail)
-                            dropped_join_tokens += len(prev_trail) + len(lead)
+                    items.append((s, None if (not core or _has_escaped_sml(core))
+                                  else (lead, core, trail, s)))
+
+                packed = []
+                dropped_join_tokens = 0
+
+                def _emit(run):
+                    nonlocal dropped_join_tokens
+                    for g in _balanced_groups(run):
+                        if len(g) == 1:
+                            # Untouched, byte for byte. _split_sml_edges drops the
+                            # whitespace around a token, so rebuilding a row that was
+                            # never merged would quietly rewrite it.
+                            packed.append(run[g[0]][3])
                             continue
-                    packed.append(s)
-                    edges.append((lead, core, trail))
+                        lead = run[g[0]][0]
+                        trail = run[g[-1]][2]
+                        core = run[g[0]][1]
+                        for i in g[1:]:
+                            core = core.rstrip() + ' ' + run[i][1].lstrip()
+                        # Every join discards the accumulating chunk's TRAILING token
+                        # and the incoming row's LEADING token, counted as before.
+                        for i in g[:-1]:
+                            dropped_join_tokens += len(run[i][2])
+                        for i in g[1:]:
+                            dropped_join_tokens += len(run[i][0])
+                        packed.append(f'{lead}{core}{trail}')
+
+                run = []
+                for s, e in items:
+                    if e is None:
+                        if run:
+                            _emit(run)
+                            run = []
+                        packed.append(s)
+                    else:
+                        run.append(e)
+                if run:
+                    _emit(run)
                 if dropped_join_tokens:
                     print(f'get_sentences() Orpheus pack: {dropped_join_tokens} join pause token(s) dropped '
                           f'packing {len(final_list)} rows into {len(packed)} chunks (packing > pause)')
