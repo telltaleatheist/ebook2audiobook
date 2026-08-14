@@ -1833,6 +1833,28 @@ def get_sentences(text:str, session_id:str)->list|None:
 
         assert not SML_TAG_PATTERN.search(text)
 
+        # A row ends at whitespace, at end of text — or at a PARAGRAPH BOUNDARY.
+        #
+        # escape_sml has replaced each <break>/<pause>/… with ONE char of
+        # ord >= sml_escape_tag (0xE000), and that char is not \s. So a paragraph
+        # that ends 'There is hope.' followed immediately by the next paragraph
+        # read as 'hope.<break>So when family…' — one unsplittable row with the
+        # token BURIED in the middle, where orpheus.py strips it and its pause is
+        # silently lost, and where PASS 5 refuses to pack the row at all
+        # (see _plain).
+        #
+        # Latent until Orpheus stopped being routed through the punctuation-
+        # spacing rule above: that rule had been inserting the very space this
+        # lookahead now recognises. Measured on Killing America the day it went
+        # in — 1357 rows became 1725, because packing stopped happening, and
+        # every buried break lost its pause. The book's own spacing is still
+        # never touched; this only teaches the splitter that a paragraph break
+        # ends a row, which it always did.
+        #
+        # The range matches _strip_escaped_sml's own test (ord >= sml_escape_tag)
+        # rather than assuming the tokens stay inside the Private Use Area.
+        row_end = rf'(?=\s|$|[{chr(sml_escape_tag)}-\U0010FFFF])'
+
         # PASS 1 — hard punctuation
         if tts_engine == 'orpheus':
             # Abbreviations stay unexpanded for Orpheus (book-exact text), so
@@ -1854,12 +1876,12 @@ def get_sentences(text:str, session_id:str)->list|None:
             guarded_dot = rf'(?<!\b[A-Za-z]){guards}\.'
             others = [re.escape(p) for p in punctuation_split_hard_set if p != '.']
             hard_pattern = re.compile(
-                rf"(.*?(?:{'|'.join([guarded_dot] + others)}))(?=\s|$)",
+                rf"(.*?(?:{'|'.join([guarded_dot] + others)})){row_end}",
                 re.DOTALL
             )
         else:
             hard_pattern = re.compile(
-                rf"(.*?(?:{'|'.join(map(re.escape, punctuation_split_hard_set))}))(?=\s|$)",
+                rf"(.*?(?:{'|'.join(map(re.escape, punctuation_split_hard_set))})){row_end}",
                 re.DOTALL
             )
         hard_list = split_inclusive(text, hard_pattern)
@@ -1869,7 +1891,7 @@ def get_sentences(text:str, session_id:str)->list|None:
 
         # PASS 2 — soft punctuation
         soft_pattern = re.compile(
-            rf"(.*?(?:{'|'.join(map(re.escape, punctuation_split_soft_set))}))(?=\s|$)",
+            rf"(.*?(?:{'|'.join(map(re.escape, punctuation_split_soft_set))})){row_end}",
             re.DOTALL
         )
         soft_list = []
