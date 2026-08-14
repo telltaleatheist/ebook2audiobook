@@ -588,11 +588,6 @@ def convert2epub(session_id:str)-> bool:
         try:
             title = False
             author = False
-            util_app = shutil.which('ebook-convert')
-            if not util_app:
-                error = 'ebook-convert utility is not installed or not found.'
-                print(error)
-                return False
             file_input = session['ebook']
             if os.path.getsize(file_input) == 0:
                 error = f'Input file is empty: {file_input}'
@@ -601,6 +596,33 @@ def convert2epub(session_id:str)-> bool:
             file_ext = os.path.splitext(file_input)[1].lower()
             if file_ext not in ebook_formats:
                 error = f'Unsupported file format: {file_ext}'
+                print(error)
+                return False
+            if file_ext == '.epub':
+                # The book already IS an EPUB, so its spine and TOC ARE the chapter
+                # structure and they are the authority. Converting it anyway was
+                # actively destructive on two counts:
+                #
+                #  - '--page-breaks-before' on every h1..h5, plus Calibre's default of
+                #    splitting at page breaks, exploded one 7-chapter book into 78 spine
+                #    documents (each opening with Calibre's own id="calibre_pb_N").
+                #    get_chapters() makes ONE CHAPTER PER SPINE DOCUMENT, so every
+                #    section heading became an m4b chapter marker.
+                #  - '--smarten-punctuation' rewrites the book's straight quotes to
+                #    typographic ones (arm's -> arm’s), mutating the very text that
+                #    Orpheus fine-tunes are trained on. See the book-exact-text note in
+                #    get_sentences(): we deliberately do not normalise this text.
+                #
+                # Non-EPUB inputs still take the full Calibre pass below — the PDF, TXT
+                # and image branches flatten to a SINGLE XHTML document, and that
+                # heading split is the only thing giving those books chapters at all.
+                msg = f'Input is already an EPUB — using it directly, no Calibre pass: {file_input}'
+                print(msg)
+                session['epub_path'] = file_input
+                return True
+            util_app = shutil.which('ebook-convert')
+            if not util_app:
+                error = 'ebook-convert utility is not installed or not found.'
                 print(error)
                 return False
             if file_ext == '.txt':
