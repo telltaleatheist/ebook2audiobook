@@ -1035,10 +1035,34 @@ def assemble_audiobook(args: dict, core_module) -> dict:
             # Re-derive cover path from corrected process_dir
             # (session-state.json may contain stale WSL path)
             raw_cover = state.get('cover')
+            # get_cover() (lib/core.py, typed `-> bool|str`) returns a str path when the
+            # epub carried a cover image and the BOOLEAN True when it did not. True is
+            # not a path, and it must never reach finalize_export()'s open(cover_path):
+            # Python's open() accepts an integer fd and True == 1, so open(True) silently
+            # opens THIS PROCESS'S OWN STDOUT and the following read() blocks forever on a
+            # pipe whose only writer is itself. (Nuremberg 2026-08-14: assembly deadlocked
+            # for good after a complete, duration-verified m4b had already been written.
+            # Exposed by the Calibre bypass — ebook-convert used to synthesise a cover, so
+            # get_cover() never returned the sentinel on this path before.)
+            # "No cover" is representable exactly one way from here down: None.
             if isinstance(raw_cover, str) and session.get('filename_noext'):
                 session['cover'] = os.path.join(state['process_dir'], session['filename_noext'] + '.jpg')
+            elif raw_cover is None or isinstance(raw_cover, bool):
+                # The epub carried no cover, but BookForge stages its own chosen art at
+                # <process_dir>/cover.jpg before invoking assembly. e2a is the only thing
+                # that embeds artwork into the m4b, so without this the file ships bare.
+                staged_cover = os.path.join(state['process_dir'], 'cover.jpg')
+                if os.path.isfile(staged_cover):
+                    print(f'[ASSEMBLE] Epub carried no cover; using staged cover {staged_cover}')
+                    session['cover'] = staged_cover
+                else:
+                    print('[ASSEMBLE] No cover in the epub and none staged — shipping without artwork')
+                    session['cover'] = None
             else:
-                session['cover'] = raw_cover
+                raise TypeError(
+                    f"session-state.json 'cover' must be a path string, a bool sentinel, or null — "
+                    f"got {type(raw_cover).__name__}: {raw_cover!r}"
+                )
             # Load TOC chapter titles for proper chapter markers
             session['chapter_titles'] = state.get('chapter_titles', [])
             if session['chapter_titles']:

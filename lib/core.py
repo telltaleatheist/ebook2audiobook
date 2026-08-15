@@ -3650,6 +3650,15 @@ def combine_audio_chapters(session_id:str)->list[str]|None:
             if session['output_format'] in ['mp3', 'm4a', 'm4b', 'mp4']:
                 if session['cover'] is not None:
                     cover_path = session['cover']
+                    # open() accepts an integer file descriptor, and bool is an int
+                    # subclass — so a stray True here opens fd 1 (stdout) instead of
+                    # raising, and the read() below deadlocks the process against its
+                    # own pipe. Refuse anything that is not a path, loudly.
+                    if not isinstance(cover_path, str):
+                        raise TypeError(
+                            f"session['cover'] must be a path string or None, got "
+                            f"{type(cover_path).__name__}: {cover_path!r}"
+                        )
                     msg = f'Adding cover {cover_path} into the final audiobook file…'
                     print(msg)
                     if session['output_format'] == 'mp3':
