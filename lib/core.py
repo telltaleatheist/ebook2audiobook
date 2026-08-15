@@ -1167,8 +1167,21 @@ def filter_chapter(idx:int, doc:EpubHtml, session_id:str, stanza_nlp:Pipeline, i
             doc_body = doc.get_body_content()
             raw_html = doc_body.decode('utf-8') if isinstance(doc_body, bytes) else doc_body
             soup = BeautifulSoup(raw_html, 'html.parser')
-            body = soup.body
-            if not body or not body.get_text(strip=True):
+            # ebooklib's get_body_content() returns ONE OF TWO SHAPES, and which one
+            # depends on whether <body> carries attributes. It serializes the element
+            # and strips the wrapper with a literal `startswith(b'<body>')` check, so:
+            #   <body>            -> returns the INNER html, no body tag at all
+            #   <body class="x">  -> the check fails, returns the WHOLE element
+            # Calibre stamps class="calibre" onto every body, so for as long as every
+            # book was force-converted this only ever saw the second shape and
+            # `soup.body` always matched. A publisher/BookForge EPUB with a bare <body>
+            # gives the first shape, `soup.body` is None, and this read as "no body
+            # found" — silently skipping EVERY document and failing prepare with
+            # "No chapters found!" on a book whose text was sitting right there
+            # (measured: 21,255 characters in the document that reported no body).
+            body = soup.body if soup.body is not None else soup
+            if not body.get_text(strip=True):
+                # Genuinely empty (a nav page, a spacer) — not an error, skip it.
                 msg = 'No body found. Skip to next doc…'
                 print(msg)
                 return []
