@@ -1160,7 +1160,12 @@ def filter_chapter(idx:int, doc:EpubHtml, session_id:str, stanza_nlp:Pipeline, i
         session = context.get_session(session_id)
         if session and session.get('id', False):
             lang, lang_iso1, tts_engine = session['language'], session['language_iso1'], session['tts_engine']
-            heading_tags = [f'h{i}' for i in range(1, 5)]
+            # h1..h6, all of them: an <h5>/<h6> outside this list falls into the
+            # transparent-inline branch of _tuple_row — no [break] emitted, no
+            # period appended — and is welded to the following prose verbatim.
+            # Calibre is even told to page-break on h5 (see convert2epub), so
+            # sub-sub-headings are real in this corpus.
+            heading_tags = [f'h{i}' for i in range(1, 7)]
             break_tags = ['br', 'p', 'span']
             pause_tags = ['div']
             proc_tags = heading_tags + break_tags + pause_tags
@@ -1238,8 +1243,34 @@ def filter_chapter(idx:int, doc:EpubHtml, session_id:str, stanza_nlp:Pipeline, i
             prev_typ = None
             last_heading_normalized = None  # Track last heading to deduplicate body text
             chapter_title_normalized = None  # First heading of the chapter — suppress later echoes anywhere
+            sml_statics = {v['static'] for v in TTS_SML.values() if 'static' in v}
+
+            def _close_block(items):
+                # A BLOCK BOUNDARY FOLLOWS THE LAST ITEM. A standalone line that
+                # carries no terminal punctuation — a signature ("Lance Wallnau",
+                # then "Author" on its own line), a label, a title paragraph the
+                # TOC never listed — would otherwise weld to the next block into
+                # one sentence: the flattened text keeps the boundary only as an
+                # SML token, and the "remove any [break] between words" pass
+                # below deletes that token whenever WORD characters flank it.
+                # The period is the same treatment headings get at append time,
+                # and it also makes the token survive that pass (a '.' is not a
+                # word character), so the sentence break AND the paragraph pause
+                # both stand.
+                #
+                # GATED ON A WORD CHARACTER, not on "lacks .!?…": a line ending
+                # in a closing quote («She said, "Hello."»), a comma, a colon or
+                # a dash already says how it ends, and a second mark after it
+                # would be read aloud as a stumble. Only a bare letter or digit
+                # at the end is a line that never got to say so.
+                if items:
+                    last = items[-1]
+                    if last not in sml_statics and last and last[-1].isalnum():
+                        items[-1] = last + '.'
+
             for typ, payload in tuples_list:
                 if typ == 'heading':
+                    _close_block(text_list)
                     if not session.get('skip_headings', False):
                         title = payload.strip()
                         norm = _norm_title(title)
@@ -1257,10 +1288,12 @@ def filter_chapter(idx:int, doc:EpubHtml, session_id:str, stanza_nlp:Pipeline, i
                         if chapter_title_normalized is None:
                             chapter_title_normalized = norm
                 elif typ in ('break', 'pause'):
+                    _close_block(text_list)
                     if prev_typ != typ:
                         text_list.append(sml_token(typ))
                     # Don't clear last_heading — breaks often sit between heading and duplicate text
                 elif typ == 'table':
+                    _close_block(text_list)
                     last_heading_normalized = None
                     table = payload
                     if table in handled_tables:
@@ -1302,6 +1335,9 @@ def filter_chapter(idx:int, doc:EpubHtml, session_id:str, stanza_nlp:Pipeline, i
                             print(f'[HEADING] Detected chapter title from TOC match: "{text}"')
                         text_list.append(text)
                 prev_typ = typ
+            # The document's end is a block boundary too — a chapter whose last
+            # line is a bare signature closes the same way one mid-chapter does.
+            _close_block(text_list)
             msg = f'Flattening as raw text…'
             print(msg)
             # Voxtral and Orpheus both read better multi-sentence: packing 2-3
