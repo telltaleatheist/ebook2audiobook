@@ -247,6 +247,27 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
     # ~105s (2.8x faster), peak memory ~13.7 GB (vs ~14.2 at 2048).
     MLX_MAX_TOKENS = int(os.environ.get('ORPHEUS_MLX_MAX_TOKENS', '3700'))
 
+    # ---- MLX repetition-penalty window -------------------------------------
+    #
+    # How far back the repetition penalty looks. mlx_lm's own default is 20
+    # tokens (~0.24s of audio at 84 tok/s), and that is what this ran on until
+    # 2026-08-21. It is far too short for SILENCE: a pause is a run of repeated
+    # silence tokens, so once a pause passes a quarter second it falls out of
+    # the window and the penalty stops discouraging it — the pause is free to
+    # run on. vLLM applies the same penalty over the FULL context, which is why
+    # the identical voice paused normally there and dragged here.
+    #
+    # 4096 exceeds MLX_MAX_TOKENS, so the window is effectively the whole
+    # generation and the two backends now shape pauses the same way. Measured
+    # on a 58-chunk God's People slice (thirdreich, M1 Ultra, width 96):
+    #   window 20   → 650s, 4 cap-hits, 38.5% silence, pause p90 2.34s, max 6.37s
+    #   window 4096 → 377s, 0 cap-hits, 30.9% silence, pause p90 1.63s, max 3.65s
+    # (vLLM reference for the same voice: 31.0%, p90 1.68s, max 2.92s.)
+    # Speech seconds went UP 2.3% while silence fell 26.9% — it removes dead
+    # air, it does not clip. Killing the cap-hits also kills the serial
+    # re-render ladder those trigger, which is the larger win on a full book.
+    MLX_REP_WINDOW = int(os.environ.get('ORPHEUS_MLX_REP_WINDOW', '4096'))
+
     # ---- MLX batch memory budget -------------------------------------------
     #
     # HISTORY (read before "optimizing" this): until mlx-lm 0.31.3 the MLX batch
@@ -2154,7 +2175,7 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
                                          top_p=self._voice_cap('topP'),
                                          min_p=self._voice_cap('minP')),
                     logits_processors=make_logits_processors(
-                        None, self._voice_cap('repPenalty'), 20),
+                        None, self._voice_cap('repPenalty'), self.MLX_REP_WINDOW),
                     completion_batch_size=len(bucket),
                     prefill_batch_size=len(bucket),
                 )
@@ -3202,7 +3223,7 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
                                              top_p=self._voice_cap('topP'),
                                              min_p=self._voice_cap('minP')),
                         logits_processors=make_logits_processors(
-                            None, self._voice_cap('repPenalty'), 20),
+                            None, self._voice_cap('repPenalty'), self.MLX_REP_WINDOW),
                         completion_batch_size=len(bucket),
                         prefill_batch_size=len(bucket),
                     )
