@@ -2179,7 +2179,15 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
                     completion_batch_size=len(bucket),
                     prefill_batch_size=len(bucket),
                 )
-                uids = bg.insert([list(p) for _, p, _, _ in bucket])
+                boosts = [self._mlx_eos_boost_processor(len(c)) for _, _, c, _ in bucket]
+                if any(boosts):
+                    rep = make_logits_processors(
+                        None, self._voice_cap('repPenalty'), self.MLX_REP_WINDOW)
+                    uids = bg.insert(
+                        [list(p) for _, p, _, _ in bucket],
+                        logits_processors=[rep + [b] if b else list(rep) for b in boosts])
+                else:
+                    uids = bg.insert([list(p) for _, p, _, _ in bucket])
                 out = {u: [] for u in uids}
                 row_by_uid = dict(zip(uids, bucket))   # uid -> (i, ptoks, clean, budget)
                 pending = set(uids)                    # rows not yet resolved
@@ -2281,6 +2289,42 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
             if n > start:
                 # ramp with overrun, capped at 4x the base bias
                 logits[eos] += base * min(4.0, 1.0 + (n - start) / expected)
+            return logits
+        return _boost
+
+    def _mlx_eos_boost_processor(self, n_chars: int):
+        """The EOS boost, ported to mlx-lm's logits-processor contract
+        (`(tokens_context, logits(1, vocab)) -> logits`, applied PER ROW by
+        BatchGenerator with that row's own token history — the context is seeded
+        empty at insert, so `len(tokens)` counts generated tokens plus one, the
+        same quantity vLLM's processor sees). Returns None when the voice does
+        not carry a boost, so an unconfigured voice pays nothing.
+
+        Same base/ramp/4x arithmetic as `_eos_boost_processor`, with ONE
+        deliberate divergence: the start is clamped to fire no later than 90% of
+        MLX_MAX_TOKENS. With eosBoostStart 2.0 a ~500-char chunk's start
+        (~4,600 tokens) sits beyond the 3,700-token cap, so the vLLM-tuned start
+        can NEVER fire for a full-size chunk here — and the rows this port
+        exists for (measured 2026-08-21: 2 cap-hits in 623 chunks AFTER the
+        rep-window fix, both ~500-char slow-delivery passages) are exactly those.
+        The clamp only moves the start for chunks whose natural start would
+        outrun the cap; short-chunk runaways keep the vLLM behaviour. The
+        legitimate slow tail is safe margin: the catalog's measured p05 delivery
+        (13.78 ch/s) puts a correct 500-char render at ~3,050 tokens, under the
+        ~3,330 clamped start."""
+        base = self._voice_cap('eosBoost')
+        if base <= 0:
+            return None
+        expected = max(300.0, n_chars / 18.4 * self.TOKENS_PER_AUDIO_SECOND)
+        start = min(self._voice_cap('eosBoostStart') * expected,
+                    0.9 * self.MLX_MAX_TOKENS)
+        eos = self.END_OF_AUDIO_TOKEN
+
+        def _boost(tokens, logits):
+            n = len(tokens)
+            if n > start:
+                bias = base * min(4.0, 1.0 + (n - start) / expected)
+                return logits.at[:, eos].add(bias)
             return logits
         return _boost
 
@@ -3227,7 +3271,20 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
                         completion_batch_size=len(bucket),
                         prefill_batch_size=len(bucket),
                     )
-                    uids = bg.insert([list(p) for _, p, _, _ in bucket])
+                    # Row slot 2 here is (clean_text, gap) — NOT the bare string the
+                    # other call site carries. len(c) on the tuple is 2, which floors
+                    # `expected` at 300 and fired the boost at ~600 tokens on EVERY
+                    # row (measured 2026-08-21: 46/46 chunks truncated to ~7s at
+                    # 40-60 ch/s before this line said c[0]).
+                    boosts = [self._mlx_eos_boost_processor(len(c[0])) for _, _, c, _ in bucket]
+                    if any(boosts):
+                        rep = make_logits_processors(
+                            None, self._voice_cap('repPenalty'), self.MLX_REP_WINDOW)
+                        uids = bg.insert(
+                            [list(p) for _, p, _, _ in bucket],
+                            logits_processors=[rep + [b] if b else list(rep) for b in boosts])
+                    else:
+                        uids = bg.insert([list(p) for _, p, _, _ in bucket])
                     out = {u: [] for u in uids}
                     # Heartbeat: a long MLX batch is otherwise SILENT for minutes, which
                     # the BookForge worker watchdog reads as "stuck" and false-kills the
