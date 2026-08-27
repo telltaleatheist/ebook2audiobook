@@ -43,7 +43,7 @@ from lib.conf import (
     default_audio_proc_format,
     NATIVE,
 )
-from lib.conf_models import default_fine_tuned, TTS_ENGINES
+from lib.conf_models import default_fine_tuned, TTS_ENGINES, SML_UNSPOKEN_PATTERN
 from lib.conf_lang import default_language_code
 
 
@@ -900,8 +900,11 @@ def build_vtt_file(session_id: str, all_sentences: list, core_module) -> bool:
         vtt_blocks = []
         current_time = 0.0
 
-        # SML tag pattern for cleaning
-        SML_PATTERN = re.compile(r'\[(?:break|music|sfx|silence)(?::[^\]]+)?\]', re.IGNORECASE)
+        # SML tag pattern for cleaning. Shared with lib/core.py and the engines
+        # as of 2026-08-27 — this copy had drifted the same way core's had (no
+        # [pause]) and would have leaked the new [heading] marker into the cue
+        # text of every chapter title.
+        SML_PATTERN = SML_UNSPOKEN_PATTERN
 
         def format_timestamp(seconds: float) -> str:
             h = seconds // 3600

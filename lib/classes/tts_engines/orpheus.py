@@ -2624,7 +2624,11 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
 
     def _clean_sentence_for_tts(self, sentence: str) -> str:
         """Strip whitespace + the e2a SML tags Orpheus doesn't understand
-        ([break]/[pause]/[music]/[sfx]/[silence]); Orpheus has its own emotion tags.
+        (SML_UNSPOKEN_PATTERN: [break]/[pause]/[heading]/[music]/[sfx]/[silence]);
+        Orpheus has its own emotion tags. 2026-08-27: the alternation used to be
+        spelled out here, and identically in voxtral.py and f5.py — it moved to
+        conf_models so the [heading] marker (and anything after it) cannot be
+        taught to one engine and missed by the other two.
 
         Then apply the book-exact -> model transform (to_tts_form: scripture refs
         + bare-integer expansion, the exact transforms the fine-tunes trained
@@ -2636,7 +2640,7 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
         function's return. Idempotent: sentences from a pre-display-text session
         (already expanded) pass through unchanged."""
         sentence = (sentence or '').strip()
-        sentence = re.sub(r'\[(?:break|pause|music|sfx|silence)(?::[^\]]+)?\]', '', sentence, flags=re.IGNORECASE)
+        sentence = SML_UNSPOKEN_PATTERN.sub('', sentence)
         return to_tts_form(sentence.strip()).strip()
 
     def _classify_gap(self, sentence: str):

@@ -1304,7 +1304,16 @@ def filter_chapter(idx:int, doc:EpubHtml, session_id:str, stanza_nlp:Pipeline, i
                         # Add period to chapter titles so TTS pauses after them
                         if title and title[-1] not in '.!?…':
                             title += '.'
-                        text_list.append(title)
+                        # …and MARK it, so the period is not the only thing the
+                        # splitter knows (2026-08-27). A period alone made this a
+                        # short punctuated row and nothing more: all three merge
+                        # passes in get_sentences then glued 'Prologue.' onto the
+                        # paragraph under it, because 9 chars is far below the
+                        # 25-char min-chars floor. The marker is what makes a
+                        # header its own chunk. Only headings that are actually
+                        # VOICED get marked — the skip_headings branch above has
+                        # already dropped the rest, and marking is not a toggle.
+                        text_list.append(sml_heading(title))
                         last_heading_normalized = norm
                         if chapter_title_normalized is None:
                             chapter_title_normalized = norm
@@ -1362,7 +1371,17 @@ def filter_chapter(idx:int, doc:EpubHtml, session_id:str, stanza_nlp:Pipeline, i
                             if text[-1] not in '.!?…':
                                 text += '.'
                             print(f'[HEADING] Detected chapter title from TOC match: "{text}"')
-                        text_list.append(text)
+                            # A title recovered from the TOC is a heading in
+                            # everything but markup, so it is marked like one and
+                            # reads as its own chunk too (2026-08-27). NOTE it is
+                            # NOT gated on skip_headings, and never was: this row
+                            # is body text that happens to match a TOC entry, and
+                            # skip_headings only ever suppressed real h1-h6 tags.
+                            # Marking it does not change what is spoken, only how
+                            # it is chunked.
+                            text_list.append(sml_heading(text))
+                        else:
+                            text_list.append(text)
                 prev_typ = typ
             # The document's end is a block boundary too — a chapter whose last
             # line is a bare signature closes the same way one mid-chapter does.
@@ -1544,7 +1563,7 @@ def filter_chapter(idx:int, doc:EpubHtml, session_id:str, stanza_nlp:Pipeline, i
 
             msg = f'Get sentences…'
             print(msg)
-            sentences = get_sentences(text, session_id)
+            sentences = get_sentences(text, session_id, sml_blocks)
             # get_sentences returns None on a genuine failure and [] for empty text.
             # The old `if sentences and len(sentences)==0` could never be true and
             # did not guard None, so a None fell through to the list comprehension
@@ -1678,11 +1697,50 @@ def _has_escaped_sml(s:str)->bool:
     return any(ord(c) >= sml_escape_tag for c in s)
 
 
-def _apply_min_chars_floor(rows:list, clean_len, max_chars:int, min_chars:int)->list:
+def _heading_row_test(sml_blocks:list[str]):
+    """Build THE predicate every merge pass asks before it glues a row to a
+    neighbour: "is this row a section heading?" (2026-08-27)
+
+    filter_chapter marks a heading with the [heading] token on the row's leading
+    edge, and escape_sml has since replaced that token with ONE char whose INDEX
+    into sml_blocks is its whole identity — inside get_sentences an escaped token
+    is otherwise opaque, which is why sml_blocks has to come in with the text.
+    So the question reduces to "does this row carry a char that stands for
+    [heading]", and the answer is precomputed once per chapter.
+
+    ONE predicate, built here and passed to all three merge passes
+    (_apply_min_chars_floor, the Orpheus PASS 5 packer, the Voxtral packer).
+    Three hand-rolled edge checks would drift apart, and the existing
+    _has_escaped_sml/_plain tests cannot answer this: they look at a row's CORE,
+    and the marker sits on the LEAD, where they are blind to it.
+
+    The whole row is searched rather than just its lead, so a row that carries
+    the marker anywhere — however it got there — is one no pass may merge."""
+    marks = set()
+    for i, block in enumerate(sml_blocks):
+        m = SML_TAG_PATTERN.fullmatch(block)
+        if m and m.group('tag') == 'heading':
+            marks.add(chr(sml_escape_tag + i))
+
+    def _is_heading_row(row:str)->bool:
+        return bool(marks) and any(c in marks for c in row)
+
+    return _is_heading_row
+
+
+def _apply_min_chars_floor(rows:list, clean_len, max_chars:int, min_chars:int, is_heading)->list:
     """Merge every row whose engine-read text is shorter than min_chars into a
     neighbour, so a one-word paragraph ('No.') is never handed to TTS as its own
     ultra-short prompt. FORWARD first (the tiny row leads into the sentence that
     follows it); BACKWARD only when the forward merge would break max_chars.
+
+    HEADINGS ARE EXEMPT, IN BOTH DIRECTIONS (2026-08-27). A section header is
+    read as its own chunk, so it is never merged away and nothing is ever merged
+    into it — this pass was the main reason headers used to be spoken as part of
+    the paragraph under them, since almost every header ('Prologue.', 'II.',
+    'Chapter 8: State of Confusion.') is shorter than the 25-char floor. This is
+    the one exemption that IGNORES length: a two-character heading still stands
+    alone. is_heading is the shared predicate from _heading_row_test.
 
     RATIFIED TRADE-OFF: the SML tokens sitting AT THE JOIN — the tiny row's
     trailing token, any SML-only rows between the two, and the neighbour's
@@ -1705,6 +1763,13 @@ def _apply_min_chars_floor(rows:list, clean_len, max_chars:int, min_chars:int)->
     i = 0
     while i < len(out):
         lead, core, trail = _split_sml_edges(out[i])
+        if is_heading(out[i]):
+            # Its own chunk, whatever its length. Reported only when the floor
+            # would otherwise have eaten it, so the log says what changed.
+            if core and clean_len(out[i]) < min_chars:
+                print(f'get_sentences() min-chars floor: heading kept as its own row: {_strip_escaped_sml(core)!r}')
+            i += 1
+            continue
         if not core or clean_len(out[i]) >= min_chars:
             i += 1
             continue
@@ -1719,7 +1784,9 @@ def _apply_min_chars_floor(rows:list, clean_len, max_chars:int, min_chars:int)->
             j += 1
         if j < len(out):
             next_lead, next_core, next_trail = _split_sml_edges(out[j])
-            if not _has_escaped_sml(next_core):
+            # …and never merge a short row INTO a heading: the header would stop
+            # being the chunk's whole content, which is the point of marking it.
+            if not _has_escaped_sml(next_core) and not is_heading(out[j]):
                 merged = f'{lead}{core} {next_core}{next_trail}'
                 if clean_len(merged) <= max_chars:
                     dropped = len(trail) + len(next_lead) + sum(
@@ -1736,7 +1803,8 @@ def _apply_min_chars_floor(rows:list, clean_len, max_chars:int, min_chars:int)->
             k -= 1
         if k >= 0:
             prev_lead, prev_core, prev_trail = _split_sml_edges(out[k])
-            if not _has_escaped_sml(prev_core):
+            # Symmetric refusal: a heading is not a landing site backwards either.
+            if not _has_escaped_sml(prev_core) and not is_heading(out[k]):
                 merged = f'{prev_lead}{prev_core} {core}{trail}'
                 if clean_len(merged) <= max_chars:
                     dropped = len(prev_trail) + len(lead) + sum(
@@ -1751,7 +1819,11 @@ def _apply_min_chars_floor(rows:list, clean_len, max_chars:int, min_chars:int)->
     return out
 
 
-def get_sentences(text:str, session_id:str)->list|None:
+def get_sentences(text:str, session_id:str, sml_blocks:list[str])->list|None:
+    # sml_blocks is escape_sml's block table for THIS text, and it comes in
+    # because an escaped token is otherwise an anonymous char here: the merge
+    # passes below have to be able to ask which token a char stands for, to keep
+    # a section heading out of every merge (2026-08-27, _heading_row_test).
 
     def split_inclusive(text:str, pattern:re.Pattern[str])->list[str]:
         result = []
@@ -1914,6 +1986,9 @@ def get_sentences(text:str, session_id:str)->list|None:
         # rows shorter than this get merged into a neighbour rather than becoming
         # their own starved TTS prompt.
         min_chars = _sentence_min_chars()
+
+        # The ONE heading test, shared by every merge pass below (2026-08-27).
+        is_heading = _heading_row_test(sml_blocks)
 
         # Orpheus rows are stored/displayed BOOK-EXACT; the scripture+digit
         # expansion happens at the engine boundary (_clean_sentence_for_tts).
@@ -2182,16 +2257,26 @@ def get_sentences(text:str, session_id:str)->list|None:
                 # max_chars so each generation spans several sentences. Rendering one
                 # short sentence per call makes every sentence an independent "take"
                 # with inconsistent timbre/prosody — the packing keeps prosody coherent.
+                #
+                # A HEADING NEVER SHARES A GENERATION (2026-08-27). This packer
+                # was purely length-based and had no SML awareness at all, so a
+                # section header was simply the first few characters of whatever
+                # chunk it landed in. A marked heading now both starts its own
+                # chunk and ends it: the row after a heading opens a fresh chunk
+                # rather than being appended to the header's.
                 packed = []
                 for s in final_list:
                     s = s.strip()
                     if not s:
                         continue
+                    if is_heading(s) or (packed and is_heading(packed[-1])):
+                        packed.append(s)
+                        continue
                     if packed and clean_len(packed[-1]) + 1 + clean_len(s) <= max_chars:
                         packed[-1] = packed[-1].rstrip() + ' ' + s.lstrip()
                     else:
                         packed.append(s)
-                return _apply_min_chars_floor(packed, clean_len, max_chars, min_chars)
+                return _apply_min_chars_floor(packed, clean_len, max_chars, min_chars, is_heading)
             if tts_engine == 'orpheus':
                 # PASS 5 (Orpheus) — greedily pack adjacent sentences up to max_chars so
                 # each generation spans 2-3 sentences: coherent timbre/prosody across a
@@ -2311,13 +2396,21 @@ def get_sentences(text:str, session_id:str)->list|None:
                 # Rows as (original, edges) — edges None for a row that must never be
                 # packed into (SML-only, or a token buried mid-row that a merge would
                 # have to discard silently). Those break the run they sit in.
+                #
+                # A HEADING IS THE THIRD KIND (2026-08-27). Breaking the run is
+                # exactly the behaviour a header needs and it comes for free: the
+                # row is emitted alone, byte for byte, and neither neighbour can
+                # reach across it to the other. The classifier could not see this
+                # itself — it tests _has_escaped_sml(core), and a heading's marker
+                # sits on the row's LEAD, so the packer used to swallow headers
+                # happily and drop the marker as a join token.
                 items = []
                 for s in final_list:
                     s = s.strip()
                     if not s:
                         continue
                     lead, core, trail = _split_sml_edges(s)
-                    items.append((s, None if (not core or _has_escaped_sml(core))
+                    items.append((s, None if (not core or _has_escaped_sml(core) or is_heading(s))
                                   else (lead, core, trail, s)))
 
                 packed = []
@@ -2367,7 +2460,7 @@ def get_sentences(text:str, session_id:str)->list|None:
                     # _apply_near_dup_split: keeps a near-duplicate sentence pair
                     # out of one generation. No-op for non-repetitive prose.
                     return _apply_near_dup_split(
-                        _apply_min_chars_floor(packed, clean_len, max_chars, min_chars)
+                        _apply_min_chars_floor(packed, clean_len, max_chars, min_chars, is_heading)
                     )
                 def _split_to_cap(t):
                     parts, last = [], 0
@@ -2394,9 +2487,9 @@ def get_sentences(text:str, session_id:str)->list|None:
                 # MIN-CHARS FLOOR then PASS 6 — repetition-primed split
                 # (anti-runaway); see above.
                 return _apply_near_dup_split(
-                    _apply_min_chars_floor(capped, clean_len, max_chars, min_chars)
+                    _apply_min_chars_floor(capped, clean_len, max_chars, min_chars, is_heading)
                 )
-            return _apply_min_chars_floor(final_list, clean_len, max_chars, min_chars)
+            return _apply_min_chars_floor(final_list, clean_len, max_chars, min_chars, is_heading)
     except Exception as e:
         print(f'get_sentences() error: {e}')
         return None
@@ -2894,6 +2987,22 @@ def sml_token(tag:str, value:str|None=None, close:bool=False)->str:
     if value is not None:
         return f"[{tag}:{value}]"
     return f"[{tag}]"
+
+def sml_heading(title:str)->str:
+    """Mark a row as a section heading/title (2026-08-27).
+
+    The [heading] marker goes on the row's LEADING edge — see TTS_SML['heading']
+    for why it is a leading marker and not a paired wrapper. This marker is the
+    ONLY thing that carries the heading identity out of filter_chapter's walker
+    and down into get_sentences, where _heading_row_test turns it back into
+    "never merge this row into anything". Every engine strips it before TTS
+    (SML_UNSPOKEN_PATTERN, and _convert_sml for the XTTS-class engines), so it
+    is never spoken, and it is stripped again for VTT cues and m4b chapter
+    titles, which are built from these same rows.
+
+    The title arrives already terminated — the caller adds the period that makes
+    TTS stop — so this only prefixes the marker."""
+    return f"{sml_token('heading')}{title}"
 
 def normalize_text(text:str, lang:str, lang_iso1:str, tts_engine:str)->str:
 
@@ -4242,7 +4351,14 @@ def ellipsize_utf8_bytes(s:str, max_bytes:int, ellipsis:str='…')->str:
 def sanitize_meta_chapter_title(title:str, max_bytes:int=140)->str:
     # avoid None and embedded NULs which some muxers accidentally keep
     title = (title or '').replace('\x00', '')
-    title = title.replace(sml_token('pause'), '')
+    # A chapter's title is very often the chapter's own FIRST SENTENCE (see
+    # own_titles in combine_audio_chapters — e2a voices the heading as that
+    # sentence, so it always describes the audio), which means it arrives with
+    # whatever SML that row carries. Since 2026-08-27 that includes the
+    # [heading] marker, so this strips the whole unspoken set rather than the
+    # one [pause] literal it used to: a marker printed into an m4b chapter name
+    # is as wrong as one read aloud.
+    title = SML_UNSPOKEN_PATTERN.sub('', title).strip()
     return ellipsize_utf8_bytes(title, max_bytes=max_bytes, ellipsis='…')
 
 def clear_folder(folder_path:str)->None:
@@ -5170,8 +5286,11 @@ def build_vtt_file(session_id: str, all_sentences: list) -> bool:
         vtt_blocks = []
         current_time = 0.0
 
-        # SML tag pattern for cleaning
-        SML_PATTERN = re.compile(r'\[(?:break|music|sfx|silence)(?::[^\]]+)?\]', re.IGNORECASE)
+        # SML tag pattern for cleaning. Shared with the engines as of 2026-08-27:
+        # this local copy had already drifted — it never stripped [pause], so a
+        # blank-line cue could read "[pause]" on screen — and it would have shown
+        # the new [heading] marker in every chapter-title cue.
+        SML_PATTERN = SML_UNSPOKEN_PATTERN
 
         def format_timestamp(seconds: float) -> str:
             h = seconds // 3600

@@ -225,8 +225,10 @@ class F5(TTSUtils, TTSRegistry, name='f5'):
             )
 
             sentence = sentence.strip()
-            sentence = re.sub(r'\[(?:break|pause|music|sfx|silence)(?::[^\]]+)?\]', '',
-                              sentence, flags=re.IGNORECASE).strip()
+            # Strip the e2a SML tags F5 doesn't understand — including the
+            # [heading] marker, which is markup for the splitter only and must
+            # never be spoken (2026-08-27; alternation shared via conf_models).
+            sentence = SML_UNSPOKEN_PATTERN.sub('', sentence).strip()
 
             if not sentence:
                 silence = torch.zeros(1, int(self.params['samplerate'] * 0.1))

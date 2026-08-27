@@ -27,7 +27,51 @@ TTS_SML = {
 	"break": {"static": "[break]", "paired": False},
 	"pause": {"static": "[pause]", "paired": False},
 	"voice": {"paired": True},
+	# HEADING MARKER (2026-08-27) — section headers and titles are read as their
+	# OWN TTS chunk. filter_chapter's walker already knows which rows are h1-h6
+	# headings, but it threw that identity away the moment it appended the text,
+	# so downstream a heading was just a short punctuated row and all three merge
+	# passes in get_sentences glued it to the prose behind it ("Prologue." is 9
+	# chars, well under the 25-char min-chars floor). This tag is the carrier: it
+	# sits on the LEADING edge of the heading row and means "the row behind me is
+	# a heading, do not merge it into anything".
+	#
+	# NON-PAIRED, and that is a measurement, not a preference. A paired
+	# [heading]…[/heading] was tried first and does not survive get_sentences:
+	# ROW_END terminates a row AT the next escaped token, so the CLOSING half
+	# never lands on the heading row — it starts the NEXT row, where the
+	# min-chars floor and the Orpheus packer both count it as a join token and
+	# DROP it. Reproduced against the existing paired [voice] tag on 2026-08-27:
+	#   in   '[break][voice:tara]Prologue.[/voice][break]Some prose…'
+	#   rows '[break][voice:tara]Prologue.' + '[/voice][break]Some prose…'
+	#   out  '[break][voice:tara]Prologue. Some prose…'   ([/voice] deleted)
+	# A heading is exactly ONE row by construction (ROW_END isolates it), so an
+	# opening marker carries the whole identity and there is nothing for a
+	# closing half to do.
+	#
+	# It realizes NO silence. Unlike [break]/[pause] this is pure markup: the
+	# heading chunk gets the same sentence-gap tail every other chunk gets. The
+	# 2026-07-17 ruling that removed Orpheus' paragraph/section gap tiers stands
+	# — isolation is the behavior being asked for here, not a longer pause.
+	"heading": {"static": "[heading]", "paired": False},
 }
+
+# THE tags no engine ever SPEAKS, as ONE pattern.
+#
+# Timing tags ([break]/[pause]) are realized as silence before this point and
+# [heading] is pure markup, so by the time text reaches a model — or a VTT cue,
+# or an m4b chapter title — none of them may still be in it. This used to be a
+# hand-rolled alternation copied into five places that had already drifted apart
+# (the two VTT builders omitted 'pause' outright, so a cue could read "[pause]"),
+# and adding [heading] in 2026-08-27 would have made it six. One pattern, so a
+# tag can never again be taught to some readers and missed by the rest.
+#
+# The optional '/' matches a closing form; none of these tags is paired today,
+# but stripping '[/x]' is never wrong for a tag that is never spoken.
+SML_UNSPOKEN_PATTERN = re.compile(
+	r'\[/?(?:break|pause|heading|music|sfx|silence)(?::[^\]]+)?\]',
+	re.IGNORECASE
+)
 
 sml_escape_tag = 0xE000
 sml_tag_keys = '|'.join(map(re.escape, TTS_SML.keys()))
