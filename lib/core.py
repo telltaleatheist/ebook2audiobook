@@ -1022,7 +1022,11 @@ def _collapse_glue(rows:list)->list:
                 out[-1] = ('text', out[-1][1] + payload)
                 continue
             if pending is not None:
-                out.append(('break', pending))
+                # The restore inherits the row's own inline-ness: a suppressed
+                # break resolved by a 'sep' row (an empty pagebreak span glued to
+                # the text before it) must come back as 'sep', or the restore
+                # re-manufactures the block boundary the walk just declined.
+                out.append(('sep' if typ == 'sep' else 'break', pending))
         out.append((typ, payload))
     return out
 
@@ -1049,7 +1053,14 @@ def filter_chapter(idx:int, doc:EpubHtml, session_id:str, stanza_nlp:Pipeline, i
                     if text:
                         if prev_child_had_data:
                             if ws_pending or raw[:1].isspace():
-                                yield ('break', sml_token("break"))
+                                # A text node reached across whitespace from an
+                                # INLINE sibling (`<em>magical</em> world`) is the
+                                # same sentence, not a new block: 'sep' keeps the
+                                # [break] token but never closes the block, so
+                                # break_between_alnum_re can collapse it back to a
+                                # space. As 'break' it manufactured a period
+                                # ("magical. world") ~140 times in one real book.
+                                yield ('sep', sml_token("break"))
                             else:
                                 yield ('glue', sml_token("break"))
                         yield ('text', text)
@@ -1087,6 +1098,16 @@ def filter_chapter(idx:int, doc:EpubHtml, session_id:str, stanza_nlp:Pipeline, i
                                 # and always separate.
                                 if name == 'span' and not lead_ws:
                                     yield ('glue', sml_token("break"))
+                                elif name == 'span' and not first_char and not last_char:
+                                    # A span with NO text at all cannot be a block —
+                                    # it is a marker (EPUB pagebreak spans:
+                                    # `<span epub:type="pagebreak" …></span>` mid-
+                                    # sentence). NARROW on purpose: a span WITH text
+                                    # keeps 'break', because `<span>Lance Wallnau
+                                    # </span> <span>Author</span>` is the signature
+                                    # case _close_block exists to protect, and the
+                                    # broad form welded it into one line.
+                                    yield ('sep', sml_token("break"))
                                 else:
                                     yield ('break', sml_token("break"))
                             for inner in _tuple_row(child, last_text_char):
@@ -1292,6 +1313,14 @@ def filter_chapter(idx:int, doc:EpubHtml, session_id:str, stanza_nlp:Pipeline, i
                     if prev_typ != typ:
                         text_list.append(sml_token(typ))
                     # Don't clear last_heading — breaks often sit between heading and duplicate text
+                elif typ == 'sep':
+                    # An inline whitespace separator: the [break] token is kept
+                    # (so a pagebreak span still pauses where nothing flanks it)
+                    # but the block is NOT closed — no manufactured period, and
+                    # break_between_alnum_re downstream turns the token back into
+                    # the plain space the markup meant when words flank it.
+                    if prev_typ not in ('break', 'pause', 'sep'):
+                        text_list.append(sml_token('break'))
                 elif typ == 'table':
                     _close_block(text_list)
                     last_heading_normalized = None
