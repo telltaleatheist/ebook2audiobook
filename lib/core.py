@@ -5304,8 +5304,11 @@ def build_vtt_file(session_id: str, all_sentences: list) -> bool:
             end_time = start_time + duration
             current_time = end_time
 
-            # Clean sentence text
-            text = re.sub(r'\s+', ' ', SML_PATTERN.sub('', str(flat_sentences[idx]))).strip()
+            # Cue text: markers stripped, and BOLD when the row is a heading.
+            # Built by the shared vtt_cue_text so this copy, the parallel
+            # session.py one and TTSUtils._build_vtt_file cannot drift apart
+            # again (2026-08-27).
+            text = vtt_cue_text(str(flat_sentences[idx]), SML_PATTERN)
 
             start_str = format_timestamp(start_time)
             end_str = format_timestamp(end_time)

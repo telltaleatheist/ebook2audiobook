@@ -662,11 +662,10 @@ class TTSUtils:
                     sentences_total_time = end_time
                     start = self._format_timestamp(start_time)
                     end = self._format_timestamp(end_time)
-                    text = re.sub(
-                        r'\s+',
-                        ' ',
-                        SML_TAG_PATTERN.sub('', str(all_sentences[idx]))
-                    ).strip()
+                    # Cue text: tags stripped, and BOLD when the row is a
+                    # heading. Shared with the two build_vtt_file copies so the
+                    # three builders cannot drift apart again (2026-08-27).
+                    text = vtt_cue_text(str(all_sentences[idx]), SML_TAG_PATTERN)
                     vtt_blocks.append(f'{start} --> {end}\n{text}\n')
                     if self.session['is_gui_process']:
                         total_progress = (t.n + 1) / audio_files_length

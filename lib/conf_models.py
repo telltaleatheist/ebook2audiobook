@@ -73,6 +73,48 @@ SML_UNSPOKEN_PATTERN = re.compile(
 	re.IGNORECASE
 )
 
+# THE test for "this row is a section heading", asked of text that still carries
+# its markers (2026-08-27). It matches the marker ANYWHERE in the row, not just
+# on the leading edge, because get_sentences emits rows like
+# '[break][heading]Chapter 8: State of Confusion.' where a [break] carried over
+# from the paragraph boundary holds position 0. Measured against the real
+# pipeline (tools/test_heading_chunks.py output), not assumed.
+SML_HEADING_PATTERN = re.compile(r'\[/?heading\]', re.IGNORECASE)
+
+
+def vtt_cue_text(sentence:str, strip_pattern)->str:
+	"""THE payload of one VTT cue, built from one stored sentence (2026-08-27).
+
+	THREE builders write VTT files — build_vtt_file in bookforge_ext/parallel/
+	session.py (BookForge's parallel runs), build_vtt_file in lib/core.py (the
+	non-parallel path) and TTSUtils._build_vtt_file (the per-engine path). They
+	had already drifted once over which tags they strip, so a cue's text is built
+	here, once, and all three call this.
+
+	A heading cue is written BOLD, in WebVTT's own spelling: <b>Chapter Eight.</b>.
+	No classes and no STYLE block — <b> is the portable form every WebVTT reader
+	already understands, and ffmpeg turns it into a real tx3g 'styl' record with
+	the bold face-style flag when the transcript is muxed into the m4b. Verified
+	with ffmpeg 7.1.1 on 2026-08-27 by dumping the muxed subtitle samples: the
+	stored text is the clean 'Chapter Eight.' and the style sits beside it, so no
+	player is ever handed the tag itself to display.
+
+	The heading test MUST run before stripping: every strip_pattern that reaches
+	this function deletes the [heading] marker that carries the fact.
+
+	strip_pattern is the caller's, because the two families legitimately differ
+	and unifying them is a separate question: the two build_vtt_file copies pass
+	SML_UNSPOKEN_PATTERN (the tags nothing ever speaks), while _build_vtt_file
+	passes SML_TAG_PATTERN, which also removes [voice:…]. Either way [heading] is
+	erased, which is why it is tested for first."""
+	is_heading = SML_HEADING_PATTERN.search(sentence) is not None
+	text = re.sub(r'\s+', ' ', strip_pattern.sub('', sentence)).strip()
+	# An empty payload stays empty: a bare '[break]' row must never become '<b></b>'.
+	if is_heading and text:
+		return f'<b>{text}</b>'
+	return text
+
+
 sml_escape_tag = 0xE000
 sml_tag_keys = '|'.join(map(re.escape, TTS_SML.keys()))
 

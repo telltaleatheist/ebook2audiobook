@@ -43,7 +43,7 @@ from lib.conf import (
     default_audio_proc_format,
     NATIVE,
 )
-from lib.conf_models import default_fine_tuned, TTS_ENGINES, SML_UNSPOKEN_PATTERN
+from lib.conf_models import default_fine_tuned, TTS_ENGINES, SML_UNSPOKEN_PATTERN, vtt_cue_text
 from lib.conf_lang import default_language_code
 
 
@@ -918,8 +918,10 @@ def build_vtt_file(session_id: str, all_sentences: list, core_module) -> bool:
             end_time = start_time + duration
             current_time = end_time
 
-            # Clean sentence text
-            text = re.sub(r'\s+', ' ', SML_PATTERN.sub('', str(flat_sentences[idx]))).strip()
+            # Cue text: markers stripped, and BOLD when the row is a heading.
+            # Built by the shared vtt_cue_text so this copy, lib/core.py's and
+            # TTSUtils._build_vtt_file cannot drift apart again (2026-08-27).
+            text = vtt_cue_text(str(flat_sentences[idx]), SML_PATTERN)
 
             start_str = format_timestamp(start_time)
             end_str = format_timestamp(end_time)
