@@ -411,30 +411,51 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
     # A voice whose corpus keeps much longer tails wants a larger value.
     SHORT_CHUNK_TAIL_TOKENS = float(os.environ.get('ORPHEUS_SHORT_TAIL_TOKENS', '96'))
 
-    # Duration-sanity backstop for chunks under the min-chars floor (2026-08-28).
-    # SECOND line of defence behind the EOS boost above: if a sub-floor chunk
-    # still comes back far longer than its text can justify, it is re-rolled once
-    # and the shorter take kept (_guard_overrun). The boost PREVENTS the bad take;
-    # this catches the one that got through, because a boost is a bias and not a
-    # guarantee — and a repeated heading is the failure Owen actually hears.
+    # Short-chunk overrun REPORT (2026-08-28). A sub-floor chunk whose audio runs
+    # far longer than its text can justify — the model saying a two-word heading
+    # twice instead of stopping — is PRINTED and then left exactly as it is.
+    #
+    # THIS MEASURES A MODEL DEFECT. IT DOES NOT COMPENSATE FOR ONE. An earlier
+    # version of this re-rendered the chunk and kept the shorter take; Owen removed
+    # it (2026-08-28): "i dont want a guard. i want to fix it at the source." He is
+    # right twice over. The text is provably single — the duplication is in the
+    # generated AUDIO (385 tokens where a healthy render is ~130), i.e. the model
+    # not committing to end-of-audio after a very short utterance, which is a
+    # fine-tuning problem and is being fixed in the Orpheus fine-tune repo. And a
+    # silent second render is exactly the kind of fallback this codebase refuses:
+    # it would hide the very signal the retrain has to be judged by.
+    #
+    # So this exists to COUNT the defect across a whole book, before and after a
+    # retrain, with one grep on the worker log:
+    #     grep -c SHORT_CHUNK_OVERRUN <log>
+    # Nothing is re-rendered, nothing is selected, nothing is thrown away.
     #
     # Scope: chars < SHORT_CHUNK_MAX_CHARS only — 25 is core.py's SENTENCE_MIN_CHARS
     # default, i.e. exactly the rows _apply_min_chars_floor used to merge away and
-    # now exempts when they are headings. Nothing longer is judged by this at all.
+    # now exempts when they are headings. Nothing longer is judged at all. Set
+    # ORPHEUS_SHORT_CHUNK_CHARS=0 to silence the report entirely (the same
+    # "0 disables" convention as the sentence gap and the min-chars floor).
     #
     # The curve `max_seconds = 0.9 + 0.19 x chars` is measured, not guessed. Against
-    # all 52 non-empty short chunks of the witches render it flags the known doubled
+    # all 52 non-empty short chunks of the witches render it names the known doubled
     # take ("Introduction.", 13 chars, 4.267 s vs 3.37 s allowed) and NOTHING else —
-    # including the genuinely slow one-word titles the floor must never re-roll
-    # ("GOD." 1.280 s, "SATAN." 1.792 s, "NEW AGE." 2.304 s). Margin is thinnest on
-    # "NEW AGE." (4.8% under the line), so this is a deliberately tight fit: it is
-    # meant to catch a DOUBLING (~3x), not slow delivery.
+    # including the genuinely slow one-word titles ("GOD." 1.280 s, "SATAN." 1.792 s,
+    # "NEW AGE." 2.304 s), whose thinnest margin is 4.8%. It is a deliberately tight
+    # fit meant to see a DOUBLING (~3x), not slow delivery.
+    #
+    # KNOWN IMPRECISION, stated so nobody reads the count as gospel: measured live
+    # on 36 renders of "Introduction." (2026-08-28), 5 crossed this line while Owen
+    # heard roughly 1-2 of 60 headings as doubled. Takes land either side of the
+    # threshold at 3.157/3.243 s (under) and 3.755/3.840 s (over) and NOBODY HAS
+    # LISTENED to those, so where "slow" ends and "doubled" begins is not yet known.
+    # Treat the count as an upper bound and a trend line, not a defect tally.
     #
     # Judged on the generated waveform BEFORE _save_audio appends the inter-clip
     # gaps, so the threshold measures what the model emitted and is independent of
-    # a voice's sentenceGap. The 0.9 s intercept still carries the model's own tail
+    # a voice's sentenceGap. The 0.9 s intercept carries the model's own tail
     # (deathstalker 0.81 s), so a voice with a much longer trained tail needs a
     # larger intercept — hence the env overrides.
+    SHORT_CHUNK_OVERRUN_TAG = 'SHORT_CHUNK_OVERRUN'
     SHORT_CHUNK_MAX_CHARS = int(os.environ.get('ORPHEUS_SHORT_CHUNK_CHARS', '25'))
     SHORT_CHUNK_SECONDS_BASE = float(os.environ.get('ORPHEUS_SHORT_CHUNK_SECONDS_BASE', '0.9'))
     SHORT_CHUNK_SECONDS_PER_CHAR = float(os.environ.get('ORPHEUS_SHORT_CHUNK_SECONDS_PER_CHAR', '0.19'))
@@ -3001,74 +3022,42 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
                            'threshold_chars_per_second': round(max_rate, 2)})
         return 'short'
 
-    def _needs_reroll(self, sentence_index: int, clean: str, audio_np) -> bool:
-        """DECISION half of _guard_overrun: is this sub-floor chunk's audio far
-        longer than its text can justify? See the SHORT_CHUNK_* constants for the
-        curve and the data it was fitted to.
+    def _report_short_chunk_overrun(self, sentence_index: int, clean: str, audio_np) -> bool:
+        """PRINT — and only print — when a sub-floor chunk's audio runs far longer
+        than its text can justify. Returns whether it reported, for the tests; the
+        audio is never touched and every caller ignores the return.
+
+        THIS MEASURES A MODEL DEFECT, IT DOES NOT COMPENSATE FOR ONE. The
+        duplication is in the generated audio, not the text, so the cure is a
+        fine-tune that commits to end-of-audio after a very short utterance — see
+        the SHORT_CHUNK_* constants for why the re-render this replaced was
+        removed, and for what the count does and does not mean.
 
         Deliberately NOT folded into _needs_resplit. That guard answers the
-        opposite question (audio too SHORT for the text, i.e. a truncation) and
-        it explicitly refuses chunks of 150 chars or fewer, so it has never had
-        an opinion about a heading; its remedy is a split, which is meaningless
-        for text with no split point. Same shape, different question, different
-        cure — keeping them apart is what stops either from being read as the
-        other's opposite.
+        opposite question (audio too SHORT for the text, i.e. a truncation), it
+        explicitly refuses chunks of 150 chars or fewer so it has never had an
+        opinion about a heading, and it ACTS where this only observes. Same shape,
+        different question — keeping them apart is what stops either from being
+        read as the other's opposite.
 
-        Measured on the GENERATED waveform: the caller passes the audio before
-        _save_audio appends any inter-clip gap.
+        Measured on the GENERATED waveform: every caller reports BEFORE _save_audio
+        appends the inter-clip gaps, so the number is what the model emitted.
         """
         if audio_np is None or len(audio_np) == 0:
             return False
         n_chars = len(clean)
-        if n_chars <= 0 or n_chars >= self.SHORT_CHUNK_MAX_CHARS:
+        if self.SHORT_CHUNK_MAX_CHARS <= 0 or n_chars <= 0 or n_chars >= self.SHORT_CHUNK_MAX_CHARS:
             return False
         seconds = len(audio_np) / self.SAMPLE_RATE
         allowed = self.SHORT_CHUNK_SECONDS_BASE + self.SHORT_CHUNK_SECONDS_PER_CHAR * n_chars
         if seconds <= allowed:
             return False
-        print(f"Orpheus: sentence {sentence_index} audio too long for {n_chars} chars "
-              f"({seconds:.2f}s > {allowed:.2f}s) — re-rolling once, keeping the shorter take")
-        self._keep_reject(sentence_index, clean, audio_np, 'overrun',
-                          {'measured_seconds': round(seconds, 3),
-                           'allowed_seconds': round(allowed, 3),
-                           'chars': n_chars})
+        # ONE line, one tag, everything needed to count and to find the clip.
+        # The text is last because it is the only unbounded field.
+        print(f"[ORPHEUS][{self.SHORT_CHUNK_OVERRUN_TAG}] sentence={sentence_index} "
+              f"chars={n_chars} seconds={seconds:.3f} allowed={allowed:.3f} "
+              f"ratio={seconds / allowed:.2f} text={clean!r}")
         return True
-
-    def _pick_shorter_take(self, sentence_index: int, first, second):
-        """Keep the shorter of an overrun take and its re-roll.
-
-        SHORTER, not "the one that passes": the re-roll is a fresh sample and may
-        overrun too, and a chunk this short has no split to fall back on. Taking
-        the shorter one is the only choice that cannot make the clip worse than
-        what we already had. An empty re-roll is refused outright — a stalled
-        heading beats a silent one.
-        """
-        if second is None or len(second) == 0:
-            print(f"Orpheus: sentence {sentence_index} re-roll produced no audio — keeping the original take")
-            return first
-        if len(second) < len(first):
-            print(f"Orpheus: sentence {sentence_index} re-roll is shorter "
-                  f"({len(second) / self.SAMPLE_RATE:.2f}s vs {len(first) / self.SAMPLE_RATE:.2f}s) — keeping it")
-            return second
-        print(f"Orpheus: sentence {sentence_index} re-roll is no shorter "
-              f"({len(second) / self.SAMPLE_RATE:.2f}s vs {len(first) / self.SAMPLE_RATE:.2f}s) — keeping the original")
-        return first
-
-    def _guard_overrun(self, sentence_index: int, clean: str, audio_np, reroll):
-        """ACTION half: re-roll a sub-floor chunk that overran, once, and keep the
-        shorter take. `reroll` re-renders the SAME text — no split, no force_split:
-        the defect is a sampling excursion (the model failed to stop and said a
-        two-word title twice), and fresh tokens are the whole cure.
-
-        Applied on both single-sentence backends and, pooled, on the vLLM BATCH
-        path (the audiobook worker, where this was measured). NOT on the MLX batch
-        path: that one has no deferral machinery, so a re-roll there would be a
-        serial render stalling the whole batch, and Metal is the backend that ranks
-        end-of-audio FIRST at the tie this defect turns on (2026-07-19: MLX greedy
-        0/25 vs vLLM greedy 75%) — it is the platform least likely to need it."""
-        if not self._needs_reroll(sentence_index, clean, audio_np):
-            return audio_np
-        return self._pick_shorter_take(sentence_index, audio_np, reroll(clean))
 
     def _ratchet_after_resplit(self, clean: str, audio_np, voice: str = None) -> None:
         """RATCHET half of _guard_truncation — see its docstring for the full rationale.
@@ -3161,12 +3150,10 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
                         sentence_index, clean, audio_np,
                         lambda c: self._generate_mlx_safe(c, force_split=True)
                     )
-                    # …and the opposite failure on a sub-floor chunk: audio far
-                    # LONGER than the text can justify (a heading spoken twice).
-                    audio_np = self._guard_overrun(
-                        sentence_index, clean, audio_np,
-                        lambda c: self._generate_mlx(c, sentence_index=sentence_index)
-                    )
+                    # …and REPORT the opposite failure on a sub-floor chunk: audio
+                    # far LONGER than the text can justify (a heading spoken twice).
+                    # Reported only — the take stands; see the SHORT_CHUNK_* block.
+                    self._report_short_chunk_overrun(sentence_index, clean, audio_np)
                 elif self.backend == 'vllm':
                     try:
                         audio_np = self._tokens_to_audio(self._generate_tokens_vllm(clean))
@@ -3182,12 +3169,10 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
                         sentence_index, clean, audio_np,
                         lambda c: self._generate_audio_vllm_safe(c, force_split=True)
                     )
-                    # …and the opposite failure on a sub-floor chunk: audio far
-                    # LONGER than the text can justify (a heading spoken twice).
-                    audio_np = self._guard_overrun(
-                        sentence_index, clean, audio_np,
-                        lambda c: self._tokens_to_audio(self._generate_tokens_vllm(c))
-                    )
+                    # …and REPORT the opposite failure on a sub-floor chunk: audio
+                    # far LONGER than the text can justify (a heading spoken twice).
+                    # Reported only — the take stands; see the SHORT_CHUNK_* block.
+                    self._report_short_chunk_overrun(sentence_index, clean, audio_np)
                 else:
                     audio_np = self._tokens_to_audio(
                         self._generate_tokens_transformers(f"{self.voice}: {clean}")
@@ -3216,10 +3201,7 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
     def _render_deferred_resplits(self, deferred: list, results: dict) -> None:
         """Re-render every truncated chunk of a batch in ONE pooled generate() call.
 
-        deferred: list of (sentence_index, clean, gap, reason, original_audio).
-        Fills `results` in place. original_audio is carried only by the 'overrun'
-        reason, whose cure is a re-roll judged against the take it replaces; every
-        other reason re-renders unconditionally and passes None.
+        deferred: list of (sentence_index, clean, gap, reason). Fills `results` in place.
 
         Each chunk is split exactly as the inline guard split it
         (_generate_audio_vllm_safe with force_split — half-length parts, well inside the
@@ -3233,14 +3215,7 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
         """
         import numpy as np
         flat, owners = [], []     # part texts, and the deferred[] position each belongs to
-        for pos, (_idx, clean, _gap, reason, _first) in enumerate(deferred):
-            if reason == 'overrun':
-                # A re-ROLL, never a split: the text is a heading with no split
-                # point, and the defect is a sampling excursion that fresh tokens
-                # fix. Splitting it would answer a question nobody asked.
-                flat.append(clean)
-                owners.append(pos)
-                continue
+        for pos, (_idx, clean, _gap, _reason) in enumerate(deferred):
             parts = self._split_long_text(clean, max_length=max(60, len(clean) // 2))
             if len(parts) < 2:
                 # Unsplittable text — the ladder falls through to a plain render, and so
@@ -3252,14 +3227,12 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
 
         waves = self._generate_parts_batched(flat, 1)
 
-        for pos, (idx, clean, gap, reason, first) in enumerate(deferred):
+        for pos, (idx, clean, gap, reason) in enumerate(deferred):
             try:
                 mine = [w for w, o in zip(waves, owners) if o == pos]
                 audio_np = np.concatenate(mine) if len(mine) > 1 else mine[0]
                 if reason == 'short':
                     self._ratchet_after_resplit(clean, audio_np)
-                elif reason == 'overrun':
-                    audio_np = self._pick_shorter_take(idx, first, audio_np)
                 results[idx] = self._save_audio(idx, audio_np, gap[0], gap[1])
             except Exception as resplit_err:
                 print(f"Orpheus deferred re-render failed for sentence {idx}: {resplit_err}")
@@ -3358,15 +3331,12 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
                         # Only the VERDICT is taken here; the re-render is pooled.
                         reason = self._needs_resplit(idx, clean, audio_np)
                         if reason is not None:
-                            deferred.append((idx, clean, gap, reason, None))
+                            deferred.append((idx, clean, gap, reason))
                             continue
-                        # The opposite verdict on a sub-floor chunk — audio far
-                        # LONGER than the text can justify. Pooled the same way,
-                        # but it carries its audio: the re-roll only wins if it
-                        # comes back shorter than what we already have.
-                        if self._needs_reroll(idx, clean, audio_np):
-                            deferred.append((idx, clean, gap, 'overrun', audio_np))
-                            continue
+                        # REPORT the opposite failure on a sub-floor chunk — audio
+                        # far LONGER than the text can justify. Nothing is deferred
+                        # and nothing re-rendered: the take stands and is counted.
+                        self._report_short_chunk_overrun(idx, clean, audio_np)
                         results[idx] = self._save_audio(idx, audio_np, gap[0], gap[1])
                     except Exception as decode_err:
                         print(f"Orpheus batch decode error for sentence {idx}: {decode_err}")

@@ -19,12 +19,22 @@ ended at 358 tokens having never received a single logit of help. The MLX
 per-chunk budget had the mirror bug, capping "GOD." at 40 tokens against a
 measured 108.
 
+MEASURED, NOT GUARDED (2026-08-28). An earlier version of this re-rendered an
+overrunning chunk and kept the shorter take. Owen removed it — "i dont want a
+guard. i want to fix it at the source" — because the duplication is in the
+generated AUDIO, not the text, so the cure belongs in the fine-tune, and a silent
+second render would hide the signal the retrain has to be judged by. What is left
+of that half is a log line that COUNTS the defect and changes nothing. Live
+measurement backs the removal: the boost pulled the runaway in by only 21 tokens
+(385 -> 364), so it was never the thing that fixed this anyway.
+
 WHAT THIS PROVES, driving the real methods (no GPU, no model):
   1. the EOS boost now engages before the known doubled take, and on NO healthy
      clip in the reference set;
   2. it is a NO-OP at 48 chars and above — ordinary prose is untouched;
   3. the MLX per-chunk token budget covers every healthy short render;
-  4. the duration backstop flags the doubled take and nothing else.
+  4. the overrun REPORT names the doubled take and nothing else, and leaves the
+     audio byte-for-byte alone.
 
 FIXTURE. The 52 non-empty chunks of <= 60 chars from the real render at
 Z:\\bookforge\\projects\\witches_-_Unknown\\stages\\03-tts\\sessions\\en\\
@@ -39,6 +49,8 @@ Run it with an interpreter that has e2a's dependencies, e.g. the bundled env:
 Exit code 0 = all cases passed.
 """
 
+import contextlib
+import io
 import math
 import os
 import sys
@@ -209,24 +221,46 @@ for chars, seconds, label in FIXTURE:
         tightest = (margin, label)
 print(f'  tightest budget margin: {tightest[0] * 100:.1f}% on {tightest[1]!r}')
 
-print('\n== 4. the duration backstop flags the doubled take and nothing else ==')
-flagged = []
+print('\n== 4. the overrun report names the doubled take, and only reports ==')
+reported = []
 for chars, seconds, label in FIXTURE:
     audio = np.zeros(int(seconds * Orpheus.SAMPLE_RATE), dtype=np.float32)
-    if tts._needs_reroll(0, 'x' * chars, audio):
-        flagged.append(label)
-check(flagged == [BAD], f'backstop must flag exactly [{BAD!r}], flagged {flagged}')
-# The re-roll is only ever allowed to shorten a clip, never to lose one.
-short_take = np.zeros(1000, dtype=np.float32)
-long_take = np.zeros(4000, dtype=np.float32)
-check(tts._pick_shorter_take(0, long_take, short_take) is short_take,
-      'a shorter re-roll must be kept')
-check(tts._pick_shorter_take(0, short_take, long_take) is short_take,
-      'a longer re-roll must be discarded')
-check(tts._pick_shorter_take(0, short_take, np.zeros(0, dtype=np.float32)) is short_take,
-      'an empty re-roll must never replace real audio')
-check(tts._pick_shorter_take(0, short_take, None) is short_take,
-      'a missing re-roll must never replace real audio')
+    before = audio.copy()
+    with io.StringIO() as sink, contextlib.redirect_stdout(sink):
+        said = tts._report_short_chunk_overrun(0, 'x' * chars, audio)
+        line = sink.getvalue()
+    if said:
+        reported.append(label)
+    # THE POINT OF THE WHOLE CHANGE: observing must not alter the take.
+    check(np.array_equal(audio, before) and len(audio) == len(before),
+          f'the report must not touch the audio ({label!r})')
+    check(bool(line.strip()) == said,
+          f'a line is printed if and only if it reported ({label!r})')
+check(reported == [BAD], f'report must name exactly [{BAD!r}], named {reported}')
+
+# The log line is the deliverable — it has to be greppable and complete.
+audio = np.zeros(int(4.267 * Orpheus.SAMPLE_RATE), dtype=np.float32)
+with io.StringIO() as sink, contextlib.redirect_stdout(sink):
+    tts._report_short_chunk_overrun(4242, 'Introduction.', audio)
+    line = sink.getvalue().strip()
+print(f'  line: {line}')
+check(line.count('\n') == 0, 'the report must be ONE line, so one grep counts it')
+check(Orpheus.SHORT_CHUNK_OVERRUN_TAG in line, 'the line must carry the grep tag')
+for field in ('sentence=4242', 'chars=13', 'seconds=4.267', 'allowed=3.370',
+              'ratio=1.27', "text='Introduction.'"):
+    check(field in line, f'the line must carry {field!r}')
+
+# Silencing, so a book can be rendered without the noise.
+saved = Orpheus.SHORT_CHUNK_MAX_CHARS
+try:
+    Orpheus.SHORT_CHUNK_MAX_CHARS = 0
+    with io.StringIO() as sink, contextlib.redirect_stdout(sink):
+        said = tts._report_short_chunk_overrun(0, 'Introduction.', audio)
+        line = sink.getvalue()
+    check(not said and not line.strip(),
+          'ORPHEUS_SHORT_CHUNK_CHARS=0 must silence the report entirely')
+finally:
+    Orpheus.SHORT_CHUNK_MAX_CHARS = saved
 
 print('\n==================== RESULT ====================')
 if failures:
