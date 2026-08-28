@@ -380,6 +380,65 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
     EOS_BOOST = float(os.environ.get('ORPHEUS_EOS_BOOST', '0.0'))
     EOS_BOOST_START = float(os.environ.get('ORPHEUS_EOS_BOOST_START', '1.2'))
 
+    # Tail allowance for a chunk's expected token count, in AUDIO TOKENS
+    # (2026-08-28, short-heading repeat). The expected-length estimate every
+    # anti-runaway lever is sized from is `chars / 18.4 ch-per-s x 84 tokens-per-s`
+    # — a pure SPEECH estimate that forgets the model's own trained tail. Orpheus
+    # emits that tail as part of the generation (nothing trims it: the save-time
+    # trim was removed 2026-07-11, NO-FALLBACK), and it does NOT scale with the
+    # text: deathstalker's catalog measures modelSelfTailS 0.81 s, and the 52
+    # short chunks of the witches render measured a mean trailing silence of
+    # 0.824 s whether the chunk was 4 chars or 59.
+    #
+    # For a 450-char chunk that tail is ~3% of the clip and ignoring it is
+    # harmless. For a 13-char heading it is most of the clip, so the estimate
+    # lands 3-5x low — which is exactly why _eos_boost_processor carried a flat
+    # `max(300.0, ...)` floor instead. That floor is what this replaces; see
+    # _expected_audio_tokens for why a flat floor left short chunks unguarded.
+    #
+    # 96 tokens = 1.14 s at TOKENS_PER_AUDIO_SECOND, swept against those 52 real
+    # chunks. Every value in [84, 110] engages the EOS boost before the known
+    # doubled take ("Introduction.", 13 chars, 358 tokens) and engages on NO
+    # healthy clip; below 84 healthy clips start being boosted mid-speech (at 71
+    # "Turtles", at 60 "NEW AGE."), and above ~110 the doubled take escapes again.
+    # 96 is the middle of that window because the two consumers want opposite
+    # ends of it: the boost start wants a SMALL allowance (more ramp against a
+    # runaway — 47 tokens of it here, vs 71 at the floor and 19 at the ceiling),
+    # while _mlx_token_budget wants a LARGE one (its tightest healthy render,
+    # "NEW AGE." at 194 tokens, clears the ceiling by 9.1% here vs 1.3% at 84).
+    # Truncation is the worse failure of the two, so the tie goes to margin, and
+    # the duration backstop below covers what a shorter ramp lets through.
+    # A voice whose corpus keeps much longer tails wants a larger value.
+    SHORT_CHUNK_TAIL_TOKENS = float(os.environ.get('ORPHEUS_SHORT_TAIL_TOKENS', '96'))
+
+    # Duration-sanity backstop for chunks under the min-chars floor (2026-08-28).
+    # SECOND line of defence behind the EOS boost above: if a sub-floor chunk
+    # still comes back far longer than its text can justify, it is re-rolled once
+    # and the shorter take kept (_guard_overrun). The boost PREVENTS the bad take;
+    # this catches the one that got through, because a boost is a bias and not a
+    # guarantee — and a repeated heading is the failure Owen actually hears.
+    #
+    # Scope: chars < SHORT_CHUNK_MAX_CHARS only — 25 is core.py's SENTENCE_MIN_CHARS
+    # default, i.e. exactly the rows _apply_min_chars_floor used to merge away and
+    # now exempts when they are headings. Nothing longer is judged by this at all.
+    #
+    # The curve `max_seconds = 0.9 + 0.19 x chars` is measured, not guessed. Against
+    # all 52 non-empty short chunks of the witches render it flags the known doubled
+    # take ("Introduction.", 13 chars, 4.267 s vs 3.37 s allowed) and NOTHING else —
+    # including the genuinely slow one-word titles the floor must never re-roll
+    # ("GOD." 1.280 s, "SATAN." 1.792 s, "NEW AGE." 2.304 s). Margin is thinnest on
+    # "NEW AGE." (4.8% under the line), so this is a deliberately tight fit: it is
+    # meant to catch a DOUBLING (~3x), not slow delivery.
+    #
+    # Judged on the generated waveform BEFORE _save_audio appends the inter-clip
+    # gaps, so the threshold measures what the model emitted and is independent of
+    # a voice's sentenceGap. The 0.9 s intercept still carries the model's own tail
+    # (deathstalker 0.81 s), so a voice with a much longer trained tail needs a
+    # larger intercept — hence the env overrides.
+    SHORT_CHUNK_MAX_CHARS = int(os.environ.get('ORPHEUS_SHORT_CHUNK_CHARS', '25'))
+    SHORT_CHUNK_SECONDS_BASE = float(os.environ.get('ORPHEUS_SHORT_CHUNK_SECONDS_BASE', '0.9'))
+    SHORT_CHUNK_SECONDS_PER_CHAR = float(os.environ.get('ORPHEUS_SHORT_CHUNK_SECONDS_PER_CHAR', '0.19'))
+
     # ── Per-voice tuning caps ────────────────────────────────────────────────
     # Every constant above is a DEFAULT, never the live value. One process can
     # serve more than one voice — the BookForge streaming worker switches voices
@@ -1829,10 +1888,24 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
         divisor = a MORE generous ceiling (safe); a larger one risks truncating
         slow narration, so we only ever go slower than 12, never faster. The 1.4
         factor is head-room over that worst case — only a runaway (many times the
-        text's real token count) exceeds it."""
+        text's real token count) exceeds it.
+
+        The tail allowance is added for the same reason _expected_audio_tokens
+        exists (2026-08-28): chars/rate estimates SPEECH only, and the model's
+        trained tail (~0.8-1.0 s) rides on every clip no matter how short the
+        text. Without it this ceiling was catastrophically low for a heading:
+        13 chars budgeted 128 tokens (1.52 s) against healthy renders of the same
+        headings measured at 1.6-2.05 s, and 4 chars ("GOD.") budgeted 40 tokens
+        against a measured 108 — a 37% ceiling, i.e. it would have truncated
+        MOST of every one-word title the 2026-08-27 header-own-chunks change
+        created. Adding a flat tail can only ever make
+        the ceiling MORE generous, which this docstring already calls the safe
+        direction; for prose it is noise (a 450-char chunk's budget stays far
+        above MLX_MAX_TOKENS either way, so its effective cap does not move)."""
         env_rate = self._max_chars_per_sec()
         chars_per_sec_floor = min(env_rate, 12.0) if env_rate > 0 else 12.0
-        return math.ceil(len(text) / chars_per_sec_floor * self.TOKENS_PER_AUDIO_SECOND * 1.4)
+        speech = len(text) / chars_per_sec_floor * self.TOKENS_PER_AUDIO_SECOND
+        return math.ceil((speech + self.SHORT_CHUNK_TAIL_TOKENS) * 1.4)
 
     def _generate_mlx(self, text: str, max_tokens: int = None, sentence_index: int = None) -> np.ndarray:
         """Generate audio using MLX backend.
@@ -2268,6 +2341,39 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
         body = self.tokenizer(f"{voice}: {text}").input_ids   # includes leading BOS
         return [128259] + list(body) + [128009, 128260, 128261, 128257]
 
+    def _expected_audio_tokens(self, n_chars: int) -> float:
+        """How many audio tokens a HEALTHY render of `n_chars` should take — the
+        one estimate every anti-runaway lever is scaled from (both EOS-boost
+        processors). Speech at the file's 18.4 ch/s anchor, plus the model's
+        flat tail (SHORT_CHUNK_TAIL_TOKENS), never above the old flat floor.
+
+        THE SHORT-CHUNK HOLE THIS CLOSES (2026-08-28). The estimate used to be
+        `max(300.0, speech)`. The 300-token floor binds for every chunk under
+        ~66 chars, so EVERY short chunk was handed the SAME expectation — and at
+        deathstalker's eosBoostStart 2.0 that put the boost's start at 600 tokens
+        (7.14 s of audio) for a 4-char title just as much as for a 65-char one.
+        A healthy 13-char heading renders in ~130 tokens, so the boost — the only
+        pressure that ever ends a stalled generation — could not engage until the
+        clip had run more than 4x its natural length. It never engaged at all on
+        the take that started this: "Introduction." spoken twice, 358 tokens.
+        Until the 2026-08-27 header-own-chunks change no chunk was ever that
+        short (_apply_min_chars_floor merged them away), so the hole was never
+        exposed; exempting headings from that floor exposed it.
+
+        A flat floor was the wrong shape, not the wrong number: what a short
+        chunk actually costs is its speech PLUS a tail that does not shrink with
+        the text. So the floor becomes that sum, and the `min` keeps the change
+        one-directional — this may only ever LOWER the expectation (engage the
+        boost EARLIER), never raise it. Speech alone reaches 300 tokens at ~66
+        chars and the tail-aware sum reaches it at ~45, so from there up the
+        `min` returns the old value and NOTHING changes: ordinary prose, whose
+        packing/gap/EOS behaviour is tuned, is untouched by construction. The
+        whole change lives in chunks of 44 chars or fewer — tools/
+        test_short_chunk_repeat.py asserts that boundary rather than trusting it.
+        """
+        speech = n_chars / 18.4 * self.TOKENS_PER_AUDIO_SECOND
+        return min(max(300.0, speech), self.SHORT_CHUNK_TAIL_TOKENS + speech)
+
     def _eos_boost_processor(self, n_chars: int, voice: str = None):
         """Per-request vLLM logits processor implementing the EOS boost (see the
         EOS_BOOST comment at the top of the class). Returns None when disabled.
@@ -2280,7 +2386,7 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
         base = self._voice_cap('eosBoost', voice)
         if base <= 0:
             return None
-        expected = max(300.0, n_chars / 18.4 * self.TOKENS_PER_AUDIO_SECOND)
+        expected = self._expected_audio_tokens(n_chars)
         start = self._voice_cap('eosBoostStart', voice) * expected
         eos = self.END_OF_AUDIO_TOKEN
 
@@ -2315,7 +2421,7 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
         base = self._voice_cap('eosBoost')
         if base <= 0:
             return None
-        expected = max(300.0, n_chars / 18.4 * self.TOKENS_PER_AUDIO_SECOND)
+        expected = self._expected_audio_tokens(n_chars)
         start = min(self._voice_cap('eosBoostStart') * expected,
                     0.9 * self.MLX_MAX_TOKENS)
         eos = self.END_OF_AUDIO_TOKEN
@@ -2895,6 +3001,75 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
                            'threshold_chars_per_second': round(max_rate, 2)})
         return 'short'
 
+    def _needs_reroll(self, sentence_index: int, clean: str, audio_np) -> bool:
+        """DECISION half of _guard_overrun: is this sub-floor chunk's audio far
+        longer than its text can justify? See the SHORT_CHUNK_* constants for the
+        curve and the data it was fitted to.
+
+        Deliberately NOT folded into _needs_resplit. That guard answers the
+        opposite question (audio too SHORT for the text, i.e. a truncation) and
+        it explicitly refuses chunks of 150 chars or fewer, so it has never had
+        an opinion about a heading; its remedy is a split, which is meaningless
+        for text with no split point. Same shape, different question, different
+        cure — keeping them apart is what stops either from being read as the
+        other's opposite.
+
+        Measured on the GENERATED waveform: the caller passes the audio before
+        _save_audio appends any inter-clip gap.
+        """
+        if audio_np is None or len(audio_np) == 0:
+            return False
+        n_chars = len(clean)
+        if n_chars <= 0 or n_chars >= self.SHORT_CHUNK_MAX_CHARS:
+            return False
+        seconds = len(audio_np) / self.SAMPLE_RATE
+        allowed = self.SHORT_CHUNK_SECONDS_BASE + self.SHORT_CHUNK_SECONDS_PER_CHAR * n_chars
+        if seconds <= allowed:
+            return False
+        print(f"Orpheus: sentence {sentence_index} audio too long for {n_chars} chars "
+              f"({seconds:.2f}s > {allowed:.2f}s) — re-rolling once, keeping the shorter take")
+        self._keep_reject(sentence_index, clean, audio_np, 'overrun',
+                          {'measured_seconds': round(seconds, 3),
+                           'allowed_seconds': round(allowed, 3),
+                           'chars': n_chars})
+        return True
+
+    def _pick_shorter_take(self, sentence_index: int, first, second):
+        """Keep the shorter of an overrun take and its re-roll.
+
+        SHORTER, not "the one that passes": the re-roll is a fresh sample and may
+        overrun too, and a chunk this short has no split to fall back on. Taking
+        the shorter one is the only choice that cannot make the clip worse than
+        what we already had. An empty re-roll is refused outright — a stalled
+        heading beats a silent one.
+        """
+        if second is None or len(second) == 0:
+            print(f"Orpheus: sentence {sentence_index} re-roll produced no audio — keeping the original take")
+            return first
+        if len(second) < len(first):
+            print(f"Orpheus: sentence {sentence_index} re-roll is shorter "
+                  f"({len(second) / self.SAMPLE_RATE:.2f}s vs {len(first) / self.SAMPLE_RATE:.2f}s) — keeping it")
+            return second
+        print(f"Orpheus: sentence {sentence_index} re-roll is no shorter "
+              f"({len(second) / self.SAMPLE_RATE:.2f}s vs {len(first) / self.SAMPLE_RATE:.2f}s) — keeping the original")
+        return first
+
+    def _guard_overrun(self, sentence_index: int, clean: str, audio_np, reroll):
+        """ACTION half: re-roll a sub-floor chunk that overran, once, and keep the
+        shorter take. `reroll` re-renders the SAME text — no split, no force_split:
+        the defect is a sampling excursion (the model failed to stop and said a
+        two-word title twice), and fresh tokens are the whole cure.
+
+        Applied on both single-sentence backends and, pooled, on the vLLM BATCH
+        path (the audiobook worker, where this was measured). NOT on the MLX batch
+        path: that one has no deferral machinery, so a re-roll there would be a
+        serial render stalling the whole batch, and Metal is the backend that ranks
+        end-of-audio FIRST at the tie this defect turns on (2026-07-19: MLX greedy
+        0/25 vs vLLM greedy 75%) — it is the platform least likely to need it."""
+        if not self._needs_reroll(sentence_index, clean, audio_np):
+            return audio_np
+        return self._pick_shorter_take(sentence_index, audio_np, reroll(clean))
+
     def _ratchet_after_resplit(self, clean: str, audio_np, voice: str = None) -> None:
         """RATCHET half of _guard_truncation — see its docstring for the full rationale.
 
@@ -2986,6 +3161,12 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
                         sentence_index, clean, audio_np,
                         lambda c: self._generate_mlx_safe(c, force_split=True)
                     )
+                    # …and the opposite failure on a sub-floor chunk: audio far
+                    # LONGER than the text can justify (a heading spoken twice).
+                    audio_np = self._guard_overrun(
+                        sentence_index, clean, audio_np,
+                        lambda c: self._generate_mlx(c, sentence_index=sentence_index)
+                    )
                 elif self.backend == 'vllm':
                     try:
                         audio_np = self._tokens_to_audio(self._generate_tokens_vllm(clean))
@@ -3000,6 +3181,12 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
                     audio_np = self._guard_truncation(
                         sentence_index, clean, audio_np,
                         lambda c: self._generate_audio_vllm_safe(c, force_split=True)
+                    )
+                    # …and the opposite failure on a sub-floor chunk: audio far
+                    # LONGER than the text can justify (a heading spoken twice).
+                    audio_np = self._guard_overrun(
+                        sentence_index, clean, audio_np,
+                        lambda c: self._tokens_to_audio(self._generate_tokens_vllm(c))
                     )
                 else:
                     audio_np = self._tokens_to_audio(
@@ -3029,7 +3216,10 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
     def _render_deferred_resplits(self, deferred: list, results: dict) -> None:
         """Re-render every truncated chunk of a batch in ONE pooled generate() call.
 
-        deferred: list of (sentence_index, clean, gap, reason). Fills `results` in place.
+        deferred: list of (sentence_index, clean, gap, reason, original_audio).
+        Fills `results` in place. original_audio is carried only by the 'overrun'
+        reason, whose cure is a re-roll judged against the take it replaces; every
+        other reason re-renders unconditionally and passes None.
 
         Each chunk is split exactly as the inline guard split it
         (_generate_audio_vllm_safe with force_split — half-length parts, well inside the
@@ -3043,7 +3233,14 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
         """
         import numpy as np
         flat, owners = [], []     # part texts, and the deferred[] position each belongs to
-        for pos, (_idx, clean, _gap, _reason) in enumerate(deferred):
+        for pos, (_idx, clean, _gap, reason, _first) in enumerate(deferred):
+            if reason == 'overrun':
+                # A re-ROLL, never a split: the text is a heading with no split
+                # point, and the defect is a sampling excursion that fresh tokens
+                # fix. Splitting it would answer a question nobody asked.
+                flat.append(clean)
+                owners.append(pos)
+                continue
             parts = self._split_long_text(clean, max_length=max(60, len(clean) // 2))
             if len(parts) < 2:
                 # Unsplittable text — the ladder falls through to a plain render, and so
@@ -3055,12 +3252,14 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
 
         waves = self._generate_parts_batched(flat, 1)
 
-        for pos, (idx, clean, gap, reason) in enumerate(deferred):
+        for pos, (idx, clean, gap, reason, first) in enumerate(deferred):
             try:
                 mine = [w for w, o in zip(waves, owners) if o == pos]
                 audio_np = np.concatenate(mine) if len(mine) > 1 else mine[0]
                 if reason == 'short':
                     self._ratchet_after_resplit(clean, audio_np)
+                elif reason == 'overrun':
+                    audio_np = self._pick_shorter_take(idx, first, audio_np)
                 results[idx] = self._save_audio(idx, audio_np, gap[0], gap[1])
             except Exception as resplit_err:
                 print(f"Orpheus deferred re-render failed for sentence {idx}: {resplit_err}")
@@ -3159,7 +3358,14 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
                         # Only the VERDICT is taken here; the re-render is pooled.
                         reason = self._needs_resplit(idx, clean, audio_np)
                         if reason is not None:
-                            deferred.append((idx, clean, gap, reason))
+                            deferred.append((idx, clean, gap, reason, None))
+                            continue
+                        # The opposite verdict on a sub-floor chunk — audio far
+                        # LONGER than the text can justify. Pooled the same way,
+                        # but it carries its audio: the re-roll only wins if it
+                        # comes back shorter than what we already have.
+                        if self._needs_reroll(idx, clean, audio_np):
+                            deferred.append((idx, clean, gap, 'overrun', audio_np))
                             continue
                         results[idx] = self._save_audio(idx, audio_np, gap[0], gap[1])
                     except Exception as decode_err:
