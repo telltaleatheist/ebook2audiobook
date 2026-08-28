@@ -992,6 +992,63 @@ def _edge_chars(tag:Any)->tuple:
     return first, last
 
 
+def _heading_text(tag:Any)->str:
+    """A heading's text, with its LINE BREAKS READ AS SPACES (2026-08-28).
+
+    ── What this replaces, and the damage it did ───────────────────────────────
+
+    `get_text(strip=True)` strips every string in the tag and joins them with
+    NOTHING. A title typeset across four lines — `God Will Not Protect<br/>
+    Children When Parents<br/>…`, or one <span> per line, which is how a print
+    title comes back from an OCR/VLM conversion — therefore came out as
+    'God Will Not ProtectChildren When ParentsAllow Occult Items InTheir Homes'.
+    Owen heard exactly that, fused words and all, in "14 Things Witches Hope You
+    Never Find Out": the words were welded in the TEXT, so they were welded in
+    the audio and in the transcript cue.
+
+    It was always wrong; it only became audible when headings started being read
+    as their own chunk, because a fused title is much harder to miss when it is
+    a take of its own than when it was buried in the paragraph behind it.
+
+    ── Why not simply `get_text(' ')` ─────────────────────────────────────────
+
+    Because a space between two pieces is not always right. `<span
+    class="dropcap">I</span>ntroduction` is ONE word split by styling, and a
+    blanket separator reads it aloud as 'I ntroduction' — the same class of
+    defect, in the other direction. _collapse_glue solves this for body text by
+    keeping the markup's own whitespace; a heading needs the same judgement.
+
+    So a space is inserted at a piece boundary only where the markup means a new
+    word: a <br> (always — that IS a line break), or a boundary where the text
+    so far ends in a word character and the next piece opens with a capital or a
+    digit. 'Protect' + 'Children' takes one; 'I' + 'ntroduction' does not.
+
+    A SPACE and never a period: these breaks fall INSIDE one sentence — the
+    title wrapped — so a period would put a full stop mid-title and stop the
+    reader four times in a row. The period a heading needs is the one at its
+    END, which filter_chapter already adds.
+    """
+    out = []
+    last_char = ''
+    for node in tag.descendants:
+        if isinstance(node, Tag):
+            if node.name.lower() == 'br':
+                out.append(' ')
+                last_char = ' '
+            continue
+        if not isinstance(node, NavigableString):
+            continue
+        piece = str(node)
+        if not piece:
+            continue
+        if (last_char and not last_char.isspace() and not piece[:1].isspace()
+                and last_char.isalnum() and (piece[0].isupper() or piece[0].isdigit())):
+            out.append(' ')
+        out.append(piece)
+        last_char = piece[-1]
+    return re.sub(r'\s+', ' ', ''.join(out)).strip()
+
+
 def _collapse_glue(rows:list)->list:
     """Resolve the ('glue', payload) markers _tuple_row emits where two pieces of
     text ABUT in the markup with NO whitespace between them.
@@ -1076,7 +1133,7 @@ def filter_chapter(idx:int, doc:EpubHtml, session_id:str, stanza_nlp:Pipeline, i
                     first_char, last_char = _edge_chars(child)
                     lead_ws = ws_pending or first_char.isspace()
                     if name in heading_tags:
-                        title = child.get_text(strip=True)
+                        title = _heading_text(child)
                         if title:
                             if prev_child_had_data:
                                 yield ('break', sml_token("break"))
