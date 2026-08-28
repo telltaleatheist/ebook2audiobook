@@ -456,6 +456,14 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
     # (deathstalker 0.81 s), so a voice with a much longer trained tail needs a
     # larger intercept — hence the env overrides.
     SHORT_CHUNK_OVERRUN_TAG = 'SHORT_CHUNK_OVERRUN'
+
+    # One machine-readable line per guard fire, on stdout, so an orchestrator can
+    # count runaways and truncations without reaching into the worker's filesystem
+    # (on Windows the worker runs inside WSL, where its scratch is not a path the
+    # host can conveniently read). The prose prints stay: they are what a person
+    # watching the console reads. This is the same event, in a form a parser can
+    # trust — tag, then one compact JSON object, on a single line.
+    GUARD_EVENT_TAG = 'ORPHEUS_GUARD_EVENT'
     SHORT_CHUNK_MAX_CHARS = int(os.environ.get('ORPHEUS_SHORT_CHUNK_CHARS', '25'))
     SHORT_CHUNK_SECONDS_BASE = float(os.environ.get('ORPHEUS_SHORT_CHUNK_SECONDS_BASE', '0.9'))
     SHORT_CHUNK_SECONDS_PER_CHAR = float(os.environ.get('ORPHEUS_SHORT_CHUNK_SECONDS_PER_CHAR', '0.19'))
@@ -2909,7 +2917,10 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
                 seconds = round(float(wave.shape[-1]) / self.SAMPLE_RATE, 3)
             record = {
                 'sentence_index': sentence_index,
-                'reason': reason,                 # 'short' | 'empty' | 'cap'
+                # 'short' = truncated, re-rendered split | 'empty' = no audio |
+                # 'cap' = never emitted EOS, hit the token ceiling |
+                # 'overrun' = short chunk spoke too long; the take SHIPPED anyway
+                'reason': reason,
                 'chars': len(clean),
                 'audio_seconds': seconds,
                 'chars_per_second': round(len(clean) / seconds, 2) if seconds else None,
@@ -2927,8 +2938,35 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
             import json as _json
             with open(stem + '.json', 'w', encoding='utf-8') as handle:
                 _json.dump(record, handle, indent=1, ensure_ascii=False)
+            # One append-only file per run, so a post-mortem is a single read
+            # rather than a directory walk, and so the record survives even if
+            # the per-event wav could not be written.
+            with open(os.path.join(directory, 'events.jsonl'), 'a', encoding='utf-8') as handle:
+                handle.write(_json.dumps(record, ensure_ascii=False) + '\n')
+            self._emit_guard_event(record)
         except Exception as err:
             print(f'Orpheus: could not keep the rejected render for sentence {sentence_index} ({err})')
+
+    def _emit_guard_event(self, record: dict):
+        """Print one parseable line for a guard fire. Best-effort like its caller.
+
+        Kept separate from _keep_reject so a chunk whose audio is NOT thrown away
+        (the short-chunk overrun — the take ships and is only counted) can report
+        through the same channel without pretending to be a rejection.
+        """
+        try:
+            import json as _json
+            compact = dict(record)
+            # The text can be 500 characters of book; the console line stays
+            # readable and the full text is already in the per-event JSON.
+            text = compact.get('text') or ''
+            if len(text) > 120:
+                compact['text'] = text[:120]
+                compact['text_truncated'] = True
+            print(f'[ORPHEUS][{self.GUARD_EVENT_TAG}] '
+                  + _json.dumps(compact, ensure_ascii=False, separators=(',', ':')))
+        except Exception:
+            pass
 
     def _guard_truncation(self, sentence_index: int, clean: str, audio_np, resplit,
                           voice: str = None):
@@ -3057,6 +3095,16 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
         print(f"[ORPHEUS][{self.SHORT_CHUNK_OVERRUN_TAG}] sentence={sentence_index} "
               f"chars={n_chars} seconds={seconds:.3f} allowed={allowed:.3f} "
               f"ratio={seconds / allowed:.2f} text={clean!r}")
+        # Also report through the structured channel, so one collector sees every
+        # guard fire. The audio is KEPT alongside it: this take ships, but it is
+        # the only recording of the doubling, and a count nobody can listen to
+        # cannot settle where "slow" ends and "doubled" begins (see the
+        # SHORT_CHUNK_* note). Saved under its own reason so it is never mistaken
+        # for a chunk that was thrown away and re-rendered.
+        self._keep_reject(sentence_index, clean, audio_np, 'overrun',
+                          {'allowed_seconds': round(allowed, 3),
+                           'overrun_ratio': round(seconds / allowed, 3),
+                           'audio_kept': True})
         return True
 
     def _ratchet_after_resplit(self, clean: str, audio_np, voice: str = None) -> None:
