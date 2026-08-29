@@ -2881,7 +2881,14 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
         override = os.environ.get('ORPHEUS_REJECT_DIR', '').strip()
         if override:
             return override
-        proc = self.session.get('process_dir')
+        # A guard can fire from a context that never adopted a session (a probe,
+        # a harness exercising the guard alone). No session means nowhere to file
+        # a reject — the same answer as a session with no process_dir, not an
+        # error worth breaking the guard's one-line report over.
+        session = getattr(self, 'session', None)
+        if not session:
+            return None
+        proc = session.get('process_dir')
         if not proc:
             return None
         ebook_dir = os.path.dirname(os.path.normpath(proc))   # <tmp>/ebook-<uuid>
@@ -2903,6 +2910,7 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
         reported and swallowed — losing a post-mortem must never take down a book.
         """
         try:
+            _rec_session = getattr(self, 'session', None) or {}
             directory = self._reject_dir()
             if not directory:
                 return
@@ -2924,12 +2932,16 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
                 'chars': len(clean),
                 'audio_seconds': seconds,
                 'chars_per_second': round(len(clean) / seconds, 2) if seconds else None,
-                'voice': self.session.get('fine_tuned'),
-                'model_dir': self.session.get('orpheus_model_dir'),
+                # Null when the engine has no session (see _reject_dir): an
+                # honest hole in the diagnostics beats an exception that eats
+                # the whole record. Reachable via ORPHEUS_REJECT_DIR, which
+                # skips _reject_dir's own no-session return.
+                'voice': _rec_session.get('fine_tuned'),
+                'model_dir': _rec_session.get('orpheus_model_dir'),
                 # Adapter mode: model_dir is None and the voice lives in the adapter,
                 # so a post-mortem needs both refs to know what actually rendered this.
-                'adapter_dir': self.session.get('orpheus_adapter_dir'),
-                'base_dir': self.session.get('orpheus_base_dir'),
+                'adapter_dir': _rec_session.get('orpheus_adapter_dir'),
+                'base_dir': _rec_session.get('orpheus_base_dir'),
                 'max_audio_tokens': self.MAX_AUDIO_TOKENS,
                 'text': clean,
             }

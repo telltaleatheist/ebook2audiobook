@@ -47,11 +47,20 @@ FIXTURE_XHTML = """<body>
 
 # Same per-engine split as the heading-chunk harness: Orpheus keeps book-exact
 # text ('Chapter 8'), every other engine runs math2words first ('Chapter eight').
+#
+# PROLOGUE IS NOT HERE, AND THAT IS THE 2026-08-29 SHORT-HEADING RULE: a heading
+# under 3 words merges FORWARD into its first paragraph so Orpheus is guaranteed
+# to voice it, and the bold cue is part of the price — the merged cue reads as
+# plain text that OPENS with the title (asserted below as MERGED_OPENERS).
 EXPECTED_BOLD = {
-    'xtts': ['<b>PROLOGUE.</b>', '<b>Chapter eight: State of Confusion.</b>', '<b>A Section Within.</b>'],
-    'orpheus': ['<b>PROLOGUE.</b>', '<b>Chapter 8: State of Confusion.</b>', '<b>A Section Within.</b>'],
-    'voxtral': ['<b>PROLOGUE.</b>', '<b>Chapter eight: State of Confusion.</b>', '<b>A Section Within.</b>'],
+    'xtts': ['<b>Chapter eight: State of Confusion.</b>', '<b>A Section Within.</b>'],
+    'orpheus': ['<b>Chapter 8: State of Confusion.</b>', '<b>A Section Within.</b>'],
+    'voxtral': ['<b>Chapter eight: State of Confusion.</b>', '<b>A Section Within.</b>'],
 }
+
+# A short heading demoted by the forward merge: its text must open an UNBOLDED
+# cue — present (it was voiced) but no longer dressed as a heading.
+MERGED_OPENERS = ['PROLOGUE. ']
 
 ENGINES = ['xtts', 'orpheus', 'voxtral']
 
@@ -150,6 +159,13 @@ def main():
             for want in expected:
                 if want not in cues:
                     failures.append(f'{label}: expected bold cue {want!r} not among the cues')
+
+            # 1b. a demoted short heading opens a PLAIN cue: spoken, not bolded.
+            for opener in MERGED_OPENERS:
+                if not any(c.startswith(opener) and not c.startswith('<b>') for c in cues):
+                    failures.append(f'{label}: merged short heading {opener!r} does not open a plain cue')
+                if any(c.startswith(f'<b>{opener}') for c in cues):
+                    failures.append(f'{label}: merged short heading {opener!r} is still bolded')
 
             # 2. nothing else is bolded, and no cue carries a stray tag.
             if len(bolded) != len(expected):
