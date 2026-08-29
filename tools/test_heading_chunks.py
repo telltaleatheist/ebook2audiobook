@@ -20,6 +20,7 @@ Exit code 0 = all cases passed.
 """
 
 import os
+import re
 import sys
 
 # The fixture covers the four shapes headers actually come in:
@@ -28,6 +29,12 @@ import sys
 #   h3  a mid-chapter section header sitting between two paragraphs
 #   h3 -> 'No.'  a header directly followed by a one-word paragraph (the pair
 #         that the 25-char min-chars floor used to fuse into one chunk)
+#   h2  a DECORATED header — '• Silo 1 •', the shape from Hugh Howey's "Shift".
+#         conf_lang maps the bullet to a period, so this header reaches the
+#         splitter as '. Silo 1 ..' and PASS 1 breaks it at that first period,
+#         leaving a heading row whose whole text is '.' — a chunk with nothing
+#         to speak, which is what the model improvised 1.6s of noise for
+#         (2026-08-29, [ORPHEUS][SHORT_CHUNK_OVERRUN] … text='.').
 FIXTURE_XHTML = """<body>
 <h1>PROLOGUE</h1>
 <p>The city had been quiet for a very long time before that morning came.</p>
@@ -36,6 +43,8 @@ FIXTURE_XHTML = """<body>
 <h3>A Section Within</h3>
 <p>No.</p>
 <p>The argument continued for another hour without anyone changing their mind.</p>
+<h2>&#8226; Silo 1 &#8226;</h2>
+<p>Troy needed to see a doctor, and had needed to for very much longer than he cared to admit to anybody at all.</p>
 </body>"""
 
 # What filter_chapter should emit as heading rows: the header text plus the
@@ -124,6 +133,72 @@ def _check_convert_sml_accepts_heading():
     return True, ''
 
 
+def _check_floor_wordless_rows(core):
+    """The min-chars floor, driven DIRECTLY over row sequences the fixture markup
+    cannot reliably produce (2026-08-29).
+
+    The fixture proves the real '• Silo 1 •' path end to end; this proves the
+    rule itself at the layer that owns it, including the two shapes that only
+    ever arise from a specific neighbour arrangement. Returns a list of failures.
+
+    A row is built the way get_sentences sees one: escape_sml has already turned
+    each SML block into ONE char whose index into sml_blocks is its identity, so
+    chr(sml_escape_tag + i) IS the token here."""
+    heading, brk = chr(core.sml_escape_tag), chr(core.sml_escape_tag + 1)
+    is_heading = core._heading_row_test(['[heading]', '[break]'])
+
+    def clean_len(s):
+        return len(core._strip_escaped_sml(s))
+
+    def has_words(s):
+        return core._has_word_chars(s)
+
+    def run(rows, min_chars=25, max_chars=350):
+        return core._apply_min_chars_floor(rows, clean_len, max_chars, min_chars, is_heading, has_words)
+
+    failures = []
+
+    def expect(label, rows, want):
+        got = run(*rows) if isinstance(rows, tuple) else run(rows)
+        print(f'  {label}\n      in : {[core._strip_escaped_sml(r) for r in (rows[0] if isinstance(rows, tuple) else rows)]!r}'
+              f'\n      out: {[core._strip_escaped_sml(r) for r in got]!r}')
+        if got != want:
+            failures.append(f'{label}: got {got!r}, want {want!r}')
+
+    # 1. A bare '.' NON-heading row wedged between two headings. Both merges are
+    #    refused — a heading is not a landing site in either direction — so this
+    #    is the arrangement where the floor's fall-through used to SHIP the row.
+    expect('bare "." between two headings is dropped',
+           [f'{heading}Chapter One.', f'{brk}.', f'{heading}Chapter Two.'],
+           [f'{heading}Chapter One.', f'{heading}Chapter Two.'])
+
+    # 2. A HEADING whose whole text is punctuation — what '• Silo 1 •' leaves
+    #    behind. The heading exemption must not rescue it.
+    expect('a heading with no word in it is dropped, exemption or not',
+           [f'{brk}{heading}.', 'Troy needed to see a doctor and had for a long while.'],
+           ['Troy needed to see a doctor and had for a long while.'])
+
+    # 3. THE EXEMPTION STILL STANDS. 'II.' is two characters and far under the
+    #    floor, but it has word characters, so it is a real heading and is read
+    #    as its own chunk — byte for byte, nothing merged into it.
+    rows = [f'{heading}II.', 'The argument continued for another hour without anyone changing their mind.']
+    expect('a short real heading ("II.") still stands alone', rows, list(rows))
+
+    # 4. An SML-ONLY row is a PAUSE, not a wordless chunk: the engines never send
+    #    it to the model (orpheus.py writes silence for it), so it must survive.
+    rows = ['A sentence long enough to clear the floor entirely on its own.', brk,
+            'Another sentence that also clears the floor without merging.']
+    expect('a bare [break] row is a pause and survives', rows, list(rows))
+
+    # 5. SENTENCE_MIN_CHARS=0 turns the LENGTH floor off. It does not licence a
+    #    chunk with nothing to say.
+    expect('the wordless rule holds with the length floor disabled',
+           ([f'{brk}.', 'Some prose that is comfortably long enough.'], 0),
+           ['Some prose that is comfortably long enough.'])
+
+    return failures
+
+
 def main():
     repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     sys.path.insert(0, repo)
@@ -138,6 +213,9 @@ def main():
     print(f'\n--- xtts-class _convert_sml([heading]) --- {"OK" if ok else "FAIL"}')
     if not ok:
         failures.append(error)
+
+    print('\n--- min-chars floor: no chunk without a word in it ---')
+    failures.extend(_check_floor_wordless_rows(core))
 
     for engine in ENGINES:
         print(f'\n===== {engine} =====')
@@ -158,6 +236,16 @@ def main():
                     f'{engine}: header {header!r} is not its own chunk'
                     + (f' — it was merged into {owner!r}' if owner else ' — it is missing entirely')
                 )
+
+        # 1b. NOTHING IS HANDED TO THE MODEL WITH NO WORD IN IT (2026-08-29).
+        #     The '• Silo 1 •' header is the fixture's carrier: its bullets
+        #     become periods, PASS 1 splits at the first one, and the leading
+        #     '.' used to ship as a heading chunk of its own. An SML-only row is
+        #     NOT this case — it never reaches the model (silence is written for
+        #     it) — so only chunks with surviving text are judged.
+        for c, s in zip(chunks, spoken):
+            if s and not re.search(r'\w', s):
+                failures.append(f'{engine}: chunk has nothing to speak: {c!r} (spoken {s!r})')
 
         # 2. nothing spoken still carries the marker, in tag form or escaped.
         for s in spoken:

@@ -1719,6 +1719,68 @@ def _strip_escaped_sml(s:str)->str:
     return ''.join(c for c in s if ord(c) < sml_escape_tag)
 
 
+def _has_word_chars(s:str)->bool:
+    """True when a row has anything to SAY: at least one word character once the
+    escaped SML tokens are gone. Unicode-aware by default in Python 3, so a CJK
+    or Cyrillic row answers yes exactly as an English one does.
+
+    Callers pass the row through the engine's own text transform first (see
+    has_words in get_sentences) so the question is asked of what the MODEL will
+    read, not of what is on screen."""
+    return bool(re.search(r'\w', _strip_escaped_sml(s)))
+
+
+def _drop_wordless_rows(rows:list, has_words)->list:
+    """Remove every row that would reach TTS as text with NO word character in
+    it (2026-08-29).
+
+    ── The bug ────────────────────────────────────────────────────────────────
+
+    Hugh Howey's "Shift" carries a decorated section header on every silo
+    chapter: `<h2>• Silo 1 •</h2>`. conf_lang maps the bullet to a period, so
+    filter_chapter marked and emitted the row as `[heading]. Silo 1 ..` — and
+    PASS 1 then split it at that FIRST period, leaving `[heading].` behind as a
+    row of its own. A heading is exempt from the min-chars floor in both
+    directions, so nothing could merge it away, and 30 chunks whose entire text
+    was '.' were handed to Orpheus in one book. The model has no period sound to
+    make, so it improvised: [ORPHEUS][SHORT_CHUNK_OVERRUN] sentence=509 chars=1
+    seconds=1.621 allowed=1.090 ratio=1.49 text='.' — 1.6s of non-speech shipped
+    into the audiobook.
+
+    ── Why DROP and not merge ─────────────────────────────────────────────────
+
+    A row with no word character is decoration — a scene-break rule, a bullet, a
+    dingbat — and it carries no audio content at all. Merging it into a
+    neighbour would not add anything spoken; it would prepend orphan punctuation
+    to that neighbour's prompt, which is the exact shape ('Silo 1 ..') Owen
+    already called a defect in b499c33f. So the row goes, and the log says so.
+
+    THIS IS NOT THE FLOOR'S 'too short' TEST and it does not care about length: a
+    250-character rule of asterisks is just as wordless as a lone period. It is
+    also not a fallback — nothing is substituted for the row, and nothing spoken
+    is lost, because there was nothing spoken in it.
+
+    SML-ONLY ROWS ARE NOT TOUCHED. A row whose core is empty (a bare [break]) is
+    not wordless-with-text: the engines never send it to the model at all —
+    orpheus.py's convert() writes silence for it — so it is a real pause and it
+    stays. Only a row that has surviving TEXT with no word in that text is
+    dropped, and the SML tokens riding on it go with it (counted in the log, the
+    same ratified trade-off the merge passes make)."""
+    out = []
+    for row in rows:
+        core = _split_sml_edges(row)[1]
+        if core and not has_words(row):
+            tokens = sum(1 for c in row if ord(c) >= sml_escape_tag)
+            # Same 'get_sentences() <pass>: <what changed>' shape as the floor's
+            # own lines, but NOT labelled as the floor: this also runs on the
+            # ideogram path, which has no floor, and it is not a length decision.
+            print(f'get_sentences() wordless row: dropped, nothing to speak, '
+                  f'{tokens} pause token(s) with it: {_strip_escaped_sml(core)!r}')
+            continue
+        out.append(row)
+    return out
+
+
 def _sentence_min_chars()->int:
     """Minimum engine-read length (in chars) a text row may have before
     _apply_min_chars_floor merges it into a neighbour. SENTENCE_MIN_CHARS
@@ -1785,7 +1847,7 @@ def _heading_row_test(sml_blocks:list[str]):
     return _is_heading_row
 
 
-def _apply_min_chars_floor(rows:list, clean_len, max_chars:int, min_chars:int, is_heading)->list:
+def _apply_min_chars_floor(rows:list, clean_len, max_chars:int, min_chars:int, is_heading, has_words)->list:
     """Merge every row whose engine-read text is shorter than min_chars into a
     neighbour, so a one-word paragraph ('No.') is never handed to TTS as its own
     ultra-short prompt. FORWARD first (the tiny row leads into the sentence that
@@ -1798,6 +1860,21 @@ def _apply_min_chars_floor(rows:list, clean_len, max_chars:int, min_chars:int, i
     'Chapter 8: State of Confusion.') is shorter than the 25-char floor. This is
     the one exemption that IGNORES length: a two-character heading still stands
     alone. is_heading is the shared predicate from _heading_row_test.
+
+    THE EXEMPTION IS FOR HEADINGS WITH WORDS IN THEM (2026-08-29).
+    _drop_wordless_rows runs FIRST, so by the time the exemption is consulted no
+    row — heading or not — is still wordless. 'II.' stands alone; the '.' left over
+    from a `<h2>• Silo 1 •</h2>` never reaches this pass to be exempted. That
+    order is the fix: the exemption made a wordless heading unmergeable, which is
+    how 30 chunks reading '.' shipped in one book (see _drop_wordless_rows).
+
+    THIS PASS IS THE LAST WORD ON WORDLESSNESS for every engine, because it runs
+    last on every return path. Neither packer can undo it — both only ever
+    CONCATENATE rows, and concatenation cannot remove a word character — and both
+    run before it. _apply_near_dup_split is the only pass after it, and it cannot
+    reintroduce the case either: it splits a chunk only at a near-duplicate
+    sentence pair, and _is_near_duplicate requires FOUR words on both sides, so a
+    wordless fragment can never open a new sub-chunk.
 
     RATIFIED TRADE-OFF: the SML tokens sitting AT THE JOIN — the tiny row's
     trailing token, any SML-only rows between the two, and the neighbour's
@@ -1814,6 +1891,11 @@ def _apply_min_chars_floor(rows:list, clean_len, max_chars:int, min_chars:int, i
     clean_len measures what the engine will actually read (SML stripped, and for
     Orpheus through the digit/scripture transform), so it must be passed in by
     the caller that owns that transform."""
+    # BEFORE the early return: a wordless row must never ship even when the
+    # length floor is switched off (SENTENCE_MIN_CHARS=0). The two rules are
+    # independent — one is about a row being too SHORT, the other about it having
+    # nothing to say at all.
+    rows = _drop_wordless_rows(rows, has_words)
     if min_chars <= 0:
         return rows
     out = list(rows)
@@ -1921,6 +2003,12 @@ def get_sentences(text:str, session_id:str, sml_blocks:list[str])->list|None:
         # the passes below uses this, so the 350-char cap bounds the MODEL's
         # text, not the display text.
         return len(strip_escaped_sml(tts_form(s)))
+
+    def has_words(s:str)->bool:
+        # Does the ENGINE get anything to say from this row? Same reading as
+        # clean_len — SML stripped, Orpheus's transform applied — so the answer
+        # is about the model's text and not the display text.
+        return _has_word_chars(tts_form(s))
 
     def _plain(s:str)->bool:
         # A row is "plain prose" only when it carries NO escaped SML token: the
@@ -2307,7 +2395,12 @@ def get_sentences(text:str, session_id:str, sml_blocks:list[str])->list|None:
             for s in join_ideogramms(result):
                 if not is_latin_only(s):
                     joined.append(s)
-            return joined
+            # The ideogram path never ran the min-chars floor and still does not,
+            # but "never hand the model text with no word in it" is not a floor
+            # rule and holds here too. \w is Unicode-aware, so every real CJK
+            # token answers yes and only decoration ('。', '※', a rule of dashes)
+            # is dropped.
+            return _drop_wordless_rows(joined, has_words)
         else:
             if tts_engine == 'voxtral':
                 # Voxtral is a long-form model: greedily pack adjacent sentences up to
@@ -2333,7 +2426,7 @@ def get_sentences(text:str, session_id:str, sml_blocks:list[str])->list|None:
                         packed[-1] = packed[-1].rstrip() + ' ' + s.lstrip()
                     else:
                         packed.append(s)
-                return _apply_min_chars_floor(packed, clean_len, max_chars, min_chars, is_heading)
+                return _apply_min_chars_floor(packed, clean_len, max_chars, min_chars, is_heading, has_words)
             if tts_engine == 'orpheus':
                 # PASS 5 (Orpheus) — greedily pack adjacent sentences up to max_chars so
                 # each generation spans 2-3 sentences: coherent timbre/prosody across a
@@ -2517,7 +2610,7 @@ def get_sentences(text:str, session_id:str, sml_blocks:list[str])->list|None:
                     # _apply_near_dup_split: keeps a near-duplicate sentence pair
                     # out of one generation. No-op for non-repetitive prose.
                     return _apply_near_dup_split(
-                        _apply_min_chars_floor(packed, clean_len, max_chars, min_chars, is_heading)
+                        _apply_min_chars_floor(packed, clean_len, max_chars, min_chars, is_heading, has_words)
                     )
                 def _split_to_cap(t):
                     parts, last = [], 0
@@ -2544,9 +2637,9 @@ def get_sentences(text:str, session_id:str, sml_blocks:list[str])->list|None:
                 # MIN-CHARS FLOOR then PASS 6 — repetition-primed split
                 # (anti-runaway); see above.
                 return _apply_near_dup_split(
-                    _apply_min_chars_floor(capped, clean_len, max_chars, min_chars, is_heading)
+                    _apply_min_chars_floor(capped, clean_len, max_chars, min_chars, is_heading, has_words)
                 )
-            return _apply_min_chars_floor(final_list, clean_len, max_chars, min_chars, is_heading)
+            return _apply_min_chars_floor(final_list, clean_len, max_chars, min_chars, is_heading, has_words)
     except Exception as e:
         print(f'get_sentences() error: {e}')
         return None
