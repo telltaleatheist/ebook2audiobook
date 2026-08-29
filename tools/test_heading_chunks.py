@@ -165,12 +165,14 @@ def _check_floor_wordless_rows(core):
         if got != want:
             failures.append(f'{label}: got {got!r}, want {want!r}')
 
-    # 1. A bare '.' NON-heading row wedged between two headings. Both merges are
-    #    refused — a heading is not a landing site in either direction — so this
-    #    is the arrangement where the floor's fall-through used to SHIP the row.
+    # 1. A bare '.' NON-heading row wedged between two headings. Both floor
+    #    merges are refused — a heading is not a landing site in either
+    #    direction — so this is the arrangement where the fall-through used to
+    #    SHIP the row. The '.' must be DROPPED; the two short headings then
+    #    coalesce forward (2026-08-29), which is case 3c's rule at work.
     expect('bare "." between two headings is dropped',
            [f'{heading}Chapter One.', f'{brk}.', f'{heading}Chapter Two.'],
-           [f'{heading}Chapter One.', f'{heading}Chapter Two.'])
+           [f'{heading}Chapter One. Chapter Two.'])
 
     # 2. A HEADING whose whole text is punctuation — what '• Silo 1 •' leaves
     #    behind. The heading exemption must not rescue it.
@@ -178,11 +180,37 @@ def _check_floor_wordless_rows(core):
            [f'{brk}{heading}.', 'Troy needed to see a doctor and had for a long while.'],
            ['Troy needed to see a doctor and had for a long while.'])
 
-    # 3. THE EXEMPTION STILL STANDS. 'II.' is two characters and far under the
-    #    floor, but it has word characters, so it is a real heading and is read
-    #    as its own chunk — byte for byte, nothing merged into it.
-    rows = [f'{heading}II.', 'The argument continued for another hour without anyone changing their mind.']
-    expect('a short real heading ("II.") still stands alone', rows, list(rows))
+    # 3. THE EXEMPTION IS FOR HEADINGS OF 3+ WORDS (2026-08-29). 'II.' has a
+    #    word character so it is not dropped — but at one word Orpheus may not
+    #    voice it at all, so it merges FORWARD into its first paragraph, demoted
+    #    to plain text (its marker rides the dropped lead).
+    expect('a 1-word heading ("II.") merges forward into its paragraph',
+           [f'{heading}II.', 'The argument continued for another hour without anyone changing their mind.'],
+           ['II. The argument continued for another hour without anyone changing their mind.'])
+
+    # 3b. A 3-word heading KEEPS its isolation — the narrowed exemption's floor.
+    rows = [f'{heading}A Section Within.', 'The argument continued for another hour without anyone changing their mind.']
+    expect('a 3-word heading still stands alone', rows, list(rows))
+
+    # 3c. STACKED short headings coalesce: each merges forward into the next,
+    #    the target's marker surviving each time, until the combined title
+    #    reaches 3 words and stands as ONE heading. The body row is untouched.
+    expect('stacked 1-word headings coalesce into one heading',
+           [f'{heading}16.', f'{brk}{heading}2110.', f'{brk}{heading}Silo one.',
+            'Troy needed to see a doctor and had for a very long while.'],
+           [f'{brk}{heading}16. 2110. Silo one.',
+            'Troy needed to see a doctor and had for a very long while.'])
+
+    # 3d. A short heading with NOTHING after it in the chapter stays isolated
+    #    (logged) — the render-side re-roll backstop is its guard.
+    rows = ['A sentence long enough to clear the floor entirely on its own.', f'{brk}{heading}II.']
+    expect('a chapter-final short heading is kept', rows, list(rows))
+
+    # 3e. SENTENCE_MIN_CHARS=0 turns off the LENGTH floor, not the voicing rule:
+    #    a 1-word heading still merges forward.
+    expect('the short-heading merge holds with the length floor disabled',
+           ([f'{heading}II.', 'Some prose that is comfortably long enough on its own.'], 0),
+           ['II. Some prose that is comfortably long enough on its own.'])
 
     # 4. An SML-ONLY row is a PAUSE, not a wordless chunk: the engines never send
     #    it to the model (orpheus.py writes silence for it), so it must survive.
@@ -226,16 +254,23 @@ def main():
         for i, c in enumerate(chunks):
             print(f'  [{i}] {c!r}')
 
-        # 1. every header is a chunk of its own — the chunk's spoken text is the
-        #    header and nothing else.
+        # 1. a header of 3+ words is a chunk of its own; a shorter one is merged
+        #    FORWARD (2026-08-29) — it must open a chunk that continues with the
+        #    text under it, never stand alone and never go missing.
         spoken = [_spoken_text(core, engine, c) for c in chunks]
         for header in EXPECTED_HEADERS[engine]:
-            if header not in spoken:
-                owner = next((s for s in spoken if header in s), None)
-                failures.append(
-                    f'{engine}: header {header!r} is not its own chunk'
-                    + (f' — it was merged into {owner!r}' if owner else ' — it is missing entirely')
-                )
+            if core._word_count(header) >= 3:
+                if header not in spoken:
+                    owner = next((s for s in spoken if header in s), None)
+                    failures.append(
+                        f'{engine}: header {header!r} is not its own chunk'
+                        + (f' — it was merged into {owner!r}' if owner else ' — it is missing entirely')
+                    )
+            else:
+                if header in spoken:
+                    failures.append(f'{engine}: short header {header!r} was left as its own chunk')
+                elif not any(s.startswith(header + ' ') for s in spoken):
+                    failures.append(f'{engine}: short header {header!r} does not open the chunk under it')
 
         # 1b. NOTHING IS HANDED TO THE MODEL WITH NO WORD IN IT (2026-08-29).
         #     The '• Silo 1 •' header is the fixture's carrier: its bullets

@@ -1793,6 +1793,105 @@ def _sentence_min_chars()->int:
     return min_chars
 
 
+def _heading_min_words()->int:
+    """Minimum word count a section heading may have and still stand as its own
+    chunk. Below it the heading is merged FORWARD into the next row (2026-08-29,
+    Owen's ruling): Orpheus can fail to voice an ultra-short prompt at all — the
+    SNAC frames are coarse enough that a one-word chunk ('No.', 'II.') can hit
+    EOS before any speech exists — and an unread chapter title is worse than one
+    that flows into its first paragraph. HEADING_MIN_WORDS overrides the
+    3-word default and 0 disables the pass; an invalid value raises (NO
+    FALLBACK), same handling style as SENTENCE_MIN_CHARS."""
+    _mw = os.environ.get('HEADING_MIN_WORDS')
+    min_words = int(_mw) if _mw else 3
+    if min_words < 0:
+        raise ValueError(f'HEADING_MIN_WORDS must be >= 0, got {min_words}')
+    return min_words
+
+
+def _word_count(core:str)->int:
+    """Words in a row's core as the reader would count them: whitespace-split
+    tokens that carry at least one word character, SML stripped. Counted on the
+    display text — the digit/number transforms have already run by the time any
+    merge pass sees a row, so display and engine text agree on word count."""
+    return sum(1 for t in _strip_escaped_sml(core).split() if re.search(r'\w', t))
+
+
+def _merge_short_headings_forward(rows:list, clean_len, max_chars:int, is_heading, min_words:int)->list:
+    """Merge every heading of fewer than min_words words FORWARD into the next
+    text row, so no ultra-short prompt is ever handed to the engine as its own
+    chunk (2026-08-29).
+
+    ── Why forward, and why headings at all ────────────────────────────────────
+
+    Orpheus has a known failure mode on very short prompts: the model can emit
+    EOS before any voiced audio exists, so a chunk like 'No.' or 'II.' may not
+    be READ AT ALL. Ultra-short chunks are almost exclusively chapter titles —
+    every other short row is already merged by the min-chars floor; headings
+    were the one exemption — and a chapter title belongs to the text UNDER it,
+    so it merges into the next row, never the previous one. This deliberately
+    narrows the 2026-08-27 heading isolation: a title of min_words or more still
+    stands alone; a shorter one trades its isolation (and its bold VTT cue) for
+    the guarantee of being spoken. Being read correctly beats standing alone.
+
+    ── Mechanics ───────────────────────────────────────────────────────────────
+
+    The merged row is the TARGET row with the heading's text prepended after the
+    target's leading SML tokens — so the target's own lead pause still plays
+    before the combined text, and when the target is ITSELF a heading (stacked
+    chapter-number headings: '16.' then '2110.') the target's [heading] marker
+    survives and the combined row remains a heading. The demoted heading's own
+    edge tokens are DROPPED and counted, the same ratified trade-off every merge
+    pass makes; its [heading] marker sits on that dropped lead, which is what
+    demotes it. The loop re-examines the merged row, so stacked short headings
+    coalesce until the combined title reaches min_words or the next row is body
+    text.
+
+    A merge that would break max_chars, and a heading with no following text row
+    in its chapter, keep the heading isolated (logged) — the render-side re-roll
+    backstop still guards those.
+
+    Runs BEFORE the min-chars floor's own loop and independently of it: the
+    floor is about prompts too short to sound natural, this is about prompts too
+    short to be voiced at all, and disabling one must not disable the other."""
+    if min_words <= 0:
+        return rows
+    out = list(rows)
+    i = 0
+    while i < len(out):
+        if not is_heading(out[i]):
+            i += 1
+            continue
+        lead, core, trail = _split_sml_edges(out[i])
+        if not core or _word_count(core) >= min_words:
+            i += 1
+            continue
+        # Forward to the next row carrying text; SML-only rows between are join
+        # fuel, same as the floor's forward merge.
+        j = i + 1
+        while j < len(out) and not _split_sml_edges(out[j])[1]:
+            j += 1
+        if j >= len(out):
+            print(f'get_sentences() short-heading merge: no following text in this chapter, heading kept: {_strip_escaped_sml(core)!r}')
+            i += 1
+            continue
+        t_lead, t_core, t_trail = _split_sml_edges(out[j])
+        merged = f'{t_lead}{core} {t_core}{t_trail}'
+        if clean_len(merged) > max_chars:
+            print(f'get_sentences() short-heading merge: merge would break max_chars, heading kept: {_strip_escaped_sml(core)!r}')
+            i += 1
+            continue
+        dropped = len(lead) + len(trail) + sum(
+            len(_split_sml_edges(r)[0]) + len(_split_sml_edges(r)[2]) for r in out[i + 1:j]
+        )
+        out[i:j + 1] = [merged]
+        print(f'get_sentences() short-heading merge: merged {_word_count(core)}-word heading forward, '
+              f'{dropped} join pause token(s) dropped: {_strip_escaped_sml(core)!r}')
+        # No i += 1: the merged row may itself be a still-short heading (stacked
+        # titles), and the next pass over it is what coalesces the stack.
+    return out
+
+
 def _split_sml_edges(row:str)->tuple:
     """Split a row into (leading SML tokens, plain core, trailing SML tokens).
     An escaped SML token is ONE char with ord >= sml_escape_tag — escape_sml
@@ -1861,6 +1960,12 @@ def _apply_min_chars_floor(rows:list, clean_len, max_chars:int, min_chars:int, i
     the one exemption that IGNORES length: a two-character heading still stands
     alone. is_heading is the shared predicate from _heading_row_test.
 
+    NARROWED 2026-08-29: the exemption is for headings of HEADING_MIN_WORDS
+    words or more. A shorter heading is merged FORWARD by
+    _merge_short_headings_forward before this loop runs — Orpheus can fail to
+    voice an ultra-short prompt at all, and an unread chapter title is worse
+    than one that flows into its first paragraph.
+
     THE EXEMPTION IS FOR HEADINGS WITH WORDS IN THEM (2026-08-29).
     _drop_wordless_rows runs FIRST, so by the time the exemption is consulted no
     row — heading or not — is still wordless. 'II.' stands alone; the '.' left over
@@ -1896,6 +2001,11 @@ def _apply_min_chars_floor(rows:list, clean_len, max_chars:int, min_chars:int, i
     # independent — one is about a row being too SHORT, the other about it having
     # nothing to say at all.
     rows = _drop_wordless_rows(rows, has_words)
+    # Also before the early return, and reading its own knob: a heading too
+    # short to be VOICED (see _merge_short_headings_forward) is a different
+    # defect from a row too short to sound natural, and SENTENCE_MIN_CHARS=0
+    # must not switch this off.
+    rows = _merge_short_headings_forward(rows, clean_len, max_chars, is_heading, _heading_min_words())
     if min_chars <= 0:
         return rows
     out = list(rows)
