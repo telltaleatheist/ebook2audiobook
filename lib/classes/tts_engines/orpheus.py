@@ -1,7 +1,8 @@
 from lib.classes.tts_engines.common.headers import *
 from lib.classes.tts_engines.common.preset_loader import load_engine_presets
 from lib.classes.tts_engines.common.audio import trim_audio
-from lib.classes.tts_engines.common.orpheus_text import to_tts_form
+from lib.classes.tts_engines.common.orpheus_text import to_tts_form, asr_gate_risk
+from lib.classes.tts_engines.common import asr_gate
 # TEST Step 3c: Direct imports since headers no longer provides them
 import torch
 import torchaudio
@@ -2980,6 +2981,50 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
         except Exception:
             pass
 
+    def _asr_verify_or_retry(self, sentence_index: int, clean: str, audio_np, rerender):
+        """ASR verify gate (census 2026-08-29): on a risk-flagged chunk (see
+        asr_gate_risk — number-word runs and digit clusters, the measured
+        derailment sites), transcribe the generated audio with CPU wav2vec2 and
+        confirm the words were actually spoken. On a >= 4-word hole: keep the
+        bad take as evidence, re-render ONCE (fresh sampling — the derailments
+        are stochastic; the loop campaign's re-render conversion precedent),
+        and keep whichever take scores better. Un-flagged chunks cost nothing;
+        an unavailable ASR stack fails open (asr_gate.check returns ok).
+
+        vLLM path only for now: the MLX (Mac) env's torchaudio is unverified
+        and MLX regeneration semantics differ — extend after a Mac smoke test."""
+        if not asr_gate.gate_enabled():
+            return audio_np
+        risk = asr_gate_risk(clean)
+        if risk is None:
+            return audio_np
+        verdict = asr_gate.check(audio_np, self.SAMPLE_RATE, clean)
+        if verdict['ok']:
+            return audio_np
+        self._keep_reject(sentence_index, clean, audio_np, 'asr_mismatch',
+                          {'risk': risk, 'ratio': verdict['ratio'],
+                           'drop_run': verdict['drop_run'],
+                           'heard': verdict['heard'][:300]})
+        print(f"Orpheus: sentence {sentence_index} failed the ASR gate "
+              f"(risk={risk}, drop_run={verdict['drop_run']}, ratio={verdict['ratio']}); "
+              f"re-rendering once")
+        try:
+            retry_np = rerender(clean)
+        except Exception as retry_err:
+            print(f'Orpheus: ASR-gate re-render failed for sentence {sentence_index} '
+                  f'({retry_err}); keeping the first take')
+            return audio_np
+        retry_verdict = asr_gate.check(retry_np, self.SAMPLE_RATE, clean)
+        keep_retry = retry_verdict['ok'] or retry_verdict['ratio'] >= verdict['ratio']
+        self._emit_guard_event({'reason': 'asr_retry_outcome',
+                                'sentence': sentence_index, 'risk': risk,
+                                'first_ratio': verdict['ratio'],
+                                'retry_ratio': retry_verdict['ratio'],
+                                'retry_ok': retry_verdict['ok'],
+                                'kept': 'retry' if keep_retry else 'first',
+                                'text': clean})
+        return retry_np if keep_retry else audio_np
+
     def _guard_truncation(self, sentence_index: int, clean: str, audio_np, resplit,
                           voice: str = None):
         """Backstop for silent early-EOS truncation (see _speech_rate). If the
@@ -3233,6 +3278,10 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
                     # far LONGER than the text can justify (a heading spoken twice).
                     # Reported only — the take stands; see the SHORT_CHUNK_* block.
                     self._report_short_chunk_overrun(sentence_index, clean, audio_np)
+                    # ASR verify gate: right length, wrong WORDS (mid-chunk
+                    # derailment on dates/citations). Risk-flagged chunks only.
+                    audio_np = self._asr_verify_or_retry(
+                        sentence_index, clean, audio_np, self._generate_audio_vllm_safe)
                 else:
                     audio_np = self._tokens_to_audio(
                         self._generate_tokens_transformers(f"{self.voice}: {clean}")
@@ -3397,6 +3446,11 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
                         # far LONGER than the text can justify. Nothing is deferred
                         # and nothing re-rendered: the take stands and is counted.
                         self._report_short_chunk_overrun(idx, clean, audio_np)
+                        # ASR verify gate: right length, wrong WORDS. Only
+                        # risk-flagged chunks pay the CPU check; a rare failure
+                        # re-renders serially here (census: ~1% of chunks).
+                        audio_np = self._asr_verify_or_retry(
+                            idx, clean, audio_np, self._generate_audio_vllm_safe)
                         results[idx] = self._save_audio(idx, audio_np, gap[0], gap[1])
                     except Exception as decode_err:
                         print(f"Orpheus batch decode error for sentence {idx}: {decode_err}")
