@@ -62,9 +62,34 @@ def _greedy_decode(emission, labels) -> str:
 
 
 def _norm_words(text: str) -> list:
+    # Digits become the words a reader would speak BEFORE the letter filter
+    # strips them — otherwise a citation chunk's expected text loses its
+    # numbers while the transcript keeps them as spoken words, and the ratio
+    # craters on a correct rendition (measured: 'MEMBER NUMBER 670,992' scored
+    # 0.0 against its own audio). Rough cardinal is fine; both sides of a
+    # correct take then agree to within CTC noise.
+    from lib.classes.tts_engines.common.orpheus_text import _big_num_words
+    def dig(m):
+        w = _big_num_words(int(m.group(0)))
+        return ' '.join(w) if w else m.group(0)
+    text = re.sub(r'\d+', lambda m: dig(m) if len(m.group(0)) <= 9 else m.group(0),
+                  text.replace(',', ''))
     text = re.sub(r"[^a-z\s']", ' ', text.lower())
     text = re.sub(r"'", '', text)
     return text.split()
+
+
+def foreign_fraction(text: str) -> float:
+    """Fraction of words carrying non-ASCII letters — a German title or Dutch
+    name is unverifiable by the English CTC model (measured: every consistent
+    double-fail on 2026-08-29 was a foreign span). The caller skips the gate
+    above a threshold rather than burning a retry on a mismatch that can never
+    clear."""
+    words = text.split()
+    if not words:
+        return 0.0
+    foreign = sum(1 for w in words if any(ord(ch) > 127 and ch.isalpha() for ch in w))
+    return foreign / len(words)
 
 
 def check(audio_np, sample_rate: int, expected_text: str) -> dict:

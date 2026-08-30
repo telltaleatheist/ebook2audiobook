@@ -58,6 +58,54 @@ def num_to_words(n: int) -> list[str] | None:
     return w
 
 
+def _big_num_words(n: int) -> list[str] | None:
+    """num_to_words extended past 9999 for the comma-grouped pre-pass ONLY —
+    same style (cardinal, no hyphens, no 'and'), scales to millions. Beyond
+    that a printed number is data, not prose; leave it."""
+    if n < 0 or n > 999_999_999:
+        return None
+    if n < 10000:
+        return num_to_words(n)
+    w = []
+    if n >= 1_000_000:
+        w += num_to_words(n // 1_000_000) + ["million"]
+        n %= 1_000_000
+    if n >= 1000:
+        w += num_to_words(n // 1000) + ["thousand"]
+        n %= 1000
+    if n:
+        w += num_to_words(n)
+    return w
+
+
+_GROUPED_INT_RE = re.compile(r'(?<!\S)([^\w\s]*)(\d{1,3}(?:,\d{3})+)([^\w\s]*)(?!\S)')
+
+
+def expand_grouped_integers(text: str) -> str:
+    """A comma-grouped integer ('670,992') is handed to the model as WORDS.
+
+    Deliberate deviation from the training text form, with the same argument as
+    year_words: the corpora keep '5,000' as printed digits while the narrator
+    SPEAKS the number, and the mapping did not take — measured 2026-08-29
+    (Gods People census + Owen's ear): the model rendered 'MEMBER NUMBER
+    670,992' as digit salad on BOTH of two takes ('six number fifty nine two
+    nine two'). Literal reading is an LLM TTS's most reliable behaviour, so it
+    gets the words it should speak. Token shape mirrors expand_digits: the
+    grouped integer must stand alone between whitespace, modulo punctuation —
+    '$5,000' and '3,450-strong' stay as printed."""
+    def repl(m: re.Match) -> str:
+        # A currency amount reads with its unit ('five thousand dollars'), not
+        # as a bare cardinal — expanding just the digits would strand the '$'.
+        # Out of scope, as promised above: leave money as printed.
+        if any(ch in m.group(1) for ch in '$€£¥'):
+            return m.group(0)
+        words = _big_num_words(int(m.group(2).replace(',', '')))
+        if not words:
+            return m.group(0)
+        return m.group(1) + " ".join(words) + m.group(3)
+    return _GROUPED_INT_RE.sub(repl, text)
+
+
 _YEAR_RE = re.compile(r'1\d{3}|20\d{2}')
 
 
@@ -141,8 +189,10 @@ def normalize_scripture(text: str) -> str:
 
 
 def to_tts_form(text: str) -> str:
-    """The full book-exact -> model-input transform, in training order."""
-    return expand_digits(normalize_scripture(text))
+    """The full book-exact -> model-input transform, in training order (the
+    grouped-integer pass runs first so '670,992' is words before expand_digits
+    sees the text; it never overlaps the other two patterns)."""
+    return expand_digits(normalize_scripture(expand_grouped_integers(text)))
 
 
 # ── ASR verify-gate risk flag (2026-08-29) ───────────────────────────────────

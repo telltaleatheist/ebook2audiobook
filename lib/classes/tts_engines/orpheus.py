@@ -2998,6 +2998,12 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
         risk = asr_gate_risk(clean)
         if risk is None:
             return audio_np
+        # A substantially foreign chunk (German title, Dutch name) is
+        # unverifiable by the English CTC model — every consistent double-fail
+        # measured 2026-08-29 was one of these. Skip rather than burn a retry
+        # on a mismatch that can never clear; the offline census adjudicates.
+        if asr_gate.foreign_fraction(clean) > 0.15:
+            return audio_np
         verdict = asr_gate.check(audio_np, self.SAMPLE_RATE, clean)
         if verdict['ok']:
             return audio_np
@@ -3016,7 +3022,14 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
             return audio_np
         retry_verdict = asr_gate.check(retry_np, self.SAMPLE_RATE, clean)
         keep_retry = retry_verdict['ok'] or retry_verdict['ratio'] >= verdict['ratio']
-        self._emit_guard_event({'reason': 'asr_retry_outcome',
+        # Both takes failing with near-identical scores is a CONSISTENT
+        # mismatch — text the ASR cannot verify, not a stochastic derailment.
+        # Named in the event so the fire-rate telemetry separates real defects
+        # from blind spots.
+        consistent = (not retry_verdict['ok']
+                      and abs(retry_verdict['ratio'] - verdict['ratio']) < 0.05)
+        self._emit_guard_event({'reason': 'asr_consistent_mismatch' if consistent
+                                          else 'asr_retry_outcome',
                                 'sentence': sentence_index, 'risk': risk,
                                 'first_ratio': verdict['ratio'],
                                 'retry_ratio': retry_verdict['ratio'],
