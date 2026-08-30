@@ -143,3 +143,40 @@ def normalize_scripture(text: str) -> str:
 def to_tts_form(text: str) -> str:
     """The full book-exact -> model-input transform, in training order."""
     return expand_digits(normalize_scripture(text))
+
+
+# ── ASR verify-gate risk flag (2026-08-29) ───────────────────────────────────
+# The Gods People census (orpheus-finetune bible, 2026-08-29) measured WHERE the
+# model falls off the text mid-chunk: number-word runs from date expansion
+# ('October fifteen, nineteen forty-four' spoken as 'October 9th, Cineology'),
+# raw digit clusters the transform deliberately leaves as printed (citations:
+# '9201, Bl. 65-71'), and twin anchors that survive the PASS 6 split. Those
+# chunks — ~10-15% of a citation-dense book, far less of plain fiction — are
+# worth an ASR spot-check after generation; the rest are not worth the CPU.
+
+_NUMBER_WORDS = frozenset(
+    "zero one two three four five six seven eight nine ten eleven twelve "
+    "thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty "
+    "thirty forty fifty sixty seventy eighty ninety hundred thousand million "
+    "oh".split())
+
+
+def asr_gate_risk(clean_text: str) -> str | None:
+    """Why this MODEL-INPUT text deserves a post-generation ASR check, or None.
+
+    Takes the text the model actually reads (to_tts_form output). Returns a
+    short reason tag for the guard-event log: 'number-run' (>= 3 consecutive
+    number words — the spoken-date shape), 'digit-cluster' (>= 2 digit-bearing
+    tokens in one window of 6 — the citation shape), or None (no flag; the
+    ordinary case, no ASR cost)."""
+    words = re.sub(r"[^\w\s]", " ", clean_text.lower()).split()
+    run = 0
+    for w in words:
+        run = run + 1 if w in _NUMBER_WORDS else 0
+        if run >= 3:
+            return "number-run"
+    digit_idx = [i for i, w in enumerate(words) if any(ch.isdigit() for ch in w)]
+    for a, b in zip(digit_idx, digit_idx[1:]):
+        if b - a < 6:
+            return "digit-cluster"
+    return None
