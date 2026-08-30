@@ -1684,22 +1684,79 @@ def _split_into_sentences_for_dup(text: str) -> list:
     return [p for p in parts if p]
 
 
+def _twin_anchor_grams(s: str) -> set:
+    """The qualifying 4-grams of a sentence, normalized. A qualifying 4-gram is
+    4 consecutive normalized words totalling >= 14 chars — long enough that two
+    copies inside one generation are a real TWIN ANCHOR (the skip-ahead primer,
+    measured 2026-08-29 on Gods People: attention resolves to the wrong copy and
+    silently deletes the words between — 'which made him unacceptable to X, or
+    …, which made him unacceptable to Y' lost its middle 85 chars), while
+    stock collocations ('at the end of') stay below the length bar."""
+    w = _normalize_for_dup(s).split()
+    return {tuple(w[i:i + 4]) for i in range(len(w) - 3)
+            if sum(len(t) for t in w[i:i + 4]) >= 14}
+
+
+def _split_intra_twin(sent: str) -> list:
+    """Split ONE sentence that contains the same qualifying 4-gram twice, at a
+    comma/semicolon/dash between the two copies — the only safe cut points a
+    mid-sentence boundary has. Each piece must keep its own copy of the anchor
+    and be >= 25 chars, else the sentence is returned unsplit (safe no-op).
+    Only the FIRST twin is targeted; the recursion handles pathological text
+    with several."""
+    grams = _twin_anchor_grams(sent)
+    words = _normalize_for_dup(sent).split()
+    twin = None
+    seen = {}
+    for i in range(len(words) - 3):
+        g = tuple(words[i:i + 4])
+        if g not in grams:
+            continue
+        if g in seen and i - seen[g] >= 4:   # non-overlapping copies only
+            twin = g
+            break
+        seen.setdefault(g, i)
+    if twin is None:
+        return [sent]
+    phrase = ' '.join(twin)
+    for m in re.finditer(r'[,;—–]\s+', sent):
+        left, right = sent[:m.end()].strip(), sent[m.end():].strip()
+        if len(left) < 25 or len(right) < 25:
+            continue
+        if phrase in _normalize_for_dup(left) and phrase in _normalize_for_dup(right):
+            return [left] + _split_intra_twin(right)
+    return [sent]
+
+
 def _split_near_dup_chunk(chunk: str) -> list:
     """Split one packed Orpheus chunk so no single generation contains a
-    near-duplicate sentence pair (the repetition-loop primer; see
-    _is_near_duplicate). Walk the chunk's sentences, starting a NEW sub-chunk
-    whenever the next sentence near-duplicates one already in the current
-    sub-chunk. Returns [chunk] UNCHANGED (exact original text) when nothing
-    splits, so non-repetitive prose keeps its packing boundaries byte-for-byte."""
+    repetition primer: a near-duplicate sentence pair (the LOOP primer; see
+    _is_near_duplicate) or a repeated qualifying 4-gram (the SKIP primer; see
+    _twin_anchor_grams — the same fragility mirrored forward). Walk the chunk's
+    sentences, starting a NEW sub-chunk whenever the next sentence
+    near-duplicates one already in the current sub-chunk OR shares a qualifying
+    4-gram with it; a twin inside a single sentence is pre-split at a comma
+    between the copies (_split_intra_twin). Returns [chunk] UNCHANGED (exact
+    original text) when nothing splits, so non-repetitive prose keeps its
+    packing boundaries byte-for-byte."""
     sents = _split_into_sentences_for_dup(chunk)
-    if len(sents) < 2:
+    if not sents:
         return [chunk]
-    groups = [[sents[0]]]
-    for s in sents[1:]:
-        if any(_is_near_duplicate(m, s) for m in groups[-1]):
+    pieces = []
+    for s in sents:
+        pieces.extend(_split_intra_twin(s))
+    if len(pieces) < 2:
+        return [chunk]
+    groups = [[pieces[0]]]
+    group_grams = _twin_anchor_grams(pieces[0])
+    for s in pieces[1:]:
+        sg = _twin_anchor_grams(s)
+        if any(_is_near_duplicate(m, s) for m in groups[-1]) or (sg & group_grams):
             groups.append([s])
+            group_grams = sg
         else:
             groups[-1].append(s)
+            group_grams |= sg
     if len(groups) < 2:
         return [chunk]
     return [' '.join(g) for g in groups]
