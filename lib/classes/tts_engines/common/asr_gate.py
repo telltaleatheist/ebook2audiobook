@@ -50,10 +50,12 @@ def _load():
 
 
 def _greedy_decode(emission, labels) -> str:
+    # Index 0 is the CTC blank in torchaudio's wav2vec2 bundles (its label
+    # prints as '-', which is NOT a hyphen in the output alphabet).
     prev = -1
     out = []
     for idx in emission.argmax(-1).tolist():
-        if idx != prev and labels[idx] not in ('<s>', '<pad>', '<unk>'):
+        if idx != prev and idx != 0 and labels[idx] not in ('<s>', '<pad>', '<unk>'):
             out.append(labels[idx])
         prev = idx
     return ''.join(out).replace('|', ' ').strip()
@@ -95,5 +97,8 @@ def check(audio_np, sample_rate: int, expected_text: str) -> dict:
             worst = max(worst, i2 - i1)
         elif op == 'replace' and i2 - i1 >= 5 and (i2 - i1) - (j2 - j1) >= 3:
             worst = max(worst, i2 - i1)
-    return {'ok': worst < 4, 'ratio': round(sm.ratio(), 3),
-            'drop_run': worst, 'heard': heard}
+    ratio = round(sm.ratio(), 3)
+    # ratio floor: a transcript that broadly disagrees with the text is a fail
+    # even without one long hole (a garble is substitutions, not deletions).
+    ok = worst < 4 and ratio >= 0.5
+    return {'ok': ok, 'ratio': ratio, 'drop_run': worst, 'heard': heard}
