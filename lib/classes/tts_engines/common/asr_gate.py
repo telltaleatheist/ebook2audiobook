@@ -15,7 +15,18 @@ same thresholds against whisper output and every flagged case was real.
 
 Fail-open by design: if torch/torchaudio are missing (Mac MLX env, stripped
 installs) the gate reports itself unavailable once and every check passes.
-Disable explicitly with ORPHEUS_ASR_GATE=0.
+
+OFF BY DEFAULT since 2026-08-31 (Owen: "remove the gate. its causing more
+problems than it solves. its doubling the render time"). The live gate's
+false-positive tax outweighed its catch rate: on name-dense scholarly text
+(Black Sun) the CTC transcriber cannot spell foreign proper nouns, titles,
+or spelled acronyms, so correct readings score below the ratio floor and
+~1 chunk in 8 paid a full GPU re-render — throughput 120 -> 72 sent/min.
+In the same window the gate's only true catch was a harmless date-order
+paraphrase. Per the fixes-over-gates doctrine it remains available as an
+explicit DIAGNOSTIC instrument: set ORPHEUS_ASR_GATE=1 to run it (e.g. for
+a census pass); reference-text normalization for acronyms/foreign nouns is
+the precondition for any return to default-on.
 """
 import difflib
 import os
@@ -26,7 +37,8 @@ _UNAVAILABLE = False    # import or load failed — gate passes everything
 
 
 def gate_enabled() -> bool:
-    return os.environ.get('ORPHEUS_ASR_GATE', '1') != '0'
+    # Default OFF (2026-08-31, see module docstring) — opt in with =1.
+    return os.environ.get('ORPHEUS_ASR_GATE', '0') == '1'
 
 
 def _load():
