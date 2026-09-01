@@ -2981,6 +2981,63 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
         except Exception:
             pass
 
+    _CHUNK_CSV_SENTINEL = None   # cached: False = checked and absent
+
+    def _chunk_csv_sentinel(self):
+        """BookForge only forwards allowlisted ORPHEUS_* vars into the WSL
+        subshell, so the CSV toggle can also live in a sentinel file:
+        ~/.orpheus_chunk_csv containing the destination path. Checked once per
+        process."""
+        cls = type(self)
+        if cls._CHUNK_CSV_SENTINEL is None:
+            try:
+                sentinel = os.path.expanduser('~/.orpheus_chunk_csv')
+                if os.path.exists(sentinel):
+                    with open(sentinel, encoding='utf-8') as handle:
+                        cls._CHUNK_CSV_SENTINEL = handle.read().strip() or False
+                else:
+                    cls._CHUNK_CSV_SENTINEL = False
+            except Exception:
+                cls._CHUNK_CSV_SENTINEL = False
+        return cls._CHUNK_CSV_SENTINEL or None
+
+    def _log_chunk_stats(self, idx, clean, out, audio_np):
+        """T0 instrumentation (THROUGHPUT_INVESTIGATION.md): one CSV line per
+        generation. Inert unless ORPHEUS_CHUNK_CSV names a file. Best-effort —
+        diagnostics must never fail a render.
+
+        Columns: sentence_index, chars, prompt_tokens, generated_tokens,
+        eos_emitted, decoded_audio_seconds (pre-trim), unix_time. Wasted tail =
+        decoded seconds minus what survives in the saved FLAC; tokens per KEPT
+        audio second is the figure that separates "model is slow" from "model
+        generates audio we throw away"."""
+        path = os.environ.get('ORPHEUS_CHUNK_CSV') or self._chunk_csv_sentinel()
+        if not path:
+            return
+        try:
+            import time as _time
+            gen_ids = list(out.outputs[0].token_ids)
+            n_prompt = len(out.prompt_token_ids) if getattr(out, 'prompt_token_ids', None) else 0
+            secs = (len(audio_np) / self.SAMPLE_RATE) if audio_np is not None and len(audio_np) else 0.0
+            with open(path, 'a', encoding='utf-8') as handle:
+                handle.write(f'{idx},{len(clean)},{n_prompt},{len(gen_ids)},'
+                             f'{int(self.END_OF_AUDIO_TOKEN in gen_ids)},{secs:.3f},{_time.time():.3f}\n')
+        except Exception:
+            pass
+
+    def _log_batch_stats(self, n_prompts, wall_s):
+        """Companion batch line for _log_chunk_stats: BATCH,n_prompts,wall_ms.
+        Same file, same gating, same best-effort contract."""
+        path = os.environ.get('ORPHEUS_CHUNK_CSV') or self._chunk_csv_sentinel()
+        if not path:
+            return
+        try:
+            import time as _time
+            with open(path, 'a', encoding='utf-8') as handle:
+                handle.write(f'BATCH,{n_prompts},{wall_s*1000:.0f},{_time.time():.3f}\n')
+        except Exception:
+            pass
+
     def _asr_verify_or_retry(self, sentence_index: int, clean: str, audio_np, rerender):
         """ASR verify gate (census 2026-08-29): on a risk-flagged chunk (see
         asr_gate_risk — number-word runs and digit clusters, the measured
@@ -3405,12 +3462,15 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
                 # calls — the use_tqdm fallback without it would render the base voice.
                 lora_request = self._lora_request()
                 # use_tqdm=False: a per-call progress bar adds overhead and noise.
+                import time as _time_t0
+                _batch_t0 = _time_t0.time()
                 try:
                     outputs = self.engine.generate(prompts, sampling_params, use_tqdm=False,
                                                    lora_request=lora_request)
                 except TypeError:
                     outputs = self.engine.generate(prompts, sampling_params,
                                                    lora_request=lora_request)
+                self._log_batch_stats(len(prompts), _time_t0.time() - _batch_t0)
                 # Chunks whose audio came back truncated are NOT re-rendered here. The
                 # verdict (_needs_resplit) is pure text-vs-audio, and the force-split
                 # re-render is deterministic — the split follows from the text alone —
@@ -3448,6 +3508,7 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
                                               {'tokens_emitted': len(tokens),
                                                'token_cap': self.MAX_AUDIO_TOKENS})
                             audio_np = self._generate_audio_vllm_safe(clean)
+                        self._log_chunk_stats(idx, clean, out, audio_np)
                         # Backstop a silent early-EOS truncation (clean EOS, audio too
                         # short for the text) that the cap check above can't catch.
                         # Only the VERDICT is taken here; the re-render is pooled.
