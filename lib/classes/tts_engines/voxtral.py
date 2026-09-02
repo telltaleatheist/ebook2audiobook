@@ -279,9 +279,10 @@ class Voxtral(TTSUtils, TTSRegistry, name='voxtral'):
 
             sentence = sentence.strip()
             # Strip e2a SML tags Voxtral doesn't understand — including the
-            # [heading] marker, which is markup for the splitter only and must
-            # never be spoken (2026-08-27; the alternation lives in conf_models
-            # now, shared with orpheus.py and f5.py).
+            # [heading] and [item] markers, which are markup for the splitter
+            # only and must never be spoken (2026-08-27 / 2026-09-01; the
+            # alternation lives in conf_models now, shared with orpheus.py and
+            # f5.py, which is why [item] needed no change here).
             sentence = SML_UNSPOKEN_PATTERN.sub('', sentence).strip()
 
             if not sentence:

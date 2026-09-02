@@ -433,7 +433,9 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
     #
     # Scope: chars < SHORT_CHUNK_MAX_CHARS only — 25 is core.py's SENTENCE_MIN_CHARS
     # default, i.e. exactly the rows _apply_min_chars_floor used to merge away and
-    # now exempts when they are headings. Nothing longer is judged at all. Set
+    # now exempts when they are headings or LIST ITEMS (2026-09-01: a one-word
+    # `<li>fourteen</li>` is 9 chars and stands alone, so short list items are now
+    # a second population arriving here). Nothing longer is judged at all. Set
     # ORPHEUS_SHORT_CHUNK_CHARS=0 to silence the report entirely (the same
     # "0 disables" convention as the sentence gap and the min-chars floor).
     #
@@ -2760,11 +2762,14 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
 
     def _clean_sentence_for_tts(self, sentence: str) -> str:
         """Strip whitespace + the e2a SML tags Orpheus doesn't understand
-        (SML_UNSPOKEN_PATTERN: [break]/[pause]/[heading]/[music]/[sfx]/[silence]);
+        (SML_UNSPOKEN_PATTERN:
+        [break]/[pause]/[heading]/[item]/[music]/[sfx]/[silence]);
         Orpheus has its own emotion tags. 2026-08-27: the alternation used to be
         spelled out here, and identically in voxtral.py and f5.py — it moved to
         conf_models so the [heading] marker (and anything after it) cannot be
-        taught to one engine and missed by the other two.
+        taught to one engine and missed by the other two. [item], added
+        2026-09-01, is exactly that "anything after it" and needed no change
+        here.
 
         Then apply the book-exact -> model transform (to_tts_form: scripture refs
         + bare-integer expansion, the exact transforms the fine-tunes trained

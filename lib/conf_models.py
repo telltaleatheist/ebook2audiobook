@@ -54,22 +54,53 @@ TTS_SML = {
 	# 2026-07-17 ruling that removed Orpheus' paragraph/section gap tiers stands
 	# — isolation is the behavior being asked for here, not a longer pause.
 	"heading": {"static": "[heading]", "paired": False},
+	# LIST-ITEM MARKER (2026-09-01) — each <li> is its own TTS chunk.
+	#
+	# Orpheus' end-of-speech failure CONCENTRATES on enumerated list text: when
+	# several list items are packed into one ~350-500 char chunk, the model
+	# re-speaks the final list phrase instead of stopping. Measured across 25 runs
+	# of the 272-draw loop battery — the worst text in the whole battery is a
+	# numbered list. Prose of the same length does not do this, so the fix is
+	# structural: an item never shares a generation with a neighbouring item or
+	# with the prose around it.
+	#
+	# Same carrier as [heading] and for the same reason: filter_chapter's walker
+	# is the only place that still knows a run of text came from an <li>, and it
+	# threw that identity away at the ' '.join — consecutive items welded into one
+	# prose row before get_sentences ever saw them. This marker sits on the
+	# LEADING edge of the item's first row and means "a new list item starts
+	# here". NON-PAIRED for the reason spelled out above: a closing half never
+	# lands on the row it belongs to (ROW_END terminates a row AT the next escaped
+	# token), and normalize_sml_tags rejects [/tag] for a non-paired tag anyway.
+	#
+	# NOT the same rule as [heading] though. An item is not emitted ALONE: all of
+	# ONE item's sentences pack together up to max_chars (a two-sentence item is
+	# one chunk), which is why the packers treat the marker as a RUN BOUNDARY
+	# rather than as an unpackable row. See the PASS 5 / Voxtral packers.
+	#
+	# It realizes NO silence — pure markup, like [heading]. The chunk gets the
+	# same sentence-gap tail every other chunk gets; the 2026-07-17 ruling that
+	# removed Orpheus' paragraph/section gap tiers stands.
+	"item": {"static": "[item]", "paired": False},
 }
 
 # THE tags no engine ever SPEAKS, as ONE pattern.
 #
 # Timing tags ([break]/[pause]) are realized as silence before this point and
-# [heading] is pure markup, so by the time text reaches a model — or a VTT cue,
-# or an m4b chapter title — none of them may still be in it. This used to be a
-# hand-rolled alternation copied into five places that had already drifted apart
-# (the two VTT builders omitted 'pause' outright, so a cue could read "[pause]"),
-# and adding [heading] in 2026-08-27 would have made it six. One pattern, so a
-# tag can never again be taught to some readers and missed by the rest.
+# [heading]/[item] are pure markup, so by the time text reaches a model — or a
+# VTT cue, or an m4b chapter title — none of them may still be in it. This used
+# to be a hand-rolled alternation copied into five places that had already
+# drifted apart (the two VTT builders omitted 'pause' outright, so a cue could
+# read "[pause]"), and adding [heading] in 2026-08-27 would have made it six. One
+# pattern, so a tag can never again be taught to some readers and missed by the
+# rest — which is why adding [item] on 2026-09-01 was a one-line change here and
+# nowhere else: every strip site, the three VTT builders and the m4b chapter-title
+# sanitizer included, already reads this pattern.
 #
 # The optional '/' matches a closing form; none of these tags is paired today,
 # but stripping '[/x]' is never wrong for a tag that is never spoken.
 SML_UNSPOKEN_PATTERN = re.compile(
-	r'\[/?(?:break|pause|heading|music|sfx|silence)(?::[^\]]+)?\]',
+	r'\[/?(?:break|pause|heading|item|music|sfx|silence)(?::[^\]]+)?\]',
 	re.IGNORECASE
 )
 
@@ -101,6 +132,11 @@ def vtt_cue_text(sentence:str, strip_pattern)->str:
 
 	The heading test MUST run before stripping: every strip_pattern that reaches
 	this function deletes the [heading] marker that carries the fact.
+
+	BOLD IS HEADING-ONLY. The [item] marker added 2026-09-01 rides the same rows
+	and is erased here by the same strip_pattern (it is in SML_UNSPOKEN_PATTERN,
+	and SML_TAG_PATTERN covers every TTS_SML key), but a list item is not a
+	heading and its cue is written plain — nothing here tests for it.
 
 	strip_pattern is the caller's, because the two families legitimately differ
 	and unifying them is a separate question: the two build_vtt_file copies pass

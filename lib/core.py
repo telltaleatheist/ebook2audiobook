@@ -1063,7 +1063,12 @@ def _collapse_glue(rows:list)->list:
     This is deliberately NOT a drop-cap detector: it never looks at letter case
     or word length. `<span>A</span>braham Lincoln` joins because the markup has
     no space; `<span>I</span> can hardly say` keeps its space because the markup
-    has one; and a plain "A man walked" was never two rows to begin with."""
+    has one; and a plain "A man walked" was never two rows to begin with.
+
+    The ('item_start'|'item_end', None) markers (2026-09-01) pass through here
+    untouched, like every other non-text row: they carry no payload to glue and
+    resolve no whitespace question — the boundary they stand for is the
+    consumer's to draw."""
     out = []
     glued = False
     suppressed = None
@@ -1145,6 +1150,44 @@ def filter_chapter(idx:int, doc:EpubHtml, session_id:str, stanza_nlp:Pipeline, i
                             yield ('break', sml_token("break"))
                         yield ('table', child)
                         current_child_had_data = True
+                    elif name == 'li':
+                        # A LIST ITEM IS ITS OWN CHUNK (2026-09-01). Handled here
+                        # beside 'heading'/'table' and deliberately NOT by adding
+                        # 'li' to break_tags: a break alone is not enough. The
+                        # boundary it makes is erased downstream — PASS 4/5 pack
+                        # straight across a [break], which is the whole point of
+                        # the 2026-08-10 pack-across-pauses change — so several
+                        # items still landed in one generation, which is the text
+                        # Orpheus re-speaks the end of. The item_start/item_end
+                        # pair carries the IDENTITY the packers refuse to cross;
+                        # see TTS_SML['item'].
+                        #
+                        # ul/ol stay transparent: they hold no text of their own,
+                        # and their whitespace-only children already set
+                        # ws_pending, so nothing welds across the list's edges
+                        # that would not have welded across a <span>'s.
+                        if prev_child_had_data:
+                            yield ('break', sml_token("break"))
+                        yield ('item_start', None)
+                        # Same recursion the proc_tags branch does — an item's
+                        # content is ordinary markup (inline emphasis, nested
+                        # <p>, a nested <ul> whose own <li> get their own
+                        # markers) and last_text_char must keep flowing through
+                        # it so _close_block still sees the item's real last
+                        # character at item_end.
+                        for inner in _tuple_row(child, last_text_char):
+                            yield inner
+                            if len(inner) > 1 and isinstance(inner[1], str) and inner[1]:
+                                last_text_char = inner[1][-1]
+                            current_child_had_data = True
+                        yield ('item_end', None)
+                        if current_child_had_data:
+                            # The item is CLOSED before whatever follows it. The
+                            # next sibling <li> emits its own leading break too
+                            # and the consumer collapses the pair, but the sibling
+                            # after a list is not always an <li> — a bare text
+                            # node after `</ul>` would otherwise reach across.
+                            yield ('break', sml_token("break"))
                     else:
                         return_data = False
                         if name in proc_tags:
@@ -1194,7 +1237,7 @@ def filter_chapter(idx:int, doc:EpubHtml, session_id:str, stanza_nlp:Pipeline, i
                     # Whitespace state AFTER this tag. Block-level boxes always end the
                     # run; an inline tag carries its own trailing whitespace, and one
                     # that emitted nothing must not clear a space already pending.
-                    if (name in heading_tags or name == 'table' or name in pause_tags
+                    if (name in heading_tags or name == 'table' or name == 'li' or name in pause_tags
                             or (name in break_tags and name != 'span')):
                         ws_pending = True
                     elif current_child_had_data:
@@ -1288,7 +1331,8 @@ def filter_chapter(idx:int, doc:EpubHtml, session_id:str, stanza_nlp:Pipeline, i
                 tag.decompose()
             # Resolve the whitespace-fidelity markers before anything reads the
             # rows: what leaves _collapse_glue is the same ('text'|'heading'|
-            # 'break'|'pause'|'table') stream the loop below has always consumed.
+            # 'break'|'pause'|'table'|'item_start'|'item_end') stream the loop
+            # below has always consumed.
             tuples_list = _collapse_glue(list(_tuple_row(body)))
             if not tuples_list:
                 error = 'No tuples_list from body created!'
@@ -1321,6 +1365,11 @@ def filter_chapter(idx:int, doc:EpubHtml, session_id:str, stanza_nlp:Pipeline, i
             prev_typ = None
             last_heading_normalized = None  # Track last heading to deduplicate body text
             chapter_title_normalized = None  # First heading of the chapter — suppress later echoes anywhere
+            # Set by 'item_start' and consumed by the FIRST body text appended
+            # inside that item (2026-09-01). One flag, not a depth counter: the
+            # marker says "a list item starts HERE", and a nested <li> starts a
+            # new item of its own, so re-arming it is exactly right.
+            item_pending = False
             sml_statics = {v['static'] for v in TTS_SML.values() if 'static' in v}
 
             def _close_block(items):
@@ -1374,6 +1423,32 @@ def filter_chapter(idx:int, doc:EpubHtml, session_id:str, stanza_nlp:Pipeline, i
                         last_heading_normalized = norm
                         if chapter_title_normalized is None:
                             chapter_title_normalized = norm
+                elif typ == 'item_start':
+                    # EVERY ITEM STARTS ON A PARAGRAPH BOUNDARY (2026-09-01),
+                    # exactly what the walker manufactures for a heading: close
+                    # the block behind it (so an intro line ending in a bare
+                    # letter gets its period and cannot weld into item one) and
+                    # put a [break] there if the boundary is not already marked.
+                    # The break matters even though the packers cross it — it is
+                    # what keeps PASS 1 from running a row on THROUGH the item's
+                    # marker, and a row that ends before a token is what makes
+                    # "the first row of an item is the one carrying its marker"
+                    # true by construction.
+                    _close_block(text_list)
+                    if prev_typ not in ('break', 'pause') and text_list:
+                        text_list.append(sml_token('break'))
+                    item_pending = True
+                elif typ == 'item_end':
+                    # THE PERIOD AN ITEM NEEDS. `<li>fourteen</li>` ends in a
+                    # letter and would otherwise weld to the next item at the
+                    # ' '.join below. This is why the marker is a PREFIX and not
+                    # a wrapper: _close_block tests `last[-1].isalnum()`, so it
+                    # still sees the item's own last character.
+                    _close_block(text_list)
+                    # Cleared unconditionally — an item that yielded no text at
+                    # all (`<li></li>`, `<li><img/></li>`) must not leave the
+                    # marker armed for whatever prose comes after the list.
+                    item_pending = False
                 elif typ in ('break', 'pause'):
                     _close_block(text_list)
                     if prev_typ != typ:
@@ -1437,6 +1512,21 @@ def filter_chapter(idx:int, doc:EpubHtml, session_id:str, stanza_nlp:Pipeline, i
                             # Marking it does not change what is spoken, only how
                             # it is chunked.
                             text_list.append(sml_heading(text))
+                            # A TOC title inside a list is a heading and nothing
+                            # else — one marker per row, and the heading rule is
+                            # the stronger one (it forbids merging outright,
+                            # where the item rule only bounds a pack). The
+                            # pending mark is spent, not carried to the item's
+                            # second line.
+                            item_pending = False
+                        elif item_pending:
+                            # FIRST body text of this <li> — the marker goes here
+                            # and only here (2026-09-01). An item's later
+                            # sentences are ordinary rows; what makes them part of
+                            # this item is that they carry NO token at all, which
+                            # is precisely what the packers key on.
+                            text_list.append(sml_item(text))
+                            item_pending = False
                         else:
                             text_list.append(text)
                 prev_typ = typ
@@ -1910,7 +2000,14 @@ def _merge_short_headings_forward(rows:list, clean_len, max_chars:int, is_headin
 
     Runs BEFORE the min-chars floor's own loop and independently of it: the
     floor is about prompts too short to sound natural, this is about prompts too
-    short to be voiced at all, and disabling one must not disable the other."""
+    short to be voiced at all, and disabling one must not disable the other.
+
+    HEADINGS ONLY, and NOT extended to the [item] marker (2026-09-01). The trade
+    this pass makes — isolation for the guarantee of being spoken — only works
+    because a demoted heading joins the text it already belongs to. A demoted
+    list item would join a DIFFERENT item, which is the exact weld [item] exists
+    to forbid, so a one-word `<li>fourteen</li>` keeps its isolation and the
+    render-side re-roll backstop guards it."""
     if min_words <= 0:
         return rows
     out = list(rows)
@@ -1972,38 +2069,50 @@ def _has_escaped_sml(s:str)->bool:
     return any(ord(c) >= sml_escape_tag for c in s)
 
 
-def _heading_row_test(sml_blocks:list[str]):
+def _marker_row_test(sml_blocks:list[str], tag:str):
     """Build THE predicate every merge pass asks before it glues a row to a
-    neighbour: "is this row a section heading?" (2026-08-27)
+    neighbour: "does this row carry the <tag> marker?" (2026-08-27; generalized
+    from headings to any structural marker 2026-09-01)
 
-    filter_chapter marks a heading with the [heading] token on the row's leading
-    edge, and escape_sml has since replaced that token with ONE char whose INDEX
-    into sml_blocks is its whole identity — inside get_sentences an escaped token
-    is otherwise opaque, which is why sml_blocks has to come in with the text.
-    So the question reduces to "does this row carry a char that stands for
-    [heading]", and the answer is precomputed once per chapter.
+    filter_chapter marks a heading with the [heading] token, and a list item with
+    the [item] token, on the row's leading edge; escape_sml has since replaced
+    that token with ONE char whose INDEX into sml_blocks is its whole identity —
+    inside get_sentences an escaped token is otherwise opaque, which is why
+    sml_blocks has to come in with the text. So the question reduces to "does
+    this row carry a char that stands for [<tag>]", and the answer is precomputed
+    once per chapter.
 
-    ONE predicate, built here and passed to all three merge passes
+    ONE predicate per marker, built here and passed to all three merge passes
     (_apply_min_chars_floor, the Orpheus PASS 5 packer, the Voxtral packer).
-    Three hand-rolled edge checks would drift apart, and the existing
+    Hand-rolled edge checks in each pass would drift apart, and the existing
     _has_escaped_sml/_plain tests cannot answer this: they look at a row's CORE,
     and the marker sits on the LEAD, where they are blind to it.
 
+    What the answer MEANS is the caller's business and the two markers differ: a
+    heading may not be merged into anything at all, while an item merely bounds a
+    pack (all of one item's sentences still pack together). Both need the same
+    question asked, which is why this is one function and not two.
+
     The whole row is searched rather than just its lead, so a row that carries
-    the marker anywhere — however it got there — is one no pass may merge."""
+    the marker anywhere — however it got there — is one every pass can see."""
     marks = set()
     for i, block in enumerate(sml_blocks):
         m = SML_TAG_PATTERN.fullmatch(block)
-        if m and m.group('tag') == 'heading':
+        if m and m.group('tag') == tag:
             marks.add(chr(sml_escape_tag + i))
 
-    def _is_heading_row(row:str)->bool:
+    def _is_marker_row(row:str)->bool:
         return bool(marks) and any(c in marks for c in row)
 
-    return _is_heading_row
+    return _is_marker_row
 
 
-def _apply_min_chars_floor(rows:list, clean_len, max_chars:int, min_chars:int, is_heading, has_words)->list:
+def _heading_row_test(sml_blocks:list[str]):
+    """The heading predicate — see _marker_row_test, which this names."""
+    return _marker_row_test(sml_blocks, 'heading')
+
+
+def _apply_min_chars_floor(rows:list, clean_len, max_chars:int, min_chars:int, is_heading, is_item, has_words)->list:
     """Merge every row whose engine-read text is shorter than min_chars into a
     neighbour, so a one-word paragraph ('No.') is never handed to TTS as its own
     ultra-short prompt. FORWARD first (the tiny row leads into the sentence that
@@ -2017,18 +2126,32 @@ def _apply_min_chars_floor(rows:list, clean_len, max_chars:int, min_chars:int, i
     the one exemption that IGNORES length: a two-character heading still stands
     alone. is_heading is the shared predicate from _heading_row_test.
 
+    LIST ITEMS ARE EXEMPT ON THE SAME TERMS (2026-09-01, Owen's ruling: a short
+    list item is NOT merged into its neighbour), and REGARDLESS OF LENGTH —
+    'fourteen.' is 9 chars and still stands alone. The exemption is the whole
+    point of marking the item: by the time this pass runs the packers have
+    already gathered each item's own sentences into one chunk, and every merge
+    left for the floor to make would be the one thing the marker exists to
+    forbid — welding one item onto the next, or onto the prose around the list,
+    which is the text Orpheus re-speaks the end of. Unlike headings there is NO
+    word-count narrowing: _merge_short_headings_forward is deliberately not
+    extended to items, because a demoted heading merely joins its own paragraph
+    while a demoted item joins a DIFFERENT item. is_item is _marker_row_test's
+    'item' predicate.
+
     NARROWED 2026-08-29: the exemption is for headings of HEADING_MIN_WORDS
     words or more. A shorter heading is merged FORWARD by
     _merge_short_headings_forward before this loop runs — Orpheus can fail to
     voice an ultra-short prompt at all, and an unread chapter title is worse
     than one that flows into its first paragraph.
 
-    THE EXEMPTION IS FOR HEADINGS WITH WORDS IN THEM (2026-08-29).
-    _drop_wordless_rows runs FIRST, so by the time the exemption is consulted no
-    row — heading or not — is still wordless. 'II.' stands alone; the '.' left over
-    from a `<h2>• Silo 1 •</h2>` never reaches this pass to be exempted. That
-    order is the fix: the exemption made a wordless heading unmergeable, which is
-    how 30 chunks reading '.' shipped in one book (see _drop_wordless_rows).
+    THE EXEMPTION IS FOR ROWS WITH WORDS IN THEM (2026-08-29).
+    _drop_wordless_rows runs FIRST, so by the time either exemption is consulted
+    no row — heading, item or plain — is still wordless. 'II.' stands alone; the
+    '.' left over from a `<h2>• Silo 1 •</h2>`, and an `<li>•</li>` with nothing
+    but decoration in it, never reach this pass to be exempted. That order is the
+    fix: the exemption made a wordless heading unmergeable, which is how 30
+    chunks reading '.' shipped in one book (see _drop_wordless_rows).
 
     THIS PASS IS THE LAST WORD ON WORDLESSNESS for every engine, because it runs
     last on every return path. Neither packer can undo it — both only ever
@@ -2069,11 +2192,38 @@ def _apply_min_chars_floor(rows:list, clean_len, max_chars:int, min_chars:int, i
     i = 0
     while i < len(out):
         lead, core, trail = _split_sml_edges(out[i])
-        if is_heading(out[i]):
+        if is_heading(out[i]) or is_item(out[i]):
+            # A SHORT ITEM ROW MAY STILL GATHER ITS OWN NEXT SENTENCE (2026-09-01).
+            # The engines with a packer (Orpheus PASS 5, Voxtral) never present
+            # this case — they have already packed the item's sentences into one
+            # chunk. The engines WITHOUT one (XTTS-class, F5) hand this pass the
+            # PASS 1-4 rows as they are, so a two-sentence item arrives as
+            # '[item]13.' + 'A printer is represented by a press.' — and the
+            # exemption below, left alone, would ship '13.' as a 9-char chunk
+            # and strand the item's text in the next one, which is the exact
+            # split the spec forbids ("ordinals stay attached to their item
+            # text"). The row that is safe to gather is recognisable by shape:
+            # it is the IMMEDIATELY following row and it carries NO token at all
+            # — the packers' own rule — because the next item and the prose
+            # after the list always open on a [break]. The lead (and with it the
+            # marker) is kept, so the merged row is still this item and the loop
+            # re-examines it: a three-sentence item gathers twice. This is a
+            # merge WITHIN one item, never between items, and it does not touch
+            # headings.
+            if (is_item(out[i]) and not is_heading(out[i]) and core
+                    and clean_len(out[i]) < min_chars and i + 1 < len(out)
+                    and not _has_escaped_sml(out[i + 1])
+                    and not is_heading(out[i + 1]) and not is_item(out[i + 1])):
+                merged = f'{lead}{core} {out[i + 1].strip()}'
+                if clean_len(merged) <= max_chars:
+                    out[i:i + 2] = [merged]
+                    print(f'get_sentences() min-chars floor: short list item gathered its own next sentence: {_strip_escaped_sml(core)!r}')
+                    continue
             # Its own chunk, whatever its length. Reported only when the floor
             # would otherwise have eaten it, so the log says what changed.
             if core and clean_len(out[i]) < min_chars:
-                print(f'get_sentences() min-chars floor: heading kept as its own row: {_strip_escaped_sml(core)!r}')
+                kind = 'heading' if is_heading(out[i]) else 'list item'
+                print(f'get_sentences() min-chars floor: {kind} kept as its own row: {_strip_escaped_sml(core)!r}')
             i += 1
             continue
         if not core or clean_len(out[i]) >= min_chars:
@@ -2092,7 +2242,10 @@ def _apply_min_chars_floor(rows:list, clean_len, max_chars:int, min_chars:int, i
             next_lead, next_core, next_trail = _split_sml_edges(out[j])
             # …and never merge a short row INTO a heading: the header would stop
             # being the chunk's whole content, which is the point of marking it.
-            if not _has_escaped_sml(next_core) and not is_heading(out[j]):
+            # Nor into a list ITEM: the row in front of a list is the prose the
+            # list belongs to, and gluing it onto item one is the weld the marker
+            # exists to forbid.
+            if not _has_escaped_sml(next_core) and not is_heading(out[j]) and not is_item(out[j]):
                 merged = f'{lead}{core} {next_core}{next_trail}'
                 if clean_len(merged) <= max_chars:
                     dropped = len(trail) + len(next_lead) + sum(
@@ -2109,8 +2262,9 @@ def _apply_min_chars_floor(rows:list, clean_len, max_chars:int, min_chars:int, i
             k -= 1
         if k >= 0:
             prev_lead, prev_core, prev_trail = _split_sml_edges(out[k])
-            # Symmetric refusal: a heading is not a landing site backwards either.
-            if not _has_escaped_sml(prev_core) and not is_heading(out[k]):
+            # Symmetric refusal: neither a heading nor a list item is a landing
+            # site backwards either.
+            if not _has_escaped_sml(prev_core) and not is_heading(out[k]) and not is_item(out[k]):
                 merged = f'{prev_lead}{prev_core} {core}{trail}'
                 if clean_len(merged) <= max_chars:
                     dropped = len(prev_trail) + len(lead) + sum(
@@ -2129,7 +2283,8 @@ def get_sentences(text:str, session_id:str, sml_blocks:list[str])->list|None:
     # sml_blocks is escape_sml's block table for THIS text, and it comes in
     # because an escaped token is otherwise an anonymous char here: the merge
     # passes below have to be able to ask which token a char stands for, to keep
-    # a section heading out of every merge (2026-08-27, _heading_row_test).
+    # a section heading out of every merge (2026-08-27) and to keep each list
+    # item in a pack of its own (2026-09-01). See _marker_row_test.
 
     def split_inclusive(text:str, pattern:re.Pattern[str])->list[str]:
         result = []
@@ -2299,8 +2454,11 @@ def get_sentences(text:str, session_id:str, sml_blocks:list[str])->list|None:
         # their own starved TTS prompt.
         min_chars = _sentence_min_chars()
 
-        # The ONE heading test, shared by every merge pass below (2026-08-27).
+        # The structural-marker tests, shared by every merge pass below
+        # (heading 2026-08-27, item 2026-09-01). One predicate per marker, built
+        # once per chapter — see _marker_row_test.
         is_heading = _heading_row_test(sml_blocks)
+        is_item = _marker_row_test(sml_blocks, 'item')
 
         # Orpheus rows are stored/displayed BOOK-EXACT; the scripture+digit
         # expansion happens at the engine boundary (_clean_sentence_for_tts).
@@ -2581,6 +2739,16 @@ def get_sentences(text:str, session_id:str, sml_blocks:list[str])->list|None:
                 # chunk it landed in. A marked heading now both starts its own
                 # chunk and ends it: the row after a heading opens a fresh chunk
                 # rather than being appended to the header's.
+                #
+                # A LIST ITEM NEVER SHARES ONE EITHER (2026-09-01), but it is a
+                # weaker rule than the heading's: an item's OWN sentences still
+                # pack together. A marked row opens a fresh chunk, and that chunk
+                # then accepts only TOKEN-FREE rows — which is exactly the item's
+                # remaining sentences. PASS 1 ends a row immediately before any
+                # escaped token and lets a row START on tokens, so the first row
+                # of the NEXT item (or of the paragraph after the list) always
+                # carries one and always opens a chunk of its own. Mirrors the
+                # Orpheus PASS 5 rule below; see TTS_SML['item'].
                 packed = []
                 for s in final_list:
                     s = s.strip()
@@ -2589,11 +2757,14 @@ def get_sentences(text:str, session_id:str, sml_blocks:list[str])->list|None:
                     if is_heading(s) or (packed and is_heading(packed[-1])):
                         packed.append(s)
                         continue
+                    if is_item(s) or (packed and is_item(packed[-1]) and _has_escaped_sml(s)):
+                        packed.append(s)
+                        continue
                     if packed and clean_len(packed[-1]) + 1 + clean_len(s) <= max_chars:
                         packed[-1] = packed[-1].rstrip() + ' ' + s.lstrip()
                     else:
                         packed.append(s)
-                return _apply_min_chars_floor(packed, clean_len, max_chars, min_chars, is_heading, has_words)
+                return _apply_min_chars_floor(packed, clean_len, max_chars, min_chars, is_heading, is_item, has_words)
             if tts_engine == 'orpheus':
                 # PASS 5 (Orpheus) — greedily pack adjacent sentences up to max_chars so
                 # each generation spans 2-3 sentences: coherent timbre/prosody across a
@@ -2721,6 +2892,14 @@ def get_sentences(text:str, session_id:str, sml_blocks:list[str])->list|None:
                 # itself — it tests _has_escaped_sml(core), and a heading's marker
                 # sits on the row's LEAD, so the packer used to swallow headers
                 # happily and drop the marker as a join token.
+                #
+                # A LIST ITEM IS NOT A FOURTH KIND, and that is deliberate
+                # (2026-09-01). Classifying it `edges is None` would emit the
+                # item's FIRST row alone and strand the rest of the item —
+                # '13.' as one generation and 'A printer is represented by a
+                # press.' as the next — which is worse than the packing it was
+                # meant to prevent. An item is a RUN BOUNDARY instead: see the
+                # run loop below.
                 items = []
                 for s in final_list:
                     s = s.strip()
@@ -2755,15 +2934,46 @@ def get_sentences(text:str, session_id:str, sml_blocks:list[str])->list|None:
                             dropped_join_tokens += len(run[i][0])
                         packed.append(f'{lead}{core}{trail}')
 
+                # EACH <li> IS ITS OWN RUN (2026-09-01). A run is what _emit packs
+                # into chunks, so bounding the run bounds the pack: all of ONE
+                # item's sentences may share a generation, and nothing else may
+                # join them.
+                #
+                # Two rules do it, and both lean on PASS 1's row shape rather than
+                # on any new bookkeeping. A row ENDS immediately before any escaped
+                # token and MAY START with tokens, so:
+                #   - the first row of an item is the one carrying [item] (plus the
+                #     [break] of its paragraph boundary) — is_item(s) flushes the
+                #     run in progress and opens the item's own;
+                #   - the item's remaining sentences are the TOKEN-FREE rows that
+                #     follow it, and they are the only rows that can be — so while
+                #     the run belongs to an item, ANY row carrying a token (lead or
+                #     trail) flushes it too.
+                # That is what packs '13.' + 'A printer is represented by a press.'
+                # + 'It stands for the whole trade.' into ONE chunk while
+                # '[break][item]fourteen.' opens the next, and it is what keeps the
+                # paragraph after the list — which opens '[break]…' — out of the
+                # last item's generation.
+                #
+                # Only ITEM runs are fenced this tightly. Ordinary prose still
+                # packs across its paragraph [break]s, which is the 2026-08-10
+                # ruling and is not being revisited.
                 run = []
+                run_is_item = False
                 for s, e in items:
                     if e is None:
                         if run:
                             _emit(run)
                             run = []
+                        run_is_item = False
                         packed.append(s)
-                    else:
-                        run.append(e)
+                        continue
+                    if is_item(s) or (run_is_item and _has_escaped_sml(s)):
+                        if run:
+                            _emit(run)
+                            run = []
+                        run_is_item = is_item(s)
+                    run.append(e)
                 if run:
                     _emit(run)
                 if dropped_join_tokens:
@@ -2777,7 +2987,7 @@ def get_sentences(text:str, session_id:str, sml_blocks:list[str])->list|None:
                     # _apply_near_dup_split: keeps a near-duplicate sentence pair
                     # out of one generation. No-op for non-repetitive prose.
                     return _apply_near_dup_split(
-                        _apply_min_chars_floor(packed, clean_len, max_chars, min_chars, is_heading, has_words)
+                        _apply_min_chars_floor(packed, clean_len, max_chars, min_chars, is_heading, is_item, has_words)
                     )
                 def _split_to_cap(t):
                     parts, last = [], 0
@@ -2804,9 +3014,9 @@ def get_sentences(text:str, session_id:str, sml_blocks:list[str])->list|None:
                 # MIN-CHARS FLOOR then PASS 6 — repetition-primed split
                 # (anti-runaway); see above.
                 return _apply_near_dup_split(
-                    _apply_min_chars_floor(capped, clean_len, max_chars, min_chars, is_heading, has_words)
+                    _apply_min_chars_floor(capped, clean_len, max_chars, min_chars, is_heading, is_item, has_words)
                 )
-            return _apply_min_chars_floor(final_list, clean_len, max_chars, min_chars, is_heading, has_words)
+            return _apply_min_chars_floor(final_list, clean_len, max_chars, min_chars, is_heading, is_item, has_words)
     except Exception as e:
         print(f'get_sentences() error: {e}')
         return None
@@ -3320,6 +3530,25 @@ def sml_heading(title:str)->str:
     The title arrives already terminated — the caller adds the period that makes
     TTS stop — so this only prefixes the marker."""
     return f"{sml_token('heading')}{title}"
+
+def sml_item(text:str)->str:
+    """Mark a row as the START of a list item (2026-09-01).
+
+    The [item] marker goes on the row's LEADING edge — see TTS_SML['item'] for
+    why it is a leading marker and not a paired wrapper. It is the ONLY thing
+    that carries "this <li> is a new item" out of filter_chapter's walker and
+    down into get_sentences, where _marker_row_test turns it back into "start a
+    fresh pack here, and do not let the min-chars floor merge this row away".
+    Every engine strips it before TTS (SML_UNSPOKEN_PATTERN, and _convert_sml for
+    the XTTS-class engines), so it is never spoken, and it is stripped again for
+    VTT cues and m4b chapter titles, which are built from these same rows.
+
+    A PREFIX, deliberately: the caller appends this row's terminal period at
+    item_end via _close_block, whose `last[-1].isalnum()` test has to keep seeing
+    the item's own last character. It is applied to the item's FIRST text only —
+    the rest of the item is plain, token-free rows, and being token-free is what
+    keeps them inside the item's pack."""
+    return f"{sml_token('item')}{text}"
 
 def normalize_text(text:str, lang:str, lang_iso1:str, tts_engine:str)->str:
 

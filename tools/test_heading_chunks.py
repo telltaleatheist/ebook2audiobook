@@ -146,6 +146,10 @@ def _check_floor_wordless_rows(core):
     chr(sml_escape_tag + i) IS the token here."""
     heading, brk = chr(core.sml_escape_tag), chr(core.sml_escape_tag + 1)
     is_heading = core._heading_row_test(['[heading]', '[break]'])
+    # No [item] in this block table, so the item predicate answers False for
+    # every row here — these cases are about headings only (see
+    # tools/test_list_item_chunks.py for the item exemption).
+    is_item = core._marker_row_test(['[heading]', '[break]'], 'item')
 
     def clean_len(s):
         return len(core._strip_escaped_sml(s))
@@ -154,7 +158,7 @@ def _check_floor_wordless_rows(core):
         return core._has_word_chars(s)
 
     def run(rows, min_chars=25, max_chars=350):
-        return core._apply_min_chars_floor(rows, clean_len, max_chars, min_chars, is_heading, has_words)
+        return core._apply_min_chars_floor(rows, clean_len, max_chars, min_chars, is_heading, is_item, has_words)
 
     failures = []
 

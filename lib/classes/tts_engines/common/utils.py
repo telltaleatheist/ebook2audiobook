@@ -591,15 +591,17 @@ class TTSUtils:
             silence_time = float(value) if value else float(
                 int(np.random.uniform(1.0, 1.6) * 100) / 100
             )
-        elif tag == 'heading':
-            # PURE MARKUP (2026-08-27). The [heading] marker tells get_sentences
-            # to keep a section header as its own chunk; by the time the row
-            # reaches an engine it has done its whole job. Nothing to speak, and
-            # NO silence of its own — the chunk's normal sentence gap covers the
-            # boundary, same as the 2026-07-17 Orpheus ruling. Returning here
-            # (rather than falling through) is what keeps it silent: the tail of
-            # this method appends a zero-filled segment of silence_time seconds,
-            # and a heading has no such duration to append.
+        elif tag in ('heading', 'item'):
+            # PURE MARKUP (heading 2026-08-27, item 2026-09-01). The [heading]
+            # marker tells get_sentences to keep a section header as its own
+            # chunk and [item] tells it to keep each <li> in a pack of its own;
+            # by the time the row reaches an engine both have done their whole
+            # job. Nothing to speak, and NO silence of their own — the chunk's
+            # normal sentence gap covers the boundary, same as the 2026-07-17
+            # Orpheus ruling. Returning here (rather than falling through) is
+            # what keeps them silent: the tail of this method appends a
+            # zero-filled segment of silence_time seconds, and neither marker has
+            # such a duration to append.
             return True, ''
         elif tag == 'voice':
             if close:

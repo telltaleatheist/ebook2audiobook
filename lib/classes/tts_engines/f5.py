@@ -226,8 +226,10 @@ class F5(TTSUtils, TTSRegistry, name='f5'):
 
             sentence = sentence.strip()
             # Strip the e2a SML tags F5 doesn't understand — including the
-            # [heading] marker, which is markup for the splitter only and must
-            # never be spoken (2026-08-27; alternation shared via conf_models).
+            # [heading] and [item] markers, which are markup for the splitter
+            # only and must never be spoken (2026-08-27 / 2026-09-01; the
+            # alternation is shared via conf_models, which is why [item] needed
+            # no change here).
             sentence = SML_UNSPOKEN_PATTERN.sub('', sentence).strip()
 
             if not sentence:
