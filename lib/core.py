@@ -40,11 +40,6 @@ from unidecode import unidecode
 from phonemizer import phonemize
 
 from lib.classes.subprocess_pipe import SubprocessPipe
-from lib.classes.tts_engines.common.orpheus_text import (
-    expand_digits as orpheus_expand_digits,
-    normalize_scripture as orpheus_normalize_scripture,
-    text_transform_enabled as orpheus_text_transform_enabled,
-)
 from lib.classes.vram_detector import VRAMDetector
 from lib.classes.voice_extractor import VoiceExtractor
 from lib.classes.tts_manager import TTSManager
@@ -1615,20 +1610,19 @@ def filter_chapter(idx:int, doc:EpubHtml, session_id:str, stanza_nlp:Pipeline, i
                 # Orpheus fine-tunes are trained on book-exact text, so the whole
                 # date/year/roman/clock/math pipeline is SKIPPED — digits like
                 # '5,000', '1930s', '7th' and romans like 'Henry VIII' stay as
-                # printed. The ONLY lexical transforms the fine-tunes know
-                # (scripture refs + bare-integer expansion, orpheus_text.py) run
-                # at the ENGINE boundary (_clean_sentence_for_tts), NOT here: the
-                # sentences stored below — and the m4b transcript built from
-                # them — therefore read like the book, while get_sentences packs
-                # against the TRANSFORMED length so the 350-char cap bounds what
-                # the model actually reads. Orpheus is English-only by design;
-                # any other language is an XTTS job — fail loudly rather than
-                # anglicize.
+                # printed here. NO lexical transform runs at the engine boundary
+                # either (permanently disabled 2026-09-02, Owen): number
+                # normalization is BookForge's model pass over the narration
+                # copy, run by its cleanup step before the text reaches e2a, so
+                # the sentences stored below — and the m4b transcript built from
+                # them — are exactly what the model reads. Orpheus is
+                # English-only by design; any other language is an XTTS job —
+                # fail loudly rather than anglicize.
                 if lang != 'eng':
                     error = f"Orpheus is English-only (got '{lang}') — route this language to another engine (XTTS)."
                     print(error)
                     return None
-                msg = 'Orpheus: book-exact sentences (lexical transforms deferred to the engine)…'
+                msg = 'Orpheus: book-exact sentences (no lexical transform — numbers are normalized upstream by BookForge)…'
                 print(msg)
             elif stanza_nlp:
                 msg = 'Converting dates and years to words…'
@@ -2461,27 +2455,17 @@ def get_sentences(text:str, session_id:str, sml_blocks:list[str])->list|None:
         is_heading = _heading_row_test(sml_blocks)
         is_item = _marker_row_test(sml_blocks, 'item')
 
-        # Orpheus rows are stored/displayed BOOK-EXACT; the scripture+digit
-        # expansion happens at the engine boundary (_clean_sentence_for_tts).
-        # tts_form is that same transform, used HERE only so clean_len measures
-        # the text the model will read. Deterministic and cached; identity for
-        # every other engine (their text is already fully words by this point).
-        # ORPHEUS_TEXT_TRANSFORM=0 (2026-09-02): the copy was normalized upstream
-        # by BookForge's model pass and the engine reads it as printed, so the
-        # packer must measure it as printed too — the same switch the engine
-        # boundary reads, so the length the cap bounds is the length the model
-        # gets. See orpheus_text.text_transform_enabled.
-        if tts_engine == 'orpheus' and orpheus_text_transform_enabled():
-            _tts_form_cache:dict[str,str] = {}
-            def tts_form(s:str)->str:
-                r = _tts_form_cache.get(s)
-                if r is None:
-                    r = orpheus_expand_digits(orpheus_normalize_scripture(s))
-                    _tts_form_cache[s] = r
-                return r
-        else:
-            def tts_form(s:str)->str:
-                return s
+        # THE PACKER MEASURES THE TEXT AS PRINTED, every engine (Owen,
+        # 2026-09-02). Until today an Orpheus row was measured through the
+        # scripture+digit transform the engine boundary applied, so the cap
+        # bounded what the model would read. That transform is permanently
+        # disabled at the engine (see Orpheus._clean_sentence_for_tts): number
+        # normalization is BookForge's model pass over the narration copy, so
+        # the rows arriving here already carry the words the model gets, and
+        # printed length IS model length. tts_form stays as the seam clean_len
+        # and has_words read through, an identity for every engine.
+        def tts_form(s:str)->str:
+            return s
 
         assert not SML_TAG_PATTERN.search(text)
 

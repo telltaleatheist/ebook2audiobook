@@ -24,10 +24,9 @@ Style notes that matter:
 - Both transforms are idempotent on their own output (no digits remain), so
   re-applying to sentences from an old already-expanded session is a no-op.
 
-Stdlib re (and os, for the ORPHEUS_TEXT_TRANSFORM switch) only — importable
-from both lib/core.py and the engine without dragging heavy deps into workers.
+Stdlib re only — importable from both lib/core.py and the engine without
+dragging heavy deps into workers.
 """
-import os
 import re
 
 _ONES = ["zero", "one", "two", "three", "four", "five", "six", "seven",
@@ -196,54 +195,17 @@ def to_tts_form(text: str) -> str:
     return expand_digits(normalize_scripture(expand_grouped_integers(text)))
 
 
-# ── The switch: is the transform applied at all? ──────────────────────────────
-# 2026-09-02, Owen: number normalization moved UPSTREAM. BookForge now runs a
-# model pass over the narration copy before e2a ever sees it (every digit-bearing
-# block, headings and TOC titles included, in the same spoken forms the
-# fine-tunes trained on), and "if we're doing it here then we should turn it off
-# in e2a — we don't need the pass done in two places." This variable is how the
-# producer of a normalized copy says so: BookForge sets ORPHEUS_TEXT_TRANSFORM=0
-# in both the prep and the generation environment for such a copy.
-#
-# DEFAULT ON, deliberately (orpheus-training's call, 2026-09-02). On a normalized
-# copy to_tts_form is idempotent — no digits are left for it to expand — so the
-# default costs nothing there and the runtime still makes exactly one pass. A
-# default of OFF, on the other hand, would silently regress every producer that
-# still hands e2a raw book text: the CLI ear renders, renderRangeHeadless
-# campaigns, the loop/ladder batteries, and any checkout that lags behind the
-# BookForge pass — digits would reach a model trained only on words. Flip the
-# default only once those paths also run the BookForge pass.
-#
-# Only '0' and '1' are accepted; anything else raises (NO FALLBACK), the same
-# handling as ORPHEUS_MAX_CHARS / SENTENCE_MIN_CHARS. The mode is printed ONCE per
-# process so a render can be audited from its log.
-_TEXT_TRANSFORM_ENV = 'ORPHEUS_TEXT_TRANSFORM'
-_text_transform_logged = False
-
-
-def text_transform_enabled() -> bool:
-    """Whether to_tts_form is applied to the text this process narrates.
-
-    Read from the environment on every call (cheap; lets a test flip it), the
-    audit line printed on the first call only."""
-    global _text_transform_logged
-    raw = os.environ.get(_TEXT_TRANSFORM_ENV)
-    value = raw.strip() if raw is not None else ''
-    if value == '' or value == '1':
-        enabled = True
-    elif value == '0':
-        enabled = False
-    else:
-        raise ValueError(f"{_TEXT_TRANSFORM_ENV} must be '0' or '1', got {raw!r}")
-    if not _text_transform_logged:
-        _text_transform_logged = True
-        if enabled:
-            print('Orpheus: text transform ON — digits/scripture refs are expanded at the engine boundary '
-                  f'({_TEXT_TRANSFORM_ENV} unset or 1)')
-        else:
-            print('Orpheus: text transform OFF — the narration copy arrives normalized upstream '
-                  f'({_TEXT_TRANSFORM_ENV}=0); text is read as printed')
-    return enabled
+# ── NOT APPLIED AT INFERENCE ANY MORE (Owen, 2026-09-02) ─────────────────────
+# Number normalization is BookForge's job: a model pass over the narration copy
+# (every digit-bearing block, headings and TOC titles included, in the spoken
+# forms the fine-tunes trained on) run by the BookForge CLI's cleanup step before
+# its TTS step. "We don't need the pass done in two places", so the engine
+# boundary (Orpheus._clean_sentence_for_tts) and the packer's length measure
+# (core.get_sentences) no longer call to_tts_form — permanently, with no switch:
+# a knob would be a second place. The functions above stay because the ASR
+# gate's _norm_words reads _big_num_words, asr_gate_risk reads model-input text,
+# and the training corpus builders keep a port of exactly this transform
+# (mb_text.py) — this file is its documented reference.
 
 
 # ── ASR verify-gate risk flag (2026-08-29) ───────────────────────────────────

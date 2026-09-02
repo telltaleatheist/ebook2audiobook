@@ -1,7 +1,7 @@
 from lib.classes.tts_engines.common.headers import *
 from lib.classes.tts_engines.common.preset_loader import load_engine_presets
 from lib.classes.tts_engines.common.audio import trim_audio
-from lib.classes.tts_engines.common.orpheus_text import to_tts_form, asr_gate_risk, text_transform_enabled
+from lib.classes.tts_engines.common.orpheus_text import asr_gate_risk
 from lib.classes.tts_engines.common import asr_gate
 # TEST Step 3c: Direct imports since headers no longer provides them
 import torch
@@ -2771,24 +2771,27 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
         2026-09-01, is exactly that "anything after it" and needed no change
         here.
 
-        Then apply the book-exact -> model transform (to_tts_form: scripture refs
-        + bare-integer expansion, the exact transforms the fine-tunes trained
-        with). Sentences arrive here BOOK-EXACT — that is what session['chapters']
-        stores and what the m4b transcript is built from — so this boundary is
-        the ONLY place the model text diverges from the display text. Everything
-        downstream (prompt, token budgets, chars/sec + truncation guards, resplit
-        ladders) measures the transformed text because they all consume this
-        function's return. Idempotent: sentences from a pre-display-text session
-        (already expanded) pass through unchanged."""
+        THE ENGINE READS THE TEXT AS PRINTED (Owen, 2026-09-02). Until today this
+        boundary also applied the book-exact -> model transform (to_tts_form:
+        scripture refs + bare-integer expansion, the transforms the fine-tunes
+        trained with). That is PERMANENTLY DISABLED here, not removed: number
+        normalization is BookForge's job now — a model pass over the narration
+        copy, every digit-bearing block including headings and TOC titles, in the
+        spoken forms the fine-tunes trained on — and "we don't need the pass done
+        in two places". e2a is reached through the BookForge CLI, whose cleanup
+        step runs that pass before its TTS step. Nothing here may expand a digit
+        the pass deliberately left (a citation code it judged unspeakable), and
+        there is no switch to turn the old transform back on: a knob would be a
+        second place. to_tts_form itself stays in orpheus_text.py as the ASR
+        gate's reference normalization and as the documented port the training
+        corpus builders mirror.
+
+        Everything downstream (prompt, token budgets, chars/sec + truncation
+        guards, resplit ladders) measures this function's return, which is now
+        the stored sentence with its SML stripped — the same text the transcript
+        shows."""
         sentence = (sentence or '').strip()
-        sentence = SML_UNSPOKEN_PATTERN.sub('', sentence).strip()
-        # ORPHEUS_TEXT_TRANSFORM=0 (2026-09-02): the copy was normalized upstream
-        # by BookForge's model pass, so the text is read AS PRINTED — nothing here
-        # may expand a digit the pass deliberately left (a citation code it
-        # judged unspeakable). See text_transform_enabled for the default and why.
-        if not text_transform_enabled():
-            return sentence
-        return to_tts_form(sentence).strip()
+        return SML_UNSPOKEN_PATTERN.sub('', sentence).strip()
 
     def _classify_gap(self, sentence: str):
         """Inter-clip silence for a chunk. Returns (lead_gap_sec, trail_gap_sec).
