@@ -43,6 +43,7 @@ from lib.classes.subprocess_pipe import SubprocessPipe
 from lib.classes.tts_engines.common.orpheus_text import (
     expand_digits as orpheus_expand_digits,
     normalize_scripture as orpheus_normalize_scripture,
+    text_transform_enabled as orpheus_text_transform_enabled,
 )
 from lib.classes.vram_detector import VRAMDetector
 from lib.classes.voice_extractor import VoiceExtractor
@@ -2465,7 +2466,12 @@ def get_sentences(text:str, session_id:str, sml_blocks:list[str])->list|None:
         # tts_form is that same transform, used HERE only so clean_len measures
         # the text the model will read. Deterministic and cached; identity for
         # every other engine (their text is already fully words by this point).
-        if tts_engine == 'orpheus':
+        # ORPHEUS_TEXT_TRANSFORM=0 (2026-09-02): the copy was normalized upstream
+        # by BookForge's model pass and the engine reads it as printed, so the
+        # packer must measure it as printed too — the same switch the engine
+        # boundary reads, so the length the cap bounds is the length the model
+        # gets. See orpheus_text.text_transform_enabled.
+        if tts_engine == 'orpheus' and orpheus_text_transform_enabled():
             _tts_form_cache:dict[str,str] = {}
             def tts_form(s:str)->str:
                 r = _tts_form_cache.get(s)

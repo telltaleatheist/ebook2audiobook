@@ -1,7 +1,7 @@
 from lib.classes.tts_engines.common.headers import *
 from lib.classes.tts_engines.common.preset_loader import load_engine_presets
 from lib.classes.tts_engines.common.audio import trim_audio
-from lib.classes.tts_engines.common.orpheus_text import to_tts_form, asr_gate_risk
+from lib.classes.tts_engines.common.orpheus_text import to_tts_form, asr_gate_risk, text_transform_enabled
 from lib.classes.tts_engines.common import asr_gate
 # TEST Step 3c: Direct imports since headers no longer provides them
 import torch
@@ -2781,8 +2781,14 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
         function's return. Idempotent: sentences from a pre-display-text session
         (already expanded) pass through unchanged."""
         sentence = (sentence or '').strip()
-        sentence = SML_UNSPOKEN_PATTERN.sub('', sentence)
-        return to_tts_form(sentence.strip()).strip()
+        sentence = SML_UNSPOKEN_PATTERN.sub('', sentence).strip()
+        # ORPHEUS_TEXT_TRANSFORM=0 (2026-09-02): the copy was normalized upstream
+        # by BookForge's model pass, so the text is read AS PRINTED — nothing here
+        # may expand a digit the pass deliberately left (a citation code it
+        # judged unspeakable). See text_transform_enabled for the default and why.
+        if not text_transform_enabled():
+            return sentence
+        return to_tts_form(sentence).strip()
 
     def _classify_gap(self, sentence: str):
         """Inter-clip silence for a chunk. Returns (lead_gap_sec, trail_gap_sec).
