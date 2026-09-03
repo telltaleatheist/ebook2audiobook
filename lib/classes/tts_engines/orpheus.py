@@ -267,7 +267,96 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
     # Speech seconds went UP 2.3% while silence fell 26.9% — it removes dead
     # air, it does not clip. Killing the cap-hits also kills the serial
     # re-render ladder those trigger, which is the larger win on a full book.
-    MLX_REP_WINDOW = int(os.environ.get('ORPHEUS_MLX_REP_WINDOW', '4096'))
+    #
+    # 8192, not 4096 (2026-09-01). The stated intent above is "the window is
+    # effectively the whole generation", and 4096 only ever delivered that by
+    # accident: the window is measured over the KV cache, which is PROMPT PLUS
+    # generation, so at the 3700-token cap it covered the whole thing only while
+    # the prompt stayed under 396 tokens (~1,500 chars). Real chunks frame to
+    # ~140 tokens so nothing observable changes today — this closes a latent
+    # cliff where a long chunk would silently drop back to a partial window, and
+    # it is the exactness condition the MLX fast path (orpheus_mlx_fastpath)
+    # checks at load and again on every step.
+    MLX_REP_WINDOW = int(os.environ.get('ORPHEUS_MLX_REP_WINDOW', '8192'))
+
+    # ---- MLX decode overlap -------------------------------------------------
+    #
+    # A batch's rows retire CONTINUOUSLY, but until 2026-09-02 nothing was decoded
+    # until every row had. Measured on a 106-chunk width-96 production run:
+    # generation of batch 1 ended at ~413 s and the next batch did not start until
+    # ~495 s — ~80 s (13% of a 601 s job) spent in the post-batch loop
+    # (parse_output -> SNAC decode -> guard -> FLAC write, serially) with the GPU's
+    # generation loop STOPPED. The same run had 1/96 rows retired by step 199,
+    # 50/96 by 2174 and 93/96 by 2715, so nearly all of that work could have run
+    # while the batch was still generating.
+    #
+    # With overlap on, a retired row is handed to ONE decoder thread the moment its
+    # finish_reason lands; the thread does only the cheap, model-free half (decode,
+    # the truncation VERDICT, the file write) and defers anything that would need
+    # the model back to the main thread after bg.close(). The single-sentence
+    # re-render ladder therefore NEVER runs next to a live BatchGenerator, so the
+    # memory profile of that path is exactly what it was.
+    #
+    # ORPHEUS_MLX_DECODE_OVERLAP=0 restores the serial post-batch loop — the A/B
+    # control, and the escape hatch if a thread ever proves to be the wrong tool.
+    MLX_DECODE_OVERLAP = os.environ.get('ORPHEUS_MLX_DECODE_OVERLAP', '1') != '0'
+
+    # How long to wait for the decoder thread after the batch ends. Its remaining
+    # work at that point is at most the last few rows' SNAC decodes (~a second
+    # each), so 10 minutes is not a tuning knob — it is the line past which the
+    # thread is WEDGED and must be reported as an error rather than waited on.
+    MLX_DECODE_JOIN_SECONDS = 600.0
+
+    # ---- MLX continuous batching (EXPERIMENT) -------------------------------
+    #
+    # Today (_mlx_batch_groups) a call's rows are split into fresh groups and each
+    # group runs its own BatchGenerator to completion, so the TAIL of every group
+    # decodes at dwindling width — at the end only the slowest row is still
+    # running and the GPU is doing 1/96th of the work it could.
+    #
+    # Continuous batching hands ONE BatchGenerator every row of the call up front
+    # and lets mlx-lm's own scheduler keep the width full: BatchGenerator._next
+    # refills from its queue whenever len(_generation_batch) < completion_batch_size,
+    # prefilling up to prefill_batch_size queued prompts and extend()ing them into
+    # the live batch. A retired slot is refilled on the NEXT step instead of at the
+    # end of the group.
+    #
+    # WHY IT MAY LOSE — this is the hypothesis under test, not a rhetorical
+    # caveat. BatchKVCache.extend LEFT-PADS a refilled row so it is right-justified
+    # at max(self._idx, other._idx), i.e. at the OLDEST live row's context length,
+    # and BatchKVCache.filter only trims the padding COMMON to all live rows. So a
+    # continuous batch attends over roughly the straggler's context for every row,
+    # while a fresh group starts every row at ~0. The measured context term at
+    # width 96 is ~34 ms per 1000 tokens of KV, and July's continuous-batching
+    # experiment measured 25.8 vs 26.6 sent/min against chunked groups — a wash,
+    # or a small loss. This switch exists to re-measure that on the fast-path +
+    # decode-overlap stack with a real book; it is not a claimed win.
+    #
+    # DEFAULT IS OFF (Owen, 2026-09-02) — MEASURED and retired. Honestly budgeted
+    # (MLX_KV_MB_PER_TOKEN_ROW_STEADY: the steady state IS width x depth) it gets 36
+    # rows at a 42 GB budget, and on a real book it ran 218 ms/step against the
+    # fresh-group path's 111-180 at width 64: every refilled row is left-padded to
+    # the oldest live row (BatchKVCache.extend) so every slot pays the straggler's
+    # context, and each retirement/refill rebuilds the cache tensors. 13 sent/min
+    # vs 40-50. The straggler tail it was meant to fix has a cheaper answer that
+    # costs no memory: sort a slice by expected length before grouping. The code
+    # stays as an opt-in measurement (ORPHEUS_MLX_CONTINUOUS=1); the width it
+    # announces is the safe one.
+    MLX_CONTINUOUS = os.environ.get('ORPHEUS_MLX_CONTINUOUS', '0') == '1'
+
+    # How many rows the WORKER should pool per convert_batch call when continuous
+    # batching is on (batch_pool_size). A continuous generator can only refill a
+    # retired slot from rows it has been GIVEN, so a pool of exactly BATCH_SIZE
+    # would leave it nothing to refill with and collapse it back into a fresh
+    # group per call. 0 (the default) means 4 x BATCH_SIZE, resolved per instance
+    # so an ORPHEUS_BATCH_SIZE override carries.
+    MLX_CONTINUOUS_POOL = int(os.environ.get('ORPHEUS_MLX_CONTINUOUS_POOL', '0') or 0)
+
+    # How many queued prompts one refill prefills at once (prefill_batch_size).
+    # Prefill interleaves with full-width decode, so this is the knob that trades
+    # refill latency against the memory spike July measured (36 GB peak at width
+    # 96). Capped at the batch width by the caller.
+    MLX_CONTINUOUS_PREFILL = int(os.environ.get('ORPHEUS_MLX_CONTINUOUS_PREFILL', '16'))
 
     # ---- MLX batch memory budget -------------------------------------------
     #
@@ -296,8 +385,27 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
     # So _mlx_batch_groups derives a per-batch WIDTH cap from the batch's own
     # token depth (see _mlx_width_for_depth) targeting this budget.
     MLX_MEM_BUDGET_GB = float(os.environ.get('ORPHEUS_MLX_MEM_BUDGET_GB', '45'))
-    # Measured KV bytes per generated token per row, in MB (see above).
+    # ARITHMETIC KV bytes per generated token per row, in MB: 28 layers x (K+V) x
+    # 8 kv heads x 128 dims x 2 bytes. This is what the cache HOLDS. It is NOT what
+    # the process PEAKS at — see MLX_KV_MB_PER_TOKEN_ROW_STEADY.
     MLX_KV_MB_PER_TOKEN_ROW = 0.1147
+    # MEASURED peak memory per generated token per row, in MB (2026-09-01, bf16,
+    # depth 1800, mx.get_peak_memory, cache excluded): width 12 -> 10.8 GB,
+    # 48 -> 23.7, 96 -> 40.8. Every pair gives the same slope, 0.203 MB/token/row,
+    # 1.77x the arithmetic figure, with a 6.5 GB intercept (the weights). The
+    # excess is mlx-lm's KV update: `self.keys[..., prev:idx, :] = keys` is a
+    # copy-on-write scatter that can only be donated in place when nothing else
+    # references the old buffer, and the step pipeline (async_eval of step N+1
+    # while step N's outputs are still referenced) keeps two generations of the
+    # cache alive at the peak. The GROUP path survives the arithmetic bound because
+    # rows retire long before the batch reaches width x depth (measured real-book
+    # peak 26.9 GB at width 96 against a 55 GB bound). CONTINUOUS batching does
+    # not: a refilled row is padded to the oldest live row, so the batch sits at
+    # full width x full depth for the whole run — the worst case IS the steady
+    # state, and it must be budgeted with the measured coefficient. Budgeting it
+    # with the arithmetic one put a 64-row continuous run at 55 GB wired on a
+    # 64 GB machine (2026-09-01) and crashed the desktop.
+    MLX_KV_MB_PER_TOKEN_ROW_STEADY = 0.203
     # Resident bf16 weights for orpheus-3b, in GB (measured at load).
     MLX_WEIGHTS_GB = 6.9
 
@@ -1040,6 +1148,31 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
         # correctly via _format_prompt_ids; MLX bypasses that helper, so patch the
         # library's framing at load to restore the exact training frame.
         self._patch_mlx_prompt_framing(model)
+        # ---- batched decode fast path ---------------------------------------
+        #
+        # mlx-lm's GenerationBatch._step does two things Orpheus does not need to
+        # pay for on every one of ~3,700 steps:
+        #   * it applies logits processors in a PYTHON LOOP over the batch —
+        #     measured 151.7 vs 142.1 ms/step at width 96 with the processors
+        #     removed entirely, i.e. ~9.6 ms/step (6%) that grows with width;
+        #   * it projects the hidden state onto all 156,940 rows of the tied
+        #     embedding when Orpheus can only emit EOS + the SNAC codes, a
+        #     contiguous 28,680-id block — 964 MB of head weight read per step
+        #     against 176 MB, 90.6 GFLOP against 16.6.
+        # orpheus_mlx_fastpath.install() replaces that step with a batched,
+        # sliced one. It is PINNED to mlx-lm 0.31.3 (it reproduces _step line for
+        # line) and it REFUSES by name — never silently falls back — on a
+        # non-tied or quantized head, or on a repetition window too short to
+        # cover prompt + generation, which is the exactness condition for its
+        # seen-mask form of the penalty. ORPHEUS_MLX_FASTPATH=0 is the kill
+        # switch; everything else about the render is unchanged.
+        if os.environ.get('ORPHEUS_MLX_FASTPATH', '1') != '0':
+            from lib.classes.tts_engines.orpheus_mlx_fastpath import install as _install_fastpath
+            print(_install_fastpath(model, rep_window=self.MLX_REP_WINDOW,
+                                    max_tokens=self.MLX_MAX_TOKENS))
+        else:
+            print('Orpheus MLX fast path disabled (ORPHEUS_MLX_FASTPATH=0); '
+                  'using mlx-lm\'s stock per-row decode step')
         self._device = 'mlx'  # MLX manages its own device
         print("Orpheus MLX model loaded!")
         return model
@@ -2065,17 +2198,37 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
     @property
     def batch_pool_size(self) -> int:
         """How many sentences the worker should accumulate before calling
-        convert_batch(). Plain BATCH_SIZE on every backend.
+        convert_batch(). Plain BATCH_SIZE everywhere EXCEPT MLX with continuous
+        batching on, where it is MLX_CONTINUOUS_POOL (default 4 x BATCH_SIZE).
 
-        (This used to return a 4x pool on MLX so length-bucketing had enough rows
-        to rebuild full-width buckets. Both the bucketing and the pool that fed it
-        are gone — mlx-lm 0.31.3 right-pads batch prefills, so mixed-length batches
-        are safe; see the MLX memory-budget block at the top of the class. The
-        property itself stays because the worker/manager plumbing is generic and
-        other engines may want a pool.)"""
-        return max(1, int(self.BATCH_SIZE or 1))
+        A continuous BatchGenerator refills a retired slot from the rows it was
+        given; handed exactly BATCH_SIZE rows it has nothing to refill with and
+        degenerates into today's single fresh group. So the pool is what makes the
+        experiment an experiment. Every other configuration returns BATCH_SIZE —
+        the same number this property returned before, so the worker's
+        `max(batch_size, batch_pool_size)` is unchanged and nothing else moves.
 
-    def _mlx_width_for_depth(self, depth: int) -> int:
+        THE POOL IS A FLUSH SIZE, NOT A BATCH WIDTH. _convert_mlx_batch still caps
+        the rows generating at once at _mlx_width_for_depth (<= BATCH_SIZE); the
+        pool only makes the CALL longer. What it does change is the worker's
+        reporting granularity: worker_core prints its per-sentence "Converting
+        sentence i/N" lines only after a flush RETURNS, so they arrive in blocks of
+        pool_size instead of BATCH_SIZE (the [ORPHEUS] heartbeat is the
+        within-call progress source meanwhile), and a cooperative stop deletes the
+        whole flush's in-flight indices, so it discards up to pool_size finished
+        sentences instead of BATCH_SIZE. Both are re-rendered on resume;
+        correctness is unaffected, wasted work is not.
+
+        (This used to return a 4x pool on MLX for an unrelated reason —
+        length-bucketing needed spare rows to rebuild full-width buckets. That
+        bucketing is gone; mlx-lm 0.31.3 right-pads batch prefills. The pool is
+        back for the scheduler, not for the buckets.)"""
+        width = max(1, int(self.BATCH_SIZE or 1))
+        if self.MLX_CONTINUOUS and getattr(self, 'backend', None) == 'mlx':
+            return max(width, int(self.MLX_CONTINUOUS_POOL or 0) or 4 * width)
+        return width
+
+    def _mlx_width_for_depth(self, depth: int, steady: bool = False) -> int:
         """Widest batch that keeps peak MLX memory inside MLX_MEM_BUDGET_GB when
         every row may generate up to `depth` tokens.
 
@@ -2096,7 +2249,10 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
         if depth <= 0:
             return width
         headroom = self._mlx_kv_headroom_gb()
-        kv_gb_per_row = depth * self.MLX_KV_MB_PER_TOKEN_ROW / 1024.0
+        # steady=True budgets the MEASURED peak per row (continuous batching, where
+        # width x depth is the steady state), not the arithmetic cache size.
+        mb = self.MLX_KV_MB_PER_TOKEN_ROW_STEADY if steady else self.MLX_KV_MB_PER_TOKEN_ROW
+        kv_gb_per_row = depth * mb / 1024.0
         return max(1, min(width, int(headroom / kv_gb_per_row)))
 
     def _mlx_kv_headroom_gb(self) -> float:
@@ -2243,7 +2399,11 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
         BatchGenerator, so an abandoned one leaves nothing behind for the next call.
         """
         from mlx_lm.generate import BatchGenerator
-        from mlx_lm.sample_utils import make_sampler, make_logits_processors
+        from mlx_lm.sample_utils import make_sampler
+        # The repetition penalty is minted by the fast path's factory rather than
+        # make_logits_processors: same mlx-lm closure, plus the marker the batched
+        # step reads (penalty, window) off. Behaves identically on a stock model.
+        from lib.classes.tts_engines.orpheus_mlx_fastpath import make_rep_penalty
 
         results = [None] * len(texts)
         gen = []  # (index, prompt_tokens, clean_text, token_budget) for non-empty sentences
@@ -2279,15 +2439,15 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
                     sampler=make_sampler(self._voice_cap('temperature'),
                                          top_p=self._voice_cap('topP'),
                                          min_p=self._voice_cap('minP')),
-                    logits_processors=make_logits_processors(
-                        None, self._voice_cap('repPenalty'), self.MLX_REP_WINDOW),
+                    logits_processors=[make_rep_penalty(
+                        self._voice_cap('repPenalty'), self.MLX_REP_WINDOW)],
                     completion_batch_size=len(bucket),
                     prefill_batch_size=len(bucket),
                 )
                 boosts = [self._mlx_eos_boost_processor(len(c)) for _, _, c, _ in bucket]
                 if any(boosts):
-                    rep = make_logits_processors(
-                        None, self._voice_cap('repPenalty'), self.MLX_REP_WINDOW)
+                    rep = [make_rep_penalty(
+                        self._voice_cap('repPenalty'), self.MLX_REP_WINDOW)]
                     uids = bg.insert(
                         [list(p) for _, p, _, _ in bucket],
                         logits_processors=[rep + [b] if b else list(rep) for b in boosts])
@@ -2456,15 +2616,12 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
         expected = self._expected_audio_tokens(n_chars)
         start = min(self._voice_cap('eosBoostStart') * expected,
                     0.9 * self.MLX_MAX_TOKENS)
-        eos = self.END_OF_AUDIO_TOKEN
-
-        def _boost(tokens, logits):
-            n = len(tokens)
-            if n > start:
-                bias = base * min(4.0, 1.0 + (n - start) / expected)
-                return logits.at[:, eos].add(bias)
-            return logits
-        return _boost
+        # Same closure as before, minted by the fast path's factory so the
+        # batched step can read (base, start, expected, eos) off it instead of
+        # guessing at an opaque closure. Called directly it behaves exactly as it
+        # always did, so a stock (un-installed) model is unaffected.
+        from lib.classes.tts_engines.orpheus_mlx_fastpath import make_eos_boost
+        return make_eos_boost(base, start, expected, self.END_OF_AUDIO_TOKEN)
 
     def _vllm_sampling_params(self, n_chars: int, max_tokens: int = None, voice: str = None):
         """The ONE place vLLM SamplingParams are built, so every path carries
@@ -3445,9 +3602,10 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
         per-call path caused over a long book. MLX has its own batched path
         (_convert_mlx_batch); transformers falls back to per-item convert().
 
-        `items` is batch_pool_size long on both backends (== BATCH_SIZE).
-        _convert_mlx_batch re-slices it against the MLX memory budget, so an MLX
-        batch is never WIDER than BATCH_SIZE and may be narrower.
+        `items` is batch_pool_size long: BATCH_SIZE on vLLM, and on MLX either
+        BATCH_SIZE or 4 x BATCH_SIZE when continuous batching is on (see
+        batch_pool_size). _convert_mlx_batch re-slices it against the MLX memory
+        budget, so an MLX batch is never WIDER than BATCH_SIZE and may be narrower.
         """
         if self.backend == 'mlx' and self.mlx_model:
             return self._convert_mlx_batch(items)
@@ -3574,6 +3732,463 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
             # A batch-level failure shouldn't lose the whole chunk — retry per item.
             return [self.convert(idx, s) for idx, s in items]
 
+    # ---- _convert_mlx_batch's per-row pieces --------------------------------
+    #
+    # Factored out so the serial post-batch loop and the overlapped decoder
+    # thread run the SAME code on a row and cannot drift apart. Ownership:
+    #   _mlx_row_audio        - either thread (pure decode, no model)
+    #   _mlx_rerender_capped  - MAIN THREAD ONLY (runs _generate_mlx_safe)
+    #   _mlx_resplit_deferred - MAIN THREAD ONLY (runs _generate_mlx_safe)
+
+    def _mlx_decode_stream(self):
+        """The ONE MLX stream a retired row's SNAC decode is scheduled on, so it
+        does not queue behind the generation loop's own stream. None when this mlx
+        cannot hand a stream across threads (see below) — the caller then declines
+        to overlap rather than sharing the generation stream.
+
+        API, quoted from the installed mlx 0.32.0 docstrings:
+
+          mx.new_thread_unsafe_stream(device) -> Stream — "Make a new stream that
+          can be used in any thread. Unlike new_stream which can only work on the
+          thread of creation, streams created by this API can be passed to and
+          evaluated anywhere, but note that currently all nodes in a graph must be
+          evaluated in sequence and it is user's responsibilty to ensure there is
+          no race condition."
+
+          mx.stream(s) -> StreamContext — "Create a context manager to set the
+          default device and stream."
+
+        That caveat is honoured, not hoped over: exactly ONE decoder thread exists
+        at a time (created and joined inside a single _convert_mlx_batch bucket),
+        it is the only thread that ever touches this stream, and it evaluates one
+        row's graph to completion — np.array() forces the eval — before it starts
+        the next. No graph on this stream is ever built or evaluated from two
+        threads.
+
+        mx.new_stream() is the WRONG call here: its stream is bound to the thread
+        that created it ("using it in any other thread would result in errors"), so
+        it would have to be minted inside each decoder thread. Every mlx stream is
+        a scheduler StreamThread plus, on Metal, its own command queue, and
+        clear_streams() only reclaims the ones created on the CALLING thread — one
+        per batch would leak both for the life of the process, and Metal command
+        queues are a bounded resource. Hence: created once, cached on self, reused
+        by every batch for the life of the engine.
+        """
+        cached = getattr(self, '_mlx_decode_stream_obj', None)
+        if cached is not None:
+            return cached
+        import mlx.core as mx
+        factory = getattr(mx, 'new_thread_unsafe_stream', None)
+        if factory is None:
+            return None
+        self._mlx_decode_stream_obj = factory(mx.default_device())
+        return self._mlx_decode_stream_obj
+
+    def _mlx_row_audio(self, ptoks: list, tokens: list):
+        """ONE retired row's prompt+generated tokens -> float32 waveform.
+
+        The cheap, model-free half of finishing a row: parse_output crops to the
+        audio codes and SNAC decodes them. Empty (len 0) when the row produced no
+        valid codes — EMPTY, never fabricated silence: fabricated zeros used to
+        sail past _save_audio's empty-rejection and ship a sentence as a success
+        with no audio. The caller's guard re-renders an empty once; if that fails
+        too, _save_audio fails the row loudly.
+
+        Raises on a decode failure — both callers own the failure contract.
+        """
+        import numpy as np
+        import mlx.core as mx
+        from mlx_audio.tts.models.llama.llama import decode_audio_from_codes
+        ids = mx.array([ptoks + tokens])
+        code_lists = self.mlx_model.parse_output(ids)
+        if code_lists and len(code_lists[0]) > 0:
+            return np.array(decode_audio_from_codes(code_lists[0])[0], dtype=np.float32)
+        return np.zeros(0, dtype=np.float32)
+
+    def _mlx_rerender_capped(self, idx: int, clean: str, ptoks: list, tokens: list,
+                             cap: int, gap) -> bool:
+        """A row that hit the token cap without finishing: keep the runaway, then
+        re-render it split at sentence boundaries. MAIN THREAD ONLY — it runs the
+        model (_generate_mlx_safe), which must never overlap a live BatchGenerator.
+
+        `cap` is THIS ROW's max_tokens, which is the batch depth on the fresh-group
+        path and min(MLX_MAX_TOKENS, the row's own budget) on the continuous one.
+        It is only recorded as evidence (`token_cap`), never re-derived.
+
+        Keeping the capped take first is the point (see _keep_reject): the
+        re-render is about to replace the only recording of the failure.
+        force_split: the cap hit is PROVEN, so skip the whole re-render
+        _generate_mlx_safe would otherwise try first.
+        """
+        print(f"Orpheus: sentence {idx} hit the MLX audio-token cap; re-rendering split at sentence boundaries")
+        try:
+            capped = self._mlx_row_audio(ptoks, tokens)
+            if capped is not None and len(capped) == 0:
+                capped = None
+        except Exception:
+            capped = None
+        self._keep_reject(idx, clean, capped, 'cap',
+                          {'tokens_emitted': len(tokens),
+                           'token_cap': cap,
+                           'backend': 'mlx'})
+        audio = self._generate_mlx_safe(clean, force_split=True)
+        return self._save_audio(idx, audio, gap[0], gap[1])
+
+    def _mlx_resplit_deferred(self, idx: int, clean: str, gap, reason: str) -> bool:
+        """The re-render half of _guard_truncation, run after the batch for a row
+        whose VERDICT (_needs_resplit) was taken during it. MAIN THREAD ONLY.
+
+        Identical work to _guard_truncation's own tail — same force_split ladder,
+        same ratchet on a 'short' verdict, and the detection log line already fired
+        inside _needs_resplit where the failure was seen. MLX sibling of the vLLM
+        path's _render_deferred_resplits, minus the pooling: on MLX the re-render
+        is a single-sequence render either way.
+        """
+        audio = self._generate_mlx_safe(clean, force_split=True)
+        if reason == 'short':
+            self._ratchet_after_resplit(clean, audio)
+        return self._save_audio(idx, audio, gap[0], gap[1])
+
+    def _mlx_generate_rows(self, rows: list, caps: list, *, depth: int, width: int,
+                           prefill: int, results: dict, group_no: int,
+                           group_count: int, continuous: bool) -> int:
+        """Run ONE mlx_lm.BatchGenerator over `rows`, filling `results` in place.
+        Returns the number of generation steps taken.
+
+        THE ONE GENERATION LOOP. Both _convert_mlx_batch paths call this: the
+        fresh-group path once per group (width == prefill == len(rows), one group
+        of many), the continuous path once for the whole call (width from the
+        memory rule, prefill from MLX_CONTINUOUS_PREFILL, rows far exceeding the
+        width so mlx-lm's scheduler refills retired slots from its own queue).
+        Factored so the two cannot drift apart — the heartbeat, the decode-overlap
+        hand-off, `deferred`, the join and the main-thread deferred pass are
+        literally the same code.
+
+        rows:  [(sentence_index, prompt_tokens, (clean_text, gap), token_budget)]
+        caps:  per-row max_tokens, aligned to `rows`. Group path: `depth` for every
+               row (identical to BatchGenerator's own default, so that path is
+               unchanged). Continuous: min(MLX_MAX_TOKENS, that row's budget), so
+               the anti-runaway ceiling stays PER ROW even though every row now
+               shares one generator — and the cap-hit test after retirement
+               compares against THAT row's cap, never the batch depth.
+
+        Raises on a generation-phase failure; the caller owns the per-item
+        convert() recovery for the rows it left without a result.
+        """
+        import mlx.core as mx
+        from mlx_lm.generate import BatchGenerator
+        from mlx_lm.sample_utils import make_sampler
+        # The repetition penalty is minted by the fast path's factory rather than
+        # make_logits_processors: same mlx-lm closure, plus the marker the batched
+        # step reads (penalty, window) off. Identical on a stock model.
+        from lib.classes.tts_engines.orpheus_mlx_fastpath import make_rep_penalty
+
+        n_rows = len(rows)
+        bg = BatchGenerator(
+            self.mlx_model,
+            max_tokens=depth,
+            # 0.31.3: stop SEQUENCES, not a set of ints — a set iterates
+            # without raising and silently fails to stop.
+            stop_tokens=[[self.END_OF_AUDIO_TOKEN]],
+            sampler=make_sampler(self._voice_cap('temperature'),
+                                 top_p=self._voice_cap('topP'),
+                                 min_p=self._voice_cap('minP')),
+            logits_processors=[make_rep_penalty(
+                self._voice_cap('repPenalty'), self.MLX_REP_WINDOW)],
+            completion_batch_size=width,
+            prefill_batch_size=prefill,
+        )
+        # Row slot 2 here is (clean_text, gap) — NOT the bare string the
+        # other call site carries. len(c) on the tuple is 2, which floors
+        # `expected` at 300 and fired the boost at ~600 tokens on EVERY
+        # row (measured 2026-08-21: 46/46 chunks truncated to ~7s at
+        # 40-60 ch/s before this line said c[0]).
+        boosts = [self._mlx_eos_boost_processor(len(c[0])) for _, _, c, _ in rows]
+        if any(boosts):
+            rep = [make_rep_penalty(
+                self._voice_cap('repPenalty'), self.MLX_REP_WINDOW)]
+            uids = bg.insert(
+                [list(p) for _, p, _, _ in rows],
+                max_tokens=list(caps),
+                logits_processors=[rep + [b] if b else list(rep) for b in boosts])
+        else:
+            uids = bg.insert([list(p) for _, p, _, _ in rows],
+                             max_tokens=list(caps))
+        out = {u: [] for u in uids}
+        # uids come back in insert order == row order. In the continuous path that
+        # is QUEUE order, not the order rows start generating in — every lookup
+        # below goes through these maps, never through position.
+        row_by_uid = dict(zip(uids, rows))     # uid -> row
+        cap_by_uid = dict(zip(uids, caps))     # uid -> that row's token cap
+        pending = set(uids)                    # rows not yet handed off
+
+        # ---- decode overlap -------------------------------------
+        #
+        # See MLX_DECODE_OVERLAP. A row retires the moment its
+        # finish_reason lands; handing it to ONE decoder thread there
+        # buys back the ~80 s the serial post-batch loop used to spend
+        # with generation stopped. The thread does the CHEAP half only
+        # — SNAC decode, the truncation VERDICT (_needs_resplit), the
+        # FLAC write — and defers every row that would need the MODEL
+        # back to the main thread, which runs them after bg.close().
+        # So _generate_mlx_safe is NEVER called next to a live
+        # BatchGenerator and that path's memory profile is unchanged.
+        deferred = []        # (idx, clean, gap, kind, ptoks, tokens, cap, err)
+                             # kind: 'cap' | 'short' | 'empty' | 'error'
+        worker_results = {}  # written ONLY by the decoder thread
+        worker_error = []
+        abandoned = []       # non-empty => stop after the current row
+        row_q = None
+        decoder = None
+        overlap = bool(self.MLX_DECODE_OVERLAP)
+        decode_stream = self._mlx_decode_stream() if overlap else None
+        if overlap and decode_stream is None:
+            # No cross-thread stream on this mlx: decoding on the
+            # generation stream would just serialize behind it, which
+            # is the thing being fixed. Say so and stay serial.
+            print('[ORPHEUS] MLX decode overlap unavailable '
+                  '(mlx.core.new_thread_unsafe_stream missing); '
+                  'decoding serially after the batch', flush=True)
+            overlap = False
+        if not getattr(self, '_mlx_overlap_announced', False):
+            self._mlx_overlap_announced = True
+            print('[ORPHEUS] MLX decode overlap '
+                  + ('ON: retired rows are decoded and written while the '
+                     'batch keeps generating (ORPHEUS_MLX_DECODE_OVERLAP=0 '
+                     'to disable)'
+                     if overlap else
+                     'OFF: rows are decoded serially after the batch'),
+                  flush=True)
+
+        def _finish_row_serially(idx, ptoks, clean, gap, tokens, cap):
+            """ONE row, start to finish, on THIS thread — the whole
+            kill-switch path, and the rescue path if the decoder
+            thread dies. Model re-renders run inline, as they always
+            did; every caller is the main thread."""
+            try:
+                if len(tokens) >= cap:
+                    # Hit the token cap without finishing → the audio
+                    # would be clipped. Re-render split instead.
+                    results[idx] = self._mlx_rerender_capped(
+                        idx, clean, ptoks, tokens, cap, gap)
+                    return
+                audio = self._mlx_row_audio(ptoks, tokens)
+                # Backstop a silent early-EOS truncation (clean stop,
+                # audio too short for the text) the cap check can't
+                # catch. force_split: a whole-chunk re-render would
+                # just clean-EOS (truncated) again — the resplit must
+                # actually split.
+                audio = self._guard_truncation(
+                    idx, clean, audio,
+                    lambda c: self._generate_mlx_safe(c, force_split=True)
+                )
+                results[idx] = self._save_audio(idx, audio, gap[0], gap[1])
+            except Exception as decode_err:
+                print(f"Orpheus MLX batch decode error for sentence {idx}: {decode_err}")
+                results[idx] = False
+
+        def _decode_retired_row(idx, ptoks, clean, gap, tokens, cap):
+            """ONE retired row on the DECODER THREAD. Everything here
+            is model-free; anything that isn't goes on `deferred`."""
+            if len(tokens) >= cap:
+                # Cap hit → a re-render, which is the model. Not here.
+                deferred.append((idx, clean, gap, 'cap', ptoks, tokens, cap, None))
+                return
+            try:
+                # mx.stream(): "Create a context manager to set the
+                # default device and stream." Scheduling SNAC on our
+                # own stream is the point — on the generation stream
+                # the decode would queue behind the next forward pass.
+                with mx.stream(decode_stream):
+                    audio = self._mlx_row_audio(ptoks, tokens)
+                # Only the VERDICT is taken here — _needs_resplit is
+                # the decision half _guard_truncation was split into
+                # for exactly this (its log line still fires here, at
+                # detection). The re-render it implies is the model,
+                # so it is deferred to the main thread.
+                reason = self._needs_resplit(idx, clean, audio)
+                if reason is not None:
+                    deferred.append((idx, clean, gap, reason, ptoks, tokens, cap, None))
+                    return
+                worker_results[idx] = self._save_audio(idx, audio, gap[0], gap[1])
+            except Exception as decode_err:
+                # Fail this row, not the batch — and report it from the
+                # main thread so the print order is deterministic.
+                deferred.append((idx, clean, gap, 'error', ptoks, tokens, cap, decode_err))
+
+        def _decode_worker():
+            try:
+                while True:
+                    row = row_q.get()
+                    if row is None:   # sentinel: the batch is over
+                        return
+                    if abandoned:
+                        # The main thread gave up waiting and is
+                        # re-rendering this bucket itself; writing more
+                        # sentence files now would race it.
+                        continue
+                    _decode_retired_row(*row)
+            except BaseException as thread_err:
+                # A failure OUTSIDE a row (the thread's own machinery).
+                # Recorded, never swallowed: the join below finishes
+                # whatever is still queued on the main thread.
+                worker_error.append(thread_err)
+
+        if overlap:
+            import queue as _queue
+            import threading as _threading
+            row_q = _queue.Queue()
+            decoder = _threading.Thread(
+                target=_decode_worker, daemon=True,
+                name=f'orpheus-mlx-decode-{group_no}')
+            decoder.start()
+
+        # Heartbeat: a long MLX batch is otherwise SILENT for minutes, which
+        # the BookForge worker watchdog reads as "stuck" and false-kills the
+        # worker (its GENERATION_ACTIVITY_RE only knew vLLM's tqdm). Emit a
+        # throttled liveness line carrying real progress — it keeps the
+        # watchdog fresh AND is the ONLY thing the queue UI can draw a
+        # within-batch progress bar from (the rendered files all land at
+        # once when the batch ends, so the chunk bar is frozen until then).
+        #
+        # Payload, in the one order that keeps BOTH directions compatible:
+        #   [ORPHEUS] MLX batch generating: 95 rows, ~1259 tokens
+        #             (step 1260/3400), 12/95 rows done, batch 1/2
+        # The leading "<N> rows, ~<T> tokens" is byte-identical to the old
+        # line, so an OLD BookForge (whose regex ends there) still parses a
+        # NEW fork; everything after is additive, so a NEW BookForge reads
+        # the extra fields when they're there and degrades to token-only
+        # progress when they aren't. `rows done` counts rows RETIRED
+        # (finish_reason set — 'stop' or the 'length' cap), which each row
+        # reports exactly once before BatchGenerator filters it out of the
+        # live set: monotone, and exact at completion. step/depth is the
+        # token-depth bound the width derivation used, so a fraction is
+        # computable before any row has retired.
+        #
+        # The continuous path appends ONE more field, again additive and
+        # again after everything that already existed:
+        #   ..., batch 1/1 live 72
+        # `live` is rows that have STARTED generating minus rows retired —
+        # derived from the responses seen (a uid appears in a response only
+        # once it is generating), not from BatchGenerator internals, so it is
+        # a fact about what the loop observed. It is what tells the A/B apart
+        # at a glance: it should sit at the width until the queue drains,
+        # where the group path's tail sags towards 1.
+        #
+        # Interval is 10 s, down from 15: the line is now a UI progress
+        # source, not just a liveness ping, and 10 s is under the "is it
+        # frozen?" threshold while still costing ~36 log lines per 6-minute
+        # batch. The watchdog (12 min) has an enormous margin either way.
+        import time as _time
+        _step = 0
+        _retired = 0
+        _started = set()     # uids that have been seen generating at least once
+        _HB_SECONDS = 10.0
+        _last_hb = 0.0  # 0 → the first generated step prints immediately
+        # 0.31.3: next() returns (prompt_responses, generation_responses),
+        # so `while responses := bg.next()` would never terminate.
+        # next_generated() yields just the generation list and returns
+        # empty once every row has retired AND the queue is drained.
+        while responses := bg.next_generated():
+            _step += 1
+            for r in responses:
+                _started.add(r.uid)
+                if r.finish_reason != 'stop':  # stop token (128258) is dropped
+                    out[r.uid].append(r.token)
+                if r.finish_reason is not None:
+                    # 'stop' (EOS matched) or 'length' (hit that row's
+                    # max_tokens) — either way this row is done and won't be
+                    # seen again, so out[uid] is FINAL here (the token above
+                    # was its last) and the row can be decoded now instead of
+                    # after the slowest row of the batch. `pending` keeps
+                    # exactly-once a promise rather than an assumption.
+                    _retired += 1
+                    if overlap and r.uid in pending:
+                        pending.discard(r.uid)
+                        _idx, _ptoks, (_clean, _gap), _budget = row_by_uid[r.uid]
+                        row_q.put((_idx, _ptoks, _clean, _gap, list(out[r.uid]),
+                                   cap_by_uid[r.uid]))
+            _now = _time.time()
+            if _now - _last_hb >= _HB_SECONDS:
+                _maxtok = max((len(v) for v in out.values()), default=0)
+                _line = (f"[ORPHEUS] MLX batch generating: {n_rows} rows, "
+                         f"~{_maxtok} tokens (step {_step}/{depth}), "
+                         f"{_retired}/{n_rows} rows done, "
+                         f"batch {group_no}/{group_count}")
+                if continuous:
+                    _line += f" live {len(_started) - _retired}"
+                print(_line, flush=True)
+                _last_hb = _now
+        bg.close()
+        if not overlap:
+            # Kill-switch path: today's serial post-batch loop, in
+            # row (== insert) order.
+            for (idx, ptoks, (clean, gap), _budget), uid in zip(rows, uids):
+                _finish_row_serially(idx, ptoks, clean, gap, out[uid], cap_by_uid[uid])
+        else:
+            # Anything that never reported a finish_reason (shouldn't
+            # happen) still has to be handed over — exactly once.
+            for (idx, ptoks, (clean, gap), _budget), uid in zip(rows, uids):
+                if uid in pending:
+                    pending.discard(uid)
+                    row_q.put((idx, ptoks, clean, gap, list(out[uid]), cap_by_uid[uid]))
+            row_q.put(None)   # drain what's queued, then exit
+            decoder.join(timeout=self.MLX_DECODE_JOIN_SECONDS)
+            if decoder.is_alive():
+                # WEDGED. A partial batch must never be returned as a
+                # whole one, so raise and let the bucket recovery in the
+                # caller re-render these rows per item — naming what is
+                # stuck. `abandoned` stops the thread taking any FURTHER
+                # row, so the overlap with the recovery is one in-flight
+                # row at worst (both takes are valid audio for the same
+                # text).
+                abandoned.append(True)
+                raise RuntimeError(
+                    f'Orpheus MLX decode thread still running after '
+                    f'{self.MLX_DECODE_JOIN_SECONDS:.0f}s with {row_q.qsize()} '
+                    f'row(s) still queued (batch {group_no}/{group_count}, '
+                    f'{n_rows} rows)')
+            # Merged AFTER the join, so `results` has exactly one writer
+            # at a time and needs no lock. (worker_results is written
+            # only by a thread that has now exited.)
+            results.update(worker_results)
+            if worker_error:
+                # The thread died on its own machinery rather than on a
+                # row. Whatever it never dequeued is still queued —
+                # finish it here rather than lose it.
+                print(f'Orpheus: MLX decode thread failed ({worker_error[0]}); '
+                      f'finishing {row_q.qsize()} remaining row(s) on the main thread')
+                while True:
+                    try:
+                        row = row_q.get_nowait()
+                    except Exception:
+                        break
+                    if row is not None:
+                        _finish_row_serially(*row)
+
+        # Everything the decoder thread refused, on the MAIN thread,
+        # exactly as the serial loop would have done it — so the
+        # single-sentence model path never overlaps a BatchGenerator.
+        # Sorted by sentence index, not retirement order, so the
+        # re-renders (and the rate ratchet they can raise) land in the
+        # same order the serial loop would have run them in.
+        for _idx, _clean, _gap, _kind, _ptoks, _tokens, _cap, _err in sorted(
+                deferred, key=lambda row: row[0]):
+            try:
+                if _kind == 'cap':
+                    results[_idx] = self._mlx_rerender_capped(
+                        _idx, _clean, _ptoks, _tokens, _cap, _gap)
+                elif _kind == 'error':
+                    print(f"Orpheus MLX batch decode error for sentence {_idx}: {_err}")
+                    results[_idx] = False
+                else:
+                    results[_idx] = self._mlx_resplit_deferred(
+                        _idx, _clean, _gap, _kind)
+            except Exception as deferred_err:
+                print(f"Orpheus MLX batch decode error for sentence {_idx}: {deferred_err}")
+                results[_idx] = False
+        return _step
+
     def _convert_mlx_batch(self, items: list) -> list:
         """Batched MLX decode via mlx_lm.BatchGenerator (Mac).
 
@@ -3600,9 +4215,14 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
         at the full 3700-token cap that lands at 72 rows.
 
         Throughput is bought by BATCH WIDTH: 12.4 sent/min at B=16 → 27-28 at
-        B=96 (the knee; B=128 is slower). `items` is exactly one BATCH_SIZE chunk
-        (batch_pool_size) — the old 4x pool existed only to refill length buckets,
-        and both are gone now that 0.31.3 right-pads prefills.
+        B=96 (the knee; B=128 is slower). `items` is one batch_pool_size chunk:
+        BATCH_SIZE normally, 4 x BATCH_SIZE while continuous batching is on (see
+        batch_pool_size — the scheduler needs queued rows to refill with). Either
+        way the rows GENERATING at once never exceed _mlx_width_for_depth.
+
+        Row scheduling is the one thing MLX_CONTINUOUS changes; both paths run
+        through _mlx_generate_rows, which is the only place a BatchGenerator is
+        built and driven.
 
         Sampling follows the per-voice caps
         (temperature/topP/minP/repPenalty, see VOICE_CAP_SOURCES) like the vLLM
@@ -3610,11 +4230,12 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
         (mlx_audio's generate doesn't plumb it; see the MIN_P comment).
         """
         try:
-            import numpy as np
             import mlx.core as mx
-            from mlx_lm.generate import BatchGenerator
-            from mlx_lm.sample_utils import make_sampler, make_logits_processors
-            from mlx_audio.tts.models.llama.llama import decode_audio_from_codes
+            # BatchGenerator / make_sampler / make_rep_penalty now live in
+            # _mlx_generate_rows, the ONE place a generator is built and driven.
+            # numpy and SNAC's decode_audio_from_codes moved into _mlx_row_audio —
+            # the one place a row's tokens become a waveform, shared by the serial
+            # loop and the decoder thread.
 
             results = {}
             sentence_by_idx = dict(items)  # for per-item retry on a bucket failure
@@ -3630,159 +4251,103 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
                     ptoks = self.mlx_model.prepare_input_ids(clean, self.voice)[0].tolist()
                     gen.append((idx, ptoks, (clean, gap), self._mlx_token_budget(clean)))
 
-            # Batches are consecutive BOOK-ORDER slices whose width is capped
-            # against the MLX memory budget from their own token depth
-            # (_mlx_batch_groups). No length bucketing: mlx-lm 0.31.3 right-pads
-            # batch prefills, so a short heading batched next to packed prose is
-            # safe. Each group is its own BatchGenerator; the model stays loaded so
-            # the extra prefills are cheap relative to generation.
-            groups = self._mlx_batch_groups(gen)
-            for group_no, (bucket, depth) in enumerate(groups, 1):
+            # HOW THE ROWS ARE SCHEDULED — the one thing MLX_CONTINUOUS changes.
+            #
+            # Fresh groups (ORPHEUS_MLX_CONTINUOUS=0): consecutive BOOK-ORDER
+            # slices whose width is capped against the MLX memory budget from
+            # their own token depth (_mlx_batch_groups), each its own
+            # BatchGenerator run to completion. Simple and predictable, but the
+            # TAIL of every group decodes at dwindling width.
+            #
+            # Continuous (default in this working tree): ONE BatchGenerator over
+            # every row of the call, width from the same memory rule (the KV bound
+            # is width x depth regardless of HOW rows are scheduled), and mlx-lm's
+            # own scheduler refills a retired slot from the queue on the next step.
+            # See the MLX_CONTINUOUS block for why this may LOSE — extend()
+            # left-pads a refilled row to the oldest live row's context.
+            #
+            # No length bucketing in either: mlx-lm 0.31.3 right-pads batch
+            # prefills, so a short heading batched next to packed prose is safe.
+            # The model stays loaded, so extra prefills are cheap relative to
+            # generation.
+            if not gen:
+                # Every sentence in the call was empty; _write_silence has already
+                # answered for all of them.
+                pass
+            elif self.MLX_CONTINUOUS:
+                depth = min(self.MLX_MAX_TOKENS, max(e[3] for e in gen))
+                # steady=True: continuous batching holds width x depth for the whole
+                # run, so the width is derived from the MEASURED peak per row, not
+                # the arithmetic cache size the group path can afford to use.
+                width = self._mlx_width_for_depth(depth, steady=True)
+                prefill = max(1, min(width, self.MLX_CONTINUOUS_PREFILL))
+                # Per-row anti-runaway ceiling. One generator now carries rows of
+                # very different lengths, so the cap CANNOT be the batch's depth —
+                # it is each row's own budget, handed to insert() as a list, and
+                # the cap-hit test after retirement compares against that.
+                caps = [min(self.MLX_MAX_TOKENS, e[3]) for e in gen]
+                if not getattr(self, '_mlx_continuous_announced', False):
+                    self._mlx_continuous_announced = True
+                    steady_gb = (self.MLX_WEIGHTS_GB
+                                 + float(os.environ.get('ORPHEUS_MLX_CACHE_LIMIT_GB', '8'))
+                                 + width * depth * self.MLX_KV_MB_PER_TOKEN_ROW_STEADY / 1024.0)
+                    print(f'[ORPHEUS] MLX continuous batching ON: width {width}, '
+                          f'prefill {prefill}, {len(gen)} rows queued, projected '
+                          f'steady state {steady_gb:.1f} GB of the '
+                          f'{self.MLX_MEM_BUDGET_GB:g} GB budget '
+                          f'(ORPHEUS_MLX_CONTINUOUS=0 for fresh groups)', flush=True)
                 try:
-                    bg = BatchGenerator(
-                        self.mlx_model,
-                        max_tokens=depth,
-                        # 0.31.3: stop SEQUENCES, not a set of ints — a set iterates
-                        # without raising and silently fails to stop.
-                        stop_tokens=[[self.END_OF_AUDIO_TOKEN]],
-                        sampler=make_sampler(self._voice_cap('temperature'),
-                                             top_p=self._voice_cap('topP'),
-                                             min_p=self._voice_cap('minP')),
-                        logits_processors=make_logits_processors(
-                            None, self._voice_cap('repPenalty'), self.MLX_REP_WINDOW),
-                        completion_batch_size=len(bucket),
-                        prefill_batch_size=len(bucket),
-                    )
-                    # Row slot 2 here is (clean_text, gap) — NOT the bare string the
-                    # other call site carries. len(c) on the tuple is 2, which floors
-                    # `expected` at 300 and fired the boost at ~600 tokens on EVERY
-                    # row (measured 2026-08-21: 46/46 chunks truncated to ~7s at
-                    # 40-60 ch/s before this line said c[0]).
-                    boosts = [self._mlx_eos_boost_processor(len(c[0])) for _, _, c, _ in bucket]
-                    if any(boosts):
-                        rep = make_logits_processors(
-                            None, self._voice_cap('repPenalty'), self.MLX_REP_WINDOW)
-                        uids = bg.insert(
-                            [list(p) for _, p, _, _ in bucket],
-                            logits_processors=[rep + [b] if b else list(rep) for b in boosts])
-                    else:
-                        uids = bg.insert([list(p) for _, p, _, _ in bucket])
-                    out = {u: [] for u in uids}
-                    # Heartbeat: a long MLX batch is otherwise SILENT for minutes, which
-                    # the BookForge worker watchdog reads as "stuck" and false-kills the
-                    # worker (its GENERATION_ACTIVITY_RE only knew vLLM's tqdm). Emit a
-                    # throttled liveness line carrying real progress — it keeps the
-                    # watchdog fresh AND is the ONLY thing the queue UI can draw a
-                    # within-batch progress bar from (the rendered files all land at
-                    # once when the batch ends, so the chunk bar is frozen until then).
-                    #
-                    # Payload, in the one order that keeps BOTH directions compatible:
-                    #   [ORPHEUS] MLX batch generating: 95 rows, ~1259 tokens
-                    #             (step 1260/3400), 12/95 rows done, batch 1/2
-                    # The leading "<N> rows, ~<T> tokens" is byte-identical to the old
-                    # line, so an OLD BookForge (whose regex ends there) still parses a
-                    # NEW fork; everything after is additive, so a NEW BookForge reads
-                    # the extra fields when they're there and degrades to token-only
-                    # progress when they aren't. `rows done` counts rows RETIRED
-                    # (finish_reason set — 'stop' or the 'length' cap), which each row
-                    # reports exactly once before BatchGenerator filters it out of the
-                    # live set: monotone, and exact at completion. step/depth is the
-                    # token-depth bound the width derivation used, so a fraction is
-                    # computable before any row has retired.
-                    #
-                    # Interval is 10 s, down from 15: the line is now a UI progress
-                    # source, not just a liveness ping, and 10 s is under the "is it
-                    # frozen?" threshold while still costing ~36 log lines per 6-minute
-                    # batch. The watchdog (12 min) has an enormous margin either way.
-                    import time as _time
-                    _step = 0
-                    _retired = 0
-                    _HB_SECONDS = 10.0
-                    _last_hb = 0.0  # 0 → the first generated step prints immediately
-                    # 0.31.3: next() returns (prompt_responses, generation_responses),
-                    # so `while responses := bg.next()` would never terminate.
-                    # next_generated() yields just the generation list and returns
-                    # empty once every row has retired.
-                    while responses := bg.next_generated():
-                        _step += 1
-                        for r in responses:
-                            if r.finish_reason is not None:
-                                # 'stop' (EOS matched) or 'length' (hit max_tokens) —
-                                # either way this row is done and won't be seen again.
-                                _retired += 1
-                            if r.finish_reason != 'stop':  # stop token (128258) is dropped
-                                out[r.uid].append(r.token)
-                        _now = _time.time()
-                        if _now - _last_hb >= _HB_SECONDS:
-                            _maxtok = max((len(v) for v in out.values()), default=0)
-                            print(f"[ORPHEUS] MLX batch generating: {len(bucket)} rows, "
-                                  f"~{_maxtok} tokens (step {_step}/{depth}), "
-                                  f"{_retired}/{len(bucket)} rows done, "
-                                  f"batch {group_no}/{len(groups)}", flush=True)
-                            _last_hb = _now
-                    bg.close()
-                    # uids come back in insert order == bucket order.
-                    for (idx, ptoks, (clean, gap), _budget), uid in zip(bucket, uids):
-                        try:
-                            if len(out[uid]) >= depth:
-                                # Hit the token cap without finishing → the audio would be
-                                # clipped. Re-render split at sentence boundaries instead.
-                                print(f"Orpheus: sentence {idx} hit the MLX audio-token cap; re-rendering split at sentence boundaries")
-                                # Keep the runaway before the re-render replaces it (see
-                                # _keep_reject); same evidence problem as the vLLM path.
-                                try:
-                                    ids = mx.array([ptoks + out[uid]])
-                                    code_lists = self.mlx_model.parse_output(ids)
-                                    capped = np.array(decode_audio_from_codes(code_lists[0])[0],
-                                                      dtype=np.float32) if code_lists and len(code_lists[0]) > 0 else None
-                                except Exception:
-                                    capped = None
-                                self._keep_reject(idx, clean, capped, 'cap',
-                                                  {'tokens_emitted': len(out[uid]),
-                                                   'token_cap': depth,
-                                                   'backend': 'mlx'})
-                                # force_split: the cap hit is PROVEN, so skip the whole
-                                # re-render _generate_mlx_safe would otherwise try first.
-                                audio = self._generate_mlx_safe(clean, force_split=True)
-                                results[idx] = self._save_audio(idx, audio, gap[0], gap[1])
-                                continue
-                            ids = mx.array([ptoks + out[uid]])
-                            code_lists = self.mlx_model.parse_output(ids)
-                            if code_lists and len(code_lists[0]) > 0:
-                                audio = np.array(
-                                    decode_audio_from_codes(code_lists[0])[0], dtype=np.float32
-                                )
-                            else:
-                                # No valid codes (immediate early-EOS / unparseable
-                                # stream): EMPTY, not fabricated silence — fabricated
-                                # zeros sailed past _save_audio's empty-rejection and
-                                # shipped the sentence as success with no audio. The
-                                # guard below re-renders empties once; if that fails
-                                # too, _save_audio fails the row loudly.
-                                audio = np.zeros(0, dtype=np.float32)
-                            # Backstop a silent early-EOS truncation (clean stop, audio
-                            # too short for the text) the token-cap check can't catch.
-                            # force_split: a whole-chunk re-render would just clean-EOS
-                            # (truncated) again — the resplit must actually split.
-                            audio = self._guard_truncation(
-                                idx, clean, audio,
-                                lambda c: self._generate_mlx_safe(c, force_split=True)
-                            )
-                            results[idx] = self._save_audio(idx, audio, gap[0], gap[1])
-                        except Exception as decode_err:
-                            print(f"Orpheus MLX batch decode error for sentence {idx}: {decode_err}")
-                            results[idx] = False
+                    steps = self._mlx_generate_rows(
+                        gen, caps, depth=depth, width=width, prefill=prefill,
+                        results=results, group_no=1, group_count=1, continuous=True)
+                    # mx.get_peak_memory() is the PROCESS high-water mark, not a
+                    # per-call figure, and it is deliberately not reset: the
+                    # question this experiment has to answer is whether continuous
+                    # batching ever exceeded the 45 GB budget over the whole book
+                    # (July measured 36 GB at width 96 because refill prefills
+                    # interleave with full-width decode). Printed next to the row
+                    # and step counts so the analytics comparison has the memory
+                    # number beside the throughput one.
+                    print(f'[ORPHEUS] MLX continuous batch done: {len(gen)} rows, '
+                          f'{steps} steps, peak {mx.get_peak_memory() / 1e9:.1f} GB',
+                          flush=True)
                 except Exception as bucket_err:
-                    # A generation-phase failure (BatchGenerator/insert/next) for
-                    # ONE bucket must not kill the others. Mirror the outer batch-
-                    # level recovery at bucket granularity: retry this bucket's rows
-                    # per item via convert() rather than dropping them.
+                    # A generation-phase failure (BatchGenerator/insert/next) must
+                    # not drop the call's rows: retry per item via convert(),
+                    # exactly as the group path does for one bucket.
                     print(f"Orpheus._convert_mlx_batch() bucket error: {bucket_err}")
                     import traceback
                     traceback.print_exc()
-                    for idx, _ptoks, _payload, _budget in bucket:
+                    for idx, _ptoks, _payload, _budget in gen:
                         if idx not in results:
                             results[idx] = self.convert(idx, sentence_by_idx[idx])
+            else:
+                if not getattr(self, '_mlx_continuous_announced', False):
+                    self._mlx_continuous_announced = True
+                    print('[ORPHEUS] MLX continuous batching OFF: fresh groups',
+                          flush=True)
+                groups = self._mlx_batch_groups(gen)
+                for group_no, (bucket, depth) in enumerate(groups, 1):
+                    try:
+                        # Uniform cap == BatchGenerator's own max_tokens default,
+                        # so this path is byte-for-byte what it was.
+                        self._mlx_generate_rows(
+                            bucket, [depth] * len(bucket), depth=depth,
+                            width=len(bucket), prefill=len(bucket),
+                            results=results, group_no=group_no,
+                            group_count=len(groups), continuous=False)
+                    except Exception as bucket_err:
+                        # A generation-phase failure (BatchGenerator/insert/next)
+                        # for ONE bucket must not kill the others. Mirror the outer
+                        # batch-level recovery at bucket granularity: retry this
+                        # bucket's rows per item via convert() rather than dropping
+                        # them.
+                        print(f"Orpheus._convert_mlx_batch() bucket error: {bucket_err}")
+                        import traceback
+                        traceback.print_exc()
+                        for idx, _ptoks, _payload, _budget in bucket:
+                            if idx not in results:
+                                results[idx] = self.convert(idx, sentence_by_idx[idx])
 
             # NO mx.clear_cache() / _cleanup_memory() here. The buffer cache is
             # bounded once at load (_load_mlx_engine sets mx.set_cache_limit), so
