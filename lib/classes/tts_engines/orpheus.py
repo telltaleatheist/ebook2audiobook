@@ -489,6 +489,40 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
     EOS_BOOST = float(os.environ.get('ORPHEUS_EOS_BOOST', '0.0'))
     EOS_BOOST_START = float(os.environ.get('ORPHEUS_EOS_BOOST_START', '1.2'))
 
+    # EOS minimum-length FLOOR (2026-09-03): the mirror of the boost. On the
+    # mistborn 240-draw battery every fine-tune shows EARLY stops at 30-60% of
+    # the text (ASR-verified), 5-15 per 240 depending on epoch, on top of the
+    # loops the boost exists for; the served models only ever caught the fast
+    # ones after the fact, via the maxCharsPerSec rate guard and a re-render.
+    # This refuses END_OF_SPEECH at decode time instead: while a request has
+    # generated fewer than EOS_FLOOR x its expected token count, the EOS logit
+    # is -inf. Expected = chars / EOS_FLOOR_RATE ch-per-s x TOKENS_PER_AUDIO_SECOND,
+    # a pure SPEECH estimate at the voice's MEDIAN rate (15.0 default; the
+    # catalog can set a per-voice p50 through eosFloorRate). No tail allowance:
+    # the model's flat tail only makes a real clip LONGER than the estimate, so
+    # leaving it out keeps the floor one-directional safe. The honest fast reads
+    # sit at >= 0.75 of expected and the truncations at 0.3-0.6, hence 0.55.
+    #
+    # THE INVARIANT that makes the floor safe: it forbids EOS exactly on a read
+    # faster than EOS_FLOOR_RATE / EOS_FLOOR chars per second (15 / 0.55 = 27.3),
+    # and a read that fast is one the rate guard (maxCharsPerSec) would already
+    # reject and re-render. _eos_floor_tokens REFUSES a configuration where that
+    # rate drops below the guard's, because a floor tighter than the guard would
+    # gag the model past a correct ending and force it to invent audio.
+    #
+    # Independent of the boost: it never touches the boost's ramp (which starts
+    # at eosBoostStart x a DIFFERENT expectation, _expected_audio_tokens), and the
+    # two can never both be active at one step — the floor covers n < ~0.55x
+    # expected, the ramp n > 1.2-2.0x. Per request, sized from that request's own
+    # prompt, so a batch is safe. Default 0 = OFF; enable per voice through
+    # models.json backends.vllm.eosFloor (registered cap for the streaming server,
+    # ORPHEUS_EOS_FLOOR for the audiobook worker spawn env). vLLM only — the MLX
+    # port is a separate job because mlx-lm's processor counts PROMPT tokens in
+    # its context (see _mlx_eos_boost_processor), so the same arithmetic would
+    # land the floor in the wrong place there; a floor configured on MLX raises.
+    EOS_FLOOR = float(os.environ.get('ORPHEUS_EOS_FLOOR', '0.0'))
+    EOS_FLOOR_RATE = float(os.environ.get('ORPHEUS_EOS_FLOOR_RATE', '15.0'))
+
     # Tail allowance for a chunk's expected token count, in AUDIO TOKENS
     # (2026-08-28, short-heading repeat). The expected-length estimate every
     # anti-runaway lever is sized from is `chars / 18.4 ch-per-s x 84 tokens-per-s`
@@ -608,6 +642,8 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
         'repPenalty':     ('ORPHEUS_REP_PENALTY',       'REP_PENALTY'),
         'eosBoost':       ('ORPHEUS_EOS_BOOST',         'EOS_BOOST'),
         'eosBoostStart':  ('ORPHEUS_EOS_BOOST_START',   'EOS_BOOST_START'),
+        'eosFloor':       ('ORPHEUS_EOS_FLOOR',         'EOS_FLOOR'),
+        'eosFloorRate':   ('ORPHEUS_EOS_FLOOR_RATE',    'EOS_FLOOR_RATE'),
         'maxCharsPerSec': ('ORPHEUS_MAX_CHARS_PER_SEC', 'DEFAULT_MAX_CHARS_PER_SEC'),
     }
 
@@ -641,6 +677,12 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
     # _lora_request() returns None unconditionally on that path and there is no
     # registry for a wipe to desynchronise.
     _voice_caps = {}
+
+    # Voices whose EOS floor has been announced on the log. Class-level for the
+    # same reason as _voice_caps: the audiobook worker is one voice per process
+    # (so this is "once per job"), the streaming server serves many voices for
+    # the life of the process (so "once per voice").
+    _eos_floor_announced = set()
 
     # Special token IDs
     END_OF_AUDIO_TOKEN = 128258
@@ -2566,29 +2608,86 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
         speech = n_chars / 18.4 * self.TOKENS_PER_AUDIO_SECOND
         return min(max(300.0, speech), self.SHORT_CHUNK_TAIL_TOKENS + speech)
 
-    def _eos_boost_processor(self, n_chars: int, voice: str = None):
-        """Per-request vLLM logits processor implementing the EOS boost (see the
-        EOS_BOOST comment at the top of the class). Returns None when disabled.
-        Expected token count uses the file's own anchors: ~18.4 chars/sec of
-        speech and TOKENS_PER_AUDIO_SECOND audio tokens/sec.
+    def _eos_floor_tokens(self, n_chars: int, voice: str = None) -> float:
+        """The generated-token count BELOW which END_OF_SPEECH is forbidden for a
+        chunk of `n_chars` (see the EOS_FLOOR comment at the top of the class),
+        or 0.0 when the voice has no floor. Announced once per voice on first use.
 
-        `voice` is per-request because the boost is a property of the FINE-TUNE
-        (only the bed-free voices carry the thin greedy EOS margin it corrects),
-        and a batch may eventually mix voices."""
+        Refuses, loudly, a floor tighter than the truncation guard: the floor's
+        own rate is eosFloorRate / eosFloor chars per second, and if that is not
+        above maxCharsPerSec the floor would forbid EOS on reads the guard
+        accepts as honest, gagging the model past its ending. A guard of 0 is
+        "disabled" and imposes no bound."""
+        ratio = self._voice_cap('eosFloor', voice)
+        if ratio <= 0:
+            return 0.0
+        if voice is None:
+            voice = self.voice
+        if ratio >= 1.0:
+            raise ValueError(
+                f"Orpheus EOS floor for {voice!r}: eosFloor must be a fraction of the "
+                f'expected length in (0, 1), got {ratio}')
+        rate = self._voice_cap('eosFloorRate', voice)
+        if rate <= 0:
+            raise ValueError(
+                f"Orpheus EOS floor for {voice!r}: eosFloorRate must be a positive "
+                f'chars-per-second speech rate, got {rate}')
+        floor_rate = rate / ratio
+        guard = self._max_chars_per_sec(voice)
+        if guard > 0 and floor_rate <= guard:
+            raise ValueError(
+                f"Orpheus EOS floor for {voice!r} is tighter than its truncation guard: "
+                f'eosFloorRate {rate} / eosFloor {ratio} forbids EOS on any read faster '
+                f'than {floor_rate:.1f} ch/s, but maxCharsPerSec {guard} accepts reads up '
+                f'to {guard} ch/s as honest. Lower eosFloor or raise eosFloorRate.')
+        if voice not in self._eos_floor_announced:
+            self._eos_floor_announced.add(voice)
+            print(f'Orpheus: EOS floor for {voice}: END_OF_SPEECH forbidden below '
+                  f'{ratio:g} x expected (chars / {rate:g} ch/s x '
+                  f'{self.TOKENS_PER_AUDIO_SECOND} tok/s), i.e. on any read faster than '
+                  f'{floor_rate:.1f} ch/s (rate guard {guard:g})')
+        return ratio * n_chars / rate * self.TOKENS_PER_AUDIO_SECOND
+
+    def _eos_boost_processor(self, n_chars: int, voice: str = None):
+        """Per-request vLLM logits processor carrying BOTH end-of-speech levers
+        (see the EOS_BOOST and EOS_FLOOR comments at the top of the class):
+
+          - the FLOOR: while fewer than _eos_floor_tokens have been generated,
+            the EOS logit is -inf (an early stop cannot be sampled at all);
+          - the BOOST: past eosBoostStart x _expected_audio_tokens, the EOS
+            logit gains a bias that ramps with the overrun.
+
+        The two windows never overlap (floor < ~0.55x expected, boost start >=
+        1.2x expected), so the boost's arithmetic here is byte-for-byte what it
+        was before the floor existed. Returns None when neither is configured,
+        so an untuned voice pays nothing. Expected token counts use the file's
+        own anchors (~18.4 chars/sec of speech for the boost, the voice's median
+        rate for the floor) and TOKENS_PER_AUDIO_SECOND audio tokens/sec.
+
+        `voice` is per-request because both levers are properties of the
+        FINE-TUNE (only the bed-free voices carry the thin greedy EOS margin the
+        boost corrects), and a batch may eventually mix voices. vLLM hands the
+        two-argument processor its GENERATED token ids only (0.7.3
+        _apply_logits_processors: past_tokens_ids = output_token_ids), so `n`
+        counts audio tokens with no prompt in it."""
         base = self._voice_cap('eosBoost', voice)
-        if base <= 0:
+        floor = self._eos_floor_tokens(n_chars, voice)
+        if base <= 0 and floor <= 0:
             return None
         expected = self._expected_audio_tokens(n_chars)
         start = self._voice_cap('eosBoostStart', voice) * expected
         eos = self.END_OF_AUDIO_TOKEN
+        neg_inf = float('-inf')
 
-        def _boost(token_ids, logits):
+        def _eos_levers(token_ids, logits):
             n = len(token_ids)
-            if n > start:
+            if n < floor:
+                logits[eos] = neg_inf
+            elif base > 0 and n > start:
                 # ramp with overrun, capped at 4x the base bias
                 logits[eos] += base * min(4.0, 1.0 + (n - start) / expected)
             return logits
-        return _boost
+        return _eos_levers
 
     def _mlx_eos_boost_processor(self, n_chars: int):
         """The EOS boost, ported to mlx-lm's logits-processor contract
@@ -2610,6 +2709,17 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
         legitimate slow tail is safe margin: the catalog's measured p05 delivery
         (13.78 ch/s) puts a correct 500-char render at ~3,050 tokens, under the
         ~3,330 clamped start."""
+        floor = self._voice_cap('eosFloor')
+        if floor > 0:
+            # NOT a silent no-op: a voice tuned with a floor would otherwise render
+            # a whole book on the Mac without it and nothing would say so. The
+            # port needs its own arithmetic (mlx-lm's `len(tokens)` includes the
+            # prompt) and its own fast-path marker; see the EOS_FLOOR comment.
+            raise NotImplementedError(
+                f'Orpheus EOS floor (eosFloor {floor:g}) is configured for '
+                f'{self.voice!r} but is vLLM-only; the MLX backend has no port yet. '
+                'Remove eosFloor from this voice\'s backends.mlx overlay / unset '
+                'ORPHEUS_EOS_FLOOR to render on MLX.')
         base = self._voice_cap('eosBoost')
         if base <= 0:
             return None
