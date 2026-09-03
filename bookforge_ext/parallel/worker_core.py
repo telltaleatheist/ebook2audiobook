@@ -448,10 +448,16 @@ def run_worker_tts(
                 batch_size = tts_manager.batch_size
                 # Flush threshold. An engine may ask for a POOL deeper than its batch
                 # size and re-slice internally; it never generates a batch wider than
-                # batch_size. No engine currently asks for one (Orpheus/MLX used to,
-                # to refill length buckets — both are gone since mlx-lm 0.31.3 fixed
-                # batch prefill padding), so this is generic plumbing, not a live
-                # behaviour. Absent/smaller values collapse to batch_size.
+                # batch_size. Orpheus/MLX asks for 4x while continuous batching is on
+                # (ORPHEUS_MLX_CONTINUOUS): one BatchGenerator spans the whole flush
+                # and refills a retired slot from the rows still queued, so a pool of
+                # exactly batch_size would leave it nothing to refill with. Two
+                # consequences, both visible from here: the per-sentence "Converting
+                # sentence" lines below are printed only after a flush RETURNS, so
+                # they arrive in blocks of pool_size (the engine's [ORPHEUS]
+                # heartbeat is the within-flush progress source), and a cooperative
+                # stop drops the whole flush (see in_flight in _flush_batch).
+                # Absent/smaller values collapse to batch_size.
                 pool_size = max(batch_size, getattr(tts_manager, 'batch_pool_size', batch_size))
                 if take == 0:
                     if pool_size != batch_size:
