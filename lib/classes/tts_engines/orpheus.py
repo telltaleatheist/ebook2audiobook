@@ -3,6 +3,12 @@ from lib.classes.tts_engines.common.preset_loader import load_engine_presets
 from lib.classes.tts_engines.common.audio import trim_audio
 from lib.classes.tts_engines.common.orpheus_text import asr_gate_risk
 from lib.classes.tts_engines.common import asr_gate
+# Fast-start streaming's frame arithmetic. Safe to import at module scope (it
+# pulls numpy and nothing else) — unlike orpheus_mlx_fastpath, which imports mlx
+# and therefore has to stay lazy.
+from lib.classes.tts_engines.orpheus_stream_decode import (
+    PAYLOAD_FRAMES, RIGHT_CONTEXT_FRAMES, SAMPLES_PER_FRAME, TOKENS_PER_FRAME,
+    StreamDecodeMisaligned, WindowedFrameEmitter)
 # TEST Step 3c: Direct imports since headers no longer provides them
 import torch
 import torchaudio
@@ -13,6 +19,7 @@ import os
 import re
 import math
 import atexit
+import threading
 import weakref
 
 # Track active Orpheus instances for cleanup on exit
@@ -157,6 +164,48 @@ def _mlx_lora_linear_cls():
 
         _MLX_LORA_LINEAR = _OrpheusMlxLoRALinear
     return _MLX_LORA_LINEAR
+
+
+class _VllmStreamRow:
+    """One in-flight vLLM request during a fast-start batch (2026-09-04).
+
+    Pure state, no behaviour: Orpheus._absorb_stream_tokens fills it and
+    _retire_vllm_stream_row empties it. It exists because the streaming loop
+    drives LLMEngine.step() directly instead of LLM.generate(), so nothing else
+    is keeping the per-request bookkeeping any more.
+
+    `raw_tokens` is EVERY generated token in order, which is exactly what
+    `out.outputs[0].token_ids` would have handed the non-streaming ladder at the
+    end — so a non-streamed row's decode/guard/resplit behaviour is unchanged by
+    the fact that it arrived a step at a time.
+
+    `audio_tokens` is the streamed row's separate, FILTERED view: SNAC codes
+    only, EOS and anything out of the audio range dropped, because the windowed
+    decoder slices it at exact multiples of 7 and a stray token would shift
+    every later frame (the misalignment _redistribute_codes exists to catch).
+
+    `consumed` tracks how much of the CUMULATIVE token_ids has already been
+    folded in — vLLM 0.7.3 defaults SamplingParams.output_kind to CUMULATIVE, so
+    every step re-sends the whole list and only the tail is new.
+    """
+    __slots__ = ('index', 'clean', 'voice', 'request_id', 'streamed',
+                 'consumed', 'raw_tokens', 'audio_tokens', 'eos_seen',
+                 'emitter', 'chunks', 'failed', 'retired')
+
+    def __init__(self, index, clean, voice, request_id, streamed):
+        self.index = index
+        self.clean = clean
+        self.voice = voice
+        self.request_id = request_id
+        self.streamed = streamed
+        self.consumed = 0
+        self.raw_tokens = []
+        self.audio_tokens = []
+        self.eos_seen = False
+        self.emitter = None
+        self.chunks = []
+        self.failed = False
+        self.retired = False
 
 
 class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
@@ -684,6 +733,27 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
     # the life of the process (so "once per voice").
     _eos_floor_announced = set()
 
+    # _keep_reject's mutual exclusion (2026-09-04). Two threads can reach it at
+    # once: the MLX decoder thread takes a retired row's _needs_resplit verdict
+    # while the main thread takes another row's, and fast start makes that the
+    # NORM rather than a rarity (a streamed row's verdict is taken on the
+    # decoder thread at every flush). The body makedirs, torchaudio.save's a
+    # numbered stem, and — the part that actually corrupts — APPENDS a JSON line
+    # to one shared events.jsonl. Two interleaved appends produce a half-written
+    # record that no post-mortem can parse.
+    #
+    # A LOCK, NOT A HAND-OFF. The alternative was to defer every streamed row's
+    # verdict to the main thread at shutdown, but that would hold a streamed
+    # row's on_row (and therefore the client's "sentence done") until the whole
+    # bucket ends — which is the exact latency fast start exists to remove. The
+    # lock costs a few file writes' worth of serialization on a path that only
+    # fires when a guard fires, and it fixes the pre-existing hazard in
+    # _mlx_generate_rows' decoder thread at the same time.
+    #
+    # Class-level: the streaming server has one engine, but two engines in one
+    # process would still share a reject directory.
+    _reject_lock = threading.Lock()
+
     # Special token IDs
     END_OF_AUDIO_TOKEN = 128258
 
@@ -711,6 +781,12 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
             # ceiling ratcheted up by a fast fine-tune (deathstalker ~23.5 ch/s) would
             # otherwise disarm the guard for a slow one still reading at ~15.
             self._rate_ceilings = {}
+
+            # Serial for fast-start vLLM request ids (see
+            # _generate_batch_stream_vllm). Initialised here so the streaming
+            # loop can just increment it — a getattr-with-default there would be
+            # a fallback standing in for an attribute that should always exist.
+            self._stream_batch_serial = 0
 
             # Try to load presets, but don't fail if they're missing
             try:
@@ -2399,7 +2475,77 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
             print(f"Orpheus _generate_mlx_batch_audio decode error [{i}]: {decode_err}")
             return None
 
-    def _generate_mlx_batch_audio(self, texts: list, on_row=None, should_stop=None) -> list:
+    def _mlx_frame_decoder(self, out: dict, uid, decode_stream):
+        """The `decode_frames` callable WindowedFrameEmitter drives for ONE MLX
+        row (2026-09-04, fast start).
+
+        WHY NOT parse_output. _mlx_row_audio decodes a whole clip through
+        mlx_model.parse_output, which crops at the LAST 128257 (the prompt's
+        START_OF_SPEECH), removes 128258, trims to a multiple of 7 and subtracts
+        128266 — walking the entire prompt+generation with a Python double loop
+        over a mask, EVERY call. A windowed decode runs ~30x per row, so that
+        cost would grow quadratically for no gain: we already hold the generated
+        tokens on their own, with the stop token dropped by the generation loop,
+        so `[t - 128266 for t in tokens[a*7:b*7]]` is exactly the code list
+        parse_output would have produced for those frames.
+
+        WHY READING `out[uid]` FROM THE DECODER THREAD IS SAFE. The generation
+        thread only ever APPENDS to that list, and this closure only ever slices
+        a PREFIX the dispatcher has already counted. CPython's list append and
+        list slice both complete under the GIL, so the slice can never observe a
+        half-written element or a reallocation in progress. The stream the
+        decode runs on is the one cross-thread stream from _mlx_decode_stream,
+        under the one-decoder-thread discipline documented there.
+
+        THE 75-SAMPLE TAIL (measured on the Mac, 2026-09-04). mlx_audio's SNAC
+        does NOT return n * 2048 samples for n frames — it returns n * 2048 + 75,
+        every time and for every width (1 frame -> 2123, 4 -> 8267, 6 -> 12363,
+        7 -> 14411, 20 -> 41035, 24 -> 49227). The extra 75 samples are a TAIL,
+        not a lead-in: cross-correlating a window's interior against the
+        whole-clip decode puts the best alignment at offset 0 (rms 0.0027 against
+        a signal rms of 0.078), so samples [0, n*2048) of a window are the frames
+        we asked for, in place, and everything past that is ring-out. So the
+        window is TRIMMED to the frame arithmetic here rather than the frame
+        arithmetic being loosened to fit it — the emitter's exact-length check
+        stays exact, which is the one thing standing between a wrong slice and a
+        listener's ears.
+
+        The consequence, stated plainly: a STREAMED MLX row is 75 samples
+        (3.1 ms at 24 kHz) shorter than the same row through _mlx_row_audio,
+        because the whole-clip decode keeps its one trailing ring-out and the
+        streamed row's last window has its trimmed off. 3 ms at the very end of
+        a sentence, under the inter-sentence gap the worker appends, is
+        inaudible; a mis-sliced payload would not be. torch SNAC (the vLLM path)
+        returns exactly n * 2048 and is unaffected by any of this.
+        """
+        import mlx.core as mx
+        from mlx_audio.tts.models.llama.llama import decode_audio_from_codes
+
+        def _decode(first, last):
+            codes = [t - 128266 for t in
+                     out[uid][first * TOKENS_PER_FRAME:last * TOKENS_PER_FRAME]]
+            if decode_stream is None:
+                audio = decode_audio_from_codes(codes)[0]
+            else:
+                with mx.stream(decode_stream):
+                    audio = decode_audio_from_codes(codes)[0]
+            # np.array() forces the eval, so this row's graph is complete before
+            # the next window's is built — the sequencing _mlx_decode_stream's
+            # docstring requires.
+            arr = np.array(audio, dtype=np.float32)
+            want = (last - first) * SAMPLES_PER_FRAME
+            if len(arr) < want:
+                # SHORT is not a tail, it is a different decoder. Refuse rather
+                # than pad: every later payload would be cut from the wrong place.
+                raise StreamDecodeMisaligned(
+                    f'mlx SNAC returned {len(arr)} samples for frames '
+                    f'[{first}, {last}) — fewer than the {want} '
+                    f'({last - first} x {SAMPLES_PER_FRAME}) those frames are')
+            return arr[:want]
+        return _decode
+
+    def _generate_mlx_batch_audio(self, texts: list, on_row=None, should_stop=None,
+                                  stream_rows=None, on_chunk=None) -> list:
         """Batch-generate raw audio for many (already-cleaned) sentences in ONE
         MLX BatchGenerator pass — continuous batching, ~3.6x the per-sentence
         throughput. Returns float32 waveforms aligned to `texts` (None for an
@@ -2439,6 +2585,33 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
 
         The model itself is never touched: each bucket builds its own
         BatchGenerator, so an abandoned one leaves nothing behind for the next call.
+
+        `stream_rows` / `on_chunk` — fast start (2026-09-04). Indices in
+        `stream_rows` are WINDOW-DECODED WHILE THEY GENERATE: every ~28 generated
+        tokens (4 frames, ~0.34 s of audio) the row's new frames are decoded with
+        one frame of left context and two of right, and the interior is handed to
+        `on_chunk(i, seq, audio)` — see orpheus_stream_decode for the arithmetic
+        and why the context is not optional. At retirement the row is flushed,
+        its payloads are concatenated, and `on_row(i, full)` fires as usual.
+        Default None -> not one line of the code below runs and the batch behaves
+        exactly as it always did.
+
+        A STREAMED ROW IS NEVER RE-RENDERED. _resolve_mlx_row's cap ladder and
+        the truncation resplit both replace audio, and audio that has been
+        emitted has been heard. So a streamed row skips that ladder entirely: the
+        cap hit and the _needs_resplit verdict are LOGGED with an
+        [ORPHEUS][STREAM] line and the audio stands.
+
+        THREADING. The windowed decodes run on ONE decoder thread over the single
+        cross-thread stream from _mlx_decode_stream() — the same discipline
+        _mlx_generate_rows uses, and for the same reason: on the generation
+        stream every 0.34 s decode would queue behind the next forward pass and
+        the fast start would cost more than it buys. So `on_chunk` and a streamed
+        row's `on_row` ARE CALLED FROM THAT THREAD. A caller whose sink is not
+        thread-safe must queue them. When this mlx cannot hand a stream across
+        threads the decodes run inline on the generation thread instead (loudly —
+        the callbacks then arrive on the calling thread), because a stalled
+        fast start is still better than sharing the generation stream.
         """
         from mlx_lm.generate import BatchGenerator
         from mlx_lm.sample_utils import make_sampler
@@ -2447,6 +2620,12 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
         # step reads (penalty, window) off. Behaves identically on a stock model.
         from lib.classes.tts_engines.orpheus_mlx_fastpath import make_rep_penalty
 
+        stream_rows = set() if stream_rows is None else set(stream_rows)
+        if stream_rows and on_chunk is None:
+            raise ValueError(
+                '_generate_mlx_batch_audio: stream_rows is non-empty but no '
+                'on_chunk was given; there would be nowhere for the streamed '
+                'audio to go')
         results = [None] * len(texts)
         gen = []  # (index, prompt_tokens, clean_text, token_budget) for non-empty sentences
         for i, t in enumerate(texts):
@@ -2471,6 +2650,15 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
             if should_stop is not None and should_stop():
                 stopped = True
                 break
+            # Named before the try so the exception handler can shut a decoder
+            # thread down even when the failure landed before the streaming
+            # state was built (a BatchGenerator that would not construct).
+            # `stream_fatal` is created here, not inside, so the handler can
+            # read it whatever happened; the shutdown gets it bound in. Non-empty
+            # means "this is not a per-bucket problem" - see the two places that
+            # append to it.
+            _stream_shutdown = None
+            stream_fatal = []
             try:
                 bg = BatchGenerator(
                     self.mlx_model,
@@ -2498,6 +2686,271 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
                 out = {u: [] for u in uids}
                 row_by_uid = dict(zip(uids, bucket))   # uid -> (i, ptoks, clean, budget)
                 pending = set(uids)                    # rows not yet resolved
+
+                # ---- fast start, for THIS bucket -----------------------------
+                #
+                # Everything below is inert when the caller named no stream_rows:
+                # `streams` is empty, no thread is started, and the loop is the
+                # loop it has always been.
+                #
+                # EVERY per-bucket name the nested functions touch is bound into
+                # them as a KEYWORD DEFAULT, evaluated here, once. Read out of
+                # the enclosing scope instead, `out`, `streams`, `emitters`,
+                # `depth`, `row_by_uid` and `job_q` would all be REBOUND by the
+                # next turn of the bucket loop - so a decoder thread that somehow
+                # outlived its bucket (a join that timed out) would decode the
+                # NEXT bucket's tokens against THIS bucket's emitters, writing
+                # one row's audio into another row's stream. The join is what
+                # should make that impossible; the binding is what makes it
+                # impossible even when the join has failed.
+                streams = {u: row_by_uid[u][0] for u in uids
+                           if row_by_uid[u][0] in stream_rows}
+                emitters = {}
+                stream_chunks = {}       # uid -> [payloads]
+                stream_failed = set()    # uids whose windowed decode broke
+                stream_results = {}      # index -> audio; ALSO the answered set
+                stream_error = []        # the decoder thread's own machinery failing
+                stream_abandoned = []    # non-empty => drop whatever is still queued
+                stream_closed = []       # shutdown runs exactly once per bucket
+                stream_flushed = set()   # uids a flush has been DISPATCHED for
+                # Per-uid high-water mark: the emitter's emitted_frames as of
+                # this row's last dispatch. Written and read ONLY by the
+                # generation thread (the dispatch site below), so unlike the
+                # dicts the decoder thread touches it needs no keyword binding.
+                last_dispatch_ef = {}
+                job_q = None
+                decoder_box = []         # the decoder thread, once it exists
+                if streams:
+                    decode_stream = self._mlx_decode_stream()
+                    for u in streams:
+                        emitters[u] = WindowedFrameEmitter(
+                            self._mlx_frame_decoder(out, u, decode_stream),
+                            label=f'row {streams[u]}')
+                        stream_chunks[u] = []
+                        last_dispatch_ef[u] = -1   # nothing dispatched yet
+                    if decode_stream is None:
+                        # No cross-thread stream on this mlx. Decoding on the
+                        # GENERATION stream from another thread is the race
+                        # _mlx_decode_stream refuses, so run inline instead and
+                        # say so: generation pauses for each ~0.34 s window, which
+                        # is slower than it should be but still starts fast.
+                        print('[ORPHEUS][STREAM] mlx.core.new_thread_unsafe_stream '
+                              'is missing, so windowed decodes cannot be moved off '
+                              'the generation thread; decoding INLINE (callbacks '
+                              'arrive on the calling thread)',
+                              file=sys.stderr, flush=True)
+                    else:
+                        # Imported HERE, not at the top of the method: the
+                        # switch-ON path must not pay so much as an import it
+                        # never had.
+                        import queue as _queue
+                        job_q = _queue.Queue()
+
+                def _stream_emit(uid, kind, n_tokens, *,
+                                 _streams=streams, _emitters=emitters,
+                                 _chunks=stream_chunks, _failed=stream_failed,
+                                 _results=stream_results, _out=out,
+                                 _rows=row_by_uid, _depth=depth):
+                    """One emitter call for one row, wherever this runs.
+
+                    'push' mid-row, 'flush' at retirement. A decode failure fails
+                    the ROW and nothing else: there is no retake to fall back on
+                    (the audio is playing) and emitting past a bad window would
+                    splice the row's own audio out of order.
+
+                    Every 'flush' writes _results[i] - including the failure
+                    paths - so _results doubles as the ANSWERED set the shutdown
+                    reconciles against.
+                    """
+                    i = _streams[uid]
+                    if uid in _failed:
+                        if kind == 'flush':
+                            _results[i] = None
+                            if on_row is not None:
+                                on_row(i, None)
+                        return
+                    try:
+                        # The on_chunk loop is deliberately OUTSIDE the try: a
+                        # callback that raises is the caller's bug, and blaming
+                        # it on the windowed decode would send whoever reads the
+                        # log to the wrong place.
+                        pairs = (_emitters[uid].flush(n_tokens) if kind == 'flush'
+                                 else _emitters[uid].push(n_tokens))
+                    except Exception as emit_err:
+                        _failed.add(uid)
+                        print(f'[ORPHEUS][STREAM] row {i} windowed decode failed '
+                              f'({emit_err}); the row is reported as a failure and '
+                              f'its chunks are discarded',
+                              file=sys.stderr, flush=True)
+                        if kind == 'flush':
+                            _results[i] = None
+                            if on_row is not None:
+                                on_row(i, None)
+                        return
+                    for seq, pcm in pairs:
+                        _chunks[uid].append(pcm)
+                        on_chunk(i, seq, pcm)
+                    if kind != 'flush':
+                        return
+                    clean = _rows[uid][2]
+                    full = np.concatenate(_chunks[uid]) if _chunks[uid] else None
+                    if len(_out[uid]) >= _depth:
+                        # The cap ladder in _resolve_mlx_row would re-render this
+                        # split. A streamed row cannot: the clipped audio has
+                        # already been heard. Say so and keep it.
+                        print(f'[ORPHEUS][STREAM] row {i} hit the MLX audio-token '
+                              f'cap ({_depth}); the streamed audio stands - nothing '
+                              f'can retract audio that has already been played',
+                              file=sys.stderr, flush=True)
+                    if full is not None:
+                        # Verdict only: _needs_resplit still logs the detection and
+                        # keeps the reject, so a fast or empty streamed read is
+                        # still visible; what it does not get is the re-render.
+                        # (_keep_reject underneath it takes _reject_lock, because
+                        # this can run on the decoder thread while the main thread
+                        # is judging a non-streamed row.)
+                        verdict = self._needs_resplit(i, clean, full)
+                        if verdict is not None:
+                            print(f'[ORPHEUS][STREAM] row {i} truncation verdict '
+                                  f'{verdict!r}: kept as streamed, no re-render',
+                                  file=sys.stderr, flush=True)
+                    _results[i] = full
+                    if on_row is not None:
+                        on_row(i, full)
+
+                def _stream_worker(*, _q=job_q, _abandoned=stream_abandoned,
+                                   _error=stream_error, _emit=_stream_emit):
+                    try:
+                        while True:
+                            job = _q.get()
+                            if job is None:      # sentinel: the bucket is over
+                                return
+                            if _abandoned:
+                                # The batch was abandoned or the decoder wedged;
+                                # emitting more now would race the caller's own
+                                # recovery.
+                                continue
+                            _emit(*job)
+                    except Exception as thread_err:
+                        # A failure OUTSIDE a row (the thread's own machinery).
+                        # Recorded, never swallowed: the shutdown answers every
+                        # row this thread will now never reach and then re-raises
+                        # this, because a batch that returns normally with rows
+                        # silently unanswered is the one failure the caller
+                        # cannot see.
+                        #
+                        # Exception, NOT BaseException: a KeyboardInterrupt or a
+                        # SystemExit arriving in this thread should unwind it the
+                        # way it would unwind any other thread, not be caught,
+                        # boxed, and re-raised later on somebody else's stack
+                        # under a "decode thread failed" banner.
+                        _error.append(thread_err)
+
+                def _stream_dispatch(uid, kind, n_tokens, *, _q=job_q,
+                                     _emit=_stream_emit, _flushed=stream_flushed):
+                    if kind == 'flush':
+                        # From here on this row is OWED an on_row, and the
+                        # shutdown is what guarantees it gets one.
+                        _flushed.add(uid)
+                    if _q is not None:
+                        _q.put((uid, kind, n_tokens))
+                    else:
+                        _emit(uid, kind, n_tokens)
+
+                def _stream_shutdown(abandon, *, _streams=streams, _q=job_q,
+                                     _box=decoder_box, _closed=stream_closed,
+                                     _abandoned=stream_abandoned,
+                                     _error=stream_error, _results=stream_results,
+                                     _flushed=stream_flushed,
+                                     _fatal=stream_fatal):
+                    """Drain (or drop) the decoder thread, answer every row it
+                    owes, and merge its results.
+
+                    Idempotent, because it is called on the normal path, on the
+                    stop path and from the bucket's exception handler.
+
+                    IT MUST BE CALLED BEFORE THE NEXT BUCKET STARTS - see the
+                    keyword-default note above for what a thread that outlives
+                    its bucket would do. A join that times out therefore does not
+                    merely log: it marks the call WEDGED, and the bucket loop
+                    ends the whole call rather than starting a second generation
+                    beside a thread that is still running.
+
+                    ONE LATE ANSWER IS POSSIBLE, and only here. A wedged thread is
+                    still inside one job, and `stream_abandoned` only stops it
+                    taking the NEXT one - so that job can still fire an on_chunk
+                    and an on_row for its row AFTER this method has raised and the
+                    call has unwound. At most one row, only ever after the 600 s
+                    timeout, and only for a row the caller has by then given up
+                    on. The caller must therefore tolerate one late answer for a
+                    row it has already failed (ignore it - never emit a second
+                    item for that sentence). Killing the thread instead is not on
+                    the table: it is mid-decode on a live mlx stream.
+                    """
+                    if not _streams or _closed:
+                        return
+                    _closed.append(True)
+                    if abandon:
+                        _abandoned.append(True)
+                    if _q is not None and _box:
+                        decoder = _box[0]
+                        _q.put(None)
+                        decoder.join(timeout=self.MLX_DECODE_JOIN_SECONDS)
+                        if decoder.is_alive():
+                            # WEDGED. Stop it taking any further row, and refuse
+                            # to answer rows it may still be mid-way through -
+                            # two on_rows for one row is worse than none. See the
+                            # docstring: the one job it is inside can still land
+                            # after this raise.
+                            _abandoned.append(True)
+                            _fatal.append(True)
+                            raise RuntimeError(
+                                f'Orpheus MLX stream decode thread still running '
+                                f'after {self.MLX_DECODE_JOIN_SECONDS:.0f}s with '
+                                f'{_q.qsize()} job(s) still queued '
+                                f'({len(_streams)} streamed row(s))')
+                    # Past the join the thread has exited, so `_results` and
+                    # `results` each have exactly one writer and need no lock.
+                    #
+                    # EXACTLY ONCE, even when the thread died. A row whose flush
+                    # was dispatched is owed an on_row; if the worker fell over
+                    # (or was abandoned) before reaching it, nothing else will
+                    # ever answer it and the caller would wait forever. Answer
+                    # those here as failures, loudly.
+                    owed = [uid for uid in _flushed if _streams[uid] not in _results]
+                    for uid in sorted(owed, key=lambda u: _streams[u]):
+                        i = _streams[uid]
+                        print(f'[ORPHEUS][STREAM] row {i} was never finished by the '
+                              f'decode thread; reporting it as a failure',
+                              file=sys.stderr, flush=True)
+                        _results[i] = None
+                        if on_row is not None:
+                            on_row(i, None)
+                    for idx, audio in _results.items():
+                        results[idx] = audio
+                    if _error:
+                        # The decoder thread died on its own machinery. Every row
+                        # it owed has just been answered by the sweep above, so
+                        # nothing is left hanging - but this is NOT a per-bucket
+                        # condition: the thread is gone, and every later bucket
+                        # would silently fall back to answering all of its
+                        # streamed rows as failures. So mark the call fatal
+                        # BEFORE raising; without that flag the raise lands in
+                        # the bucket's `except Exception`, gets printed, and the
+                        # loop marches on into the next bucket (which is exactly
+                        # what an earlier version of this comment wrongly claimed
+                        # it did not do).
+                        _fatal.append(True)
+                        raise _error[0]
+
+                if job_q is not None:
+                    # Imported HERE for the same reason as queue above.
+                    import threading as _threading
+                    decoder_box.append(_threading.Thread(
+                        target=_stream_worker, daemon=True,
+                        name='orpheus-mlx-stream-decode'))
+                    decoder_box[0].start()
+
                 # 0.31.3: next() returns (prompt_responses, generation_responses),
                 # so `while responses := bg.next()` would NEVER terminate.
                 # next_generated() yields just the generation list and returns
@@ -2506,6 +2959,42 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
                     for r in responses:
                         if r.finish_reason != 'stop':  # stop token (128258) is dropped
                             out[r.uid].append(r.token)
+                            # Fast start: ask the emitter the INSTANT a whole
+                            # payload plus its right context exists, so the MLX
+                            # latency is the vLLM latency (6 frames to the first
+                            # chunk, 4 thereafter). Pacing this at fixed
+                            # multiples of 28 tokens instead would put every
+                            # payload up to 4 frames late and the FIRST one at 8
+                            # frames — a third of a second of the half-second
+                            # budget fast start has, given away for nothing.
+                            #
+                            # Reading emitters[uid].emitted_frames across threads
+                            # is a benign int read: only the decoder thread ever
+                            # writes it, only this thread reads it, and CPython
+                            # publishes the attribute atomically. A value one
+                            # cadence stale can only cause a REDUNDANT dispatch
+                            # (the emitter then emits nothing and returns), never
+                            # a missed or duplicated payload — the emitter alone
+                            # decides what is emittable.
+                            #
+                            # The high-water mark is what keeps that cheap. Once
+                            # `len(out) >= need` the condition STAYS true on every
+                            # later token until the decoder actually advances
+                            # emitted_frames - so a lagging decoder would be sent
+                            # one no-op job per token per row, and the row's FLUSH
+                            # would then queue behind all of them. Dispatching
+                            # only when emitted_frames has moved since the last
+                            # dispatch bounds it to one job per cadence per row,
+                            # with no added latency: in the steady state the
+                            # decoder has always advanced by the time `need` is
+                            # met again.
+                            if r.uid in streams:
+                                ef = emitters[r.uid].emitted_frames
+                                need = ((ef + PAYLOAD_FRAMES + RIGHT_CONTEXT_FRAMES)
+                                        * TOKENS_PER_FRAME)
+                                if len(out[r.uid]) >= need and last_dispatch_ef[r.uid] != ef:
+                                    last_dispatch_ef[r.uid] = ef
+                                    _stream_dispatch(r.uid, 'push', len(out[r.uid]))
                         # A row reports finish_reason ('stop' or the 'length' cap)
                         # exactly once, on its LAST response, before BatchGenerator
                         # drops it from the live set — so its token list is final
@@ -2515,9 +3004,16 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
                         if r.finish_reason is not None and r.uid in pending:
                             pending.discard(r.uid)
                             i, ptoks, clean, _budget = row_by_uid[r.uid]
-                            results[i] = self._resolve_mlx_row(i, ptoks, clean, out[r.uid], depth)
-                            if on_row is not None:
-                                on_row(i, results[i])
+                            if r.uid in streams:
+                                # Streamed: flush the tail, then on_row — both from
+                                # the decoder thread. No _resolve_mlx_row, because
+                                # its cap ladder re-renders and this row's audio is
+                                # already out the door.
+                                _stream_dispatch(r.uid, 'flush', len(out[r.uid]))
+                            else:
+                                results[i] = self._resolve_mlx_row(i, ptoks, clean, out[r.uid], depth)
+                                if on_row is not None:
+                                    on_row(i, results[i])
                     # Once per decode step — a dict lookup against a forward pass over
                     # the whole batch. Rows that retired above are already delivered;
                     # the rest are abandoned unresolved.
@@ -2526,6 +3022,13 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
                         break
                 bg.close()
                 if stopped:
+                    # Drain, do NOT abandon: anything already queued is the flush
+                    # of a row that genuinely retired before the stop arrived, and
+                    # those rows stay delivered (the same promise the non-streamed
+                    # abandon path makes). Streamed rows still generating were
+                    # never dispatched a flush, so they get no on_row at all —
+                    # the "not rendered" contract.
+                    _stream_shutdown(False)
                     # stderr, not stdout: the streaming worker's stdout IS the
                     # JSON-lines protocol, and this line lands mid-batch.
                     print(f"[ORPHEUS] MLX batch abandoned on request "
@@ -2538,13 +3041,40 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
                     if uid not in pending:
                         continue
                     pending.discard(uid)
+                    if uid in streams:
+                        _stream_dispatch(uid, 'flush', len(out[uid]))
+                        continue
                     results[i] = self._resolve_mlx_row(i, ptoks, clean, out[uid], depth)
                     if on_row is not None:
                         on_row(i, results[i])
+                _stream_shutdown(False)
             except Exception as e:
                 print(f"Orpheus._generate_mlx_batch_audio() bucket error: {e}")
                 import traceback
                 traceback.print_exc()
+                if _stream_shutdown is not None:
+                    try:
+                        # The thread must never outlive its bucket, whatever
+                        # killed it — and after a bucket failure the state it
+                        # would decode from is not trustworthy, so abandon.
+                        _stream_shutdown(True)
+                    except Exception as shutdown_err:
+                        print('Orpheus._generate_mlx_batch_audio() stream shutdown '
+                              f'also failed: {shutdown_err}')
+                if stream_fatal:
+                    # TWO conditions end the whole call rather than this bucket:
+                    #  - a decoder thread that would not join is STILL RUNNING and
+                    #    still holds this bucket's queue, emitters and mlx stream,
+                    #    so starting the next bucket would run a second generation
+                    #    beside it, over the same model;
+                    #  - a decoder thread that DIED on its own machinery is gone
+                    #    for good, so every later bucket would answer all of its
+                    #    streamed rows as failures, one silent bucket at a time.
+                    # Either way the caller's per-item recovery re-renders what is
+                    # missing, which is a far better outcome than a run that keeps
+                    # going and quietly stops streaming. `raise` re-raises whatever
+                    # brought us here, which names the real first cause.
+                    raise
         # No mx.clear_cache(): the cache is bounded at load (set_cache_limit),
         # and flushing per read-ahead batch just forces cold re-allocation.
         return results
@@ -2871,6 +3401,488 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
             waves.append(self._generate_audio_vllm_safe(part, depth, voice=voice))
         return waves
 
+    # ── fast-start streaming ─────────────────────────────────────────────────
+    #
+    # THE FEATURE, in one paragraph (2026-09-04). Today the browser extension
+    # waits ~30 s before the first word: a sentence is generated whole, decoded
+    # whole, and only then does any audio leave the worker, and the client gates
+    # playback on a cushion on top of that. Fast start does not change batching
+    # width, scheduling, sampling or the guards — it changes WHEN audio leaves:
+    # a streamed row's audio is windowed-decoded and emitted every ~0.34 s while
+    # the row is still generating. It is an EXPERIMENTAL mode behind a switch
+    # that ships OFF (the extension's "buffer before playing" is ON by default);
+    # with the switch on, nothing here is called and no byte of the old path
+    # changes.
+    #
+    # THE ONE RULE THAT SHAPES EVERYTHING: audio that has been emitted has been
+    # HEARD. Nothing can retract it. So a streamed row gets no re-render, no
+    # resplit and no retake — the truncation guard's verdict is taken and LOGGED
+    # (that is what the [ORPHEUS][STREAM] lines are for) and the audio stands.
+    # A row that cannot be decoded at all is reported as a failure so the client
+    # can throw away the chunks it has; a row that merely read fast is kept,
+    # because the alternative is a stutter followed by the same sentence again.
+
+    def generate_batch_stream(self, texts: list, voices: list, stream_rows: set,
+                              on_chunk, on_row, should_stop=None) -> None:
+        """Generate a batch, streaming sub-sentence audio for `stream_rows`.
+
+        texts[i]   — ALREADY cleaned/normalized by the caller, exactly as
+                     _generate_mlx_batch_audio receives them today. Nothing here
+                     re-runs _clean_sentence_for_tts. A row that is blank after
+                     cleaning is REFUSED with a ValueError naming it, not
+                     answered: callers filter empty rows before calling, and the
+                     worker answers them as silence itself, so answering one here
+                     could only mislabel a deliberate gap as a failed sentence.
+        voices[i]  — that row's voice, or None for this engine's loaded voice.
+                     May be None entirely (every row on the loaded voice). vLLM
+                     resolves prompt token, sampling caps AND adapter per row;
+                     MLX serves exactly one voice, so a per-row voice naming
+                     anything else is REFUSED here rather than rendered with the
+                     wrong tuning (the same refusal the worker makes today).
+        stream_rows— indices to stream. Rows outside it are rendered and
+                     delivered exactly as they are today.
+        on_chunk(i, seq, audio_float32) — one emitted payload of row i, seq
+                     counting from 0 for that row. Streamed rows only.
+        on_row(i, audio_float32_or_None) — the row is finished. For a streamed
+                     row `audio` is the CONCATENATION of what was streamed (the
+                     caller uses it for duration/metrics only, never to re-send
+                     the audio); None means the row failed and whatever chunks
+                     were already sent should be discarded.
+        should_stop() — checked once per decode step. When it goes true the
+                     batch is ABANDONED where it stands: rows that have not been
+                     delivered get no on_row at all, so a caller can never
+                     mistake an abandoned row for a finished one. That is the
+                     same contract _generate_mlx_batch_audio's stop already has.
+
+        CALLBACK THREADING. on_chunk and on_row may be invoked from a DECODER
+        THREAD, not from the thread that called this. On MLX that is the norm
+        (the windowed decodes run on the one cross-thread mlx stream, so
+        generation is not stalled by SNAC — see _mlx_decode_stream); on vLLM
+        everything runs on the calling thread. A caller whose sink is not
+        thread-safe — and the streaming worker's stdout, which IS the JSON-lines
+        protocol, is exactly such a sink — must queue these callbacks and drain
+        them on its own thread.
+
+        AND THE SINK MUST NOT BLOCK. The obvious way to make the callbacks
+        thread-safe is a queue the caller's main thread drains — but that main
+        thread is the one blocked inside this call, so a BOUNDED queue would
+        deadlock: the decoder thread waits for space, the join waits for the
+        decoder thread, and nothing drains until MLX_DECODE_JOIN_SECONDS (600 s)
+        expires and the batch is declared wedged. Use an unbounded queue, or
+        write straight through under a lock; never a bounded put that waits.
+        """
+        if not texts:
+            return
+        if voices is not None and len(voices) != len(texts):
+            raise ValueError(
+                f'Orpheus.generate_batch_stream: {len(voices)} voices for '
+                f'{len(texts)} texts; voices must be aligned to texts or None')
+        stream_rows = set() if stream_rows is None else set(stream_rows)
+        stray = [i for i in stream_rows if not (0 <= i < len(texts))]
+        if stray:
+            raise ValueError(
+                f'Orpheus.generate_batch_stream: stream_rows names row(s) {stray} '
+                f'outside the batch of {len(texts)}')
+        if stream_rows and on_chunk is None:
+            raise ValueError(
+                'Orpheus.generate_batch_stream: stream_rows is non-empty but no '
+                'on_chunk was given; there would be nowhere for the streamed '
+                'audio to go')
+        # A BLANK ROW IS A CALLER ERROR, not a row to answer. This method's
+        # contract is one on_row per row, and neither backend can generate
+        # anything from empty text — so a blank row could only ever be answered
+        # as a FAILURE, which is a lie: the worker's own contract is that an
+        # empty sentence becomes a short silence, and the worker already applies
+        # it before calling here. Reporting "no audio generated" for a sentence
+        # the caller deliberately emptied would surface as a broken sentence in
+        # the reader. Refuse instead, naming the row, so the mistake is fixed
+        # where it is made.
+        blank = [i for i, t in enumerate(texts) if not (t or '').strip()]
+        if blank:
+            raise ValueError(
+                f'Orpheus.generate_batch_stream: row(s) {blank} have no text after '
+                'cleaning. Callers filter empty rows before calling; the worker '
+                'answers them as silence itself.')
+        # stderr, not stdout: this lands mid-batch and the streaming worker's
+        # stdout is the protocol. Once per batch, as the contract specifies.
+        print(f'[ORPHEUS][STREAM] fast-start: streaming {len(stream_rows)} of '
+              f'{len(texts)} rows', file=sys.stderr, flush=True)
+        if self.backend == 'vllm':
+            self._generate_batch_stream_vllm(texts, voices, stream_rows,
+                                             on_chunk, on_row, should_stop)
+            return
+        if self.backend == 'mlx':
+            # ONE voice per MLX engine: the bucket's sampler and adapter come
+            # from this instance's own caps, so a row asking for another voice
+            # could get its prompt token and never its tuning.
+            for i, v in enumerate(voices if voices is not None else ()):
+                if v is not None and v != self.voice:
+                    raise ValueError(
+                        f'Orpheus.generate_batch_stream: row {i} asks for voice '
+                        f'{v!r} but the MLX backend has {self.voice!r} loaded; '
+                        'MLX serves exactly one voice at a time')
+            self._generate_mlx_batch_audio(texts, on_row=on_row,
+                                           should_stop=should_stop,
+                                           stream_rows=stream_rows,
+                                           on_chunk=on_chunk)
+            return
+        raise NotImplementedError(
+            f'Orpheus.generate_batch_stream: the {self.backend!r} backend has no '
+            'streaming path. Fast start needs per-step access to the generated '
+            'tokens, which vLLM (LLMEngine.step) and MLX (BatchGenerator) give '
+            'and transformers.generate() does not — it returns only when the '
+            'whole sequence is done. Render this batch through the ordinary '
+            'non-streaming path instead.')
+
+    def _absorb_stream_tokens(self, row, token_ids) -> None:
+        """Fold ONE step's cumulative `token_ids` into `row`.
+
+        vLLM 0.7.3 re-sends the whole generated sequence every step
+        (RequestOutputKind.CUMULATIVE), so only the tail past `row.consumed` is
+        new. Walking just the tail keeps a 3,700-token row linear instead of
+        quadratic — at ~84 tokens/s and one step per token, re-filtering the
+        whole list every step would be millions of comparisons per row.
+
+        The audio-range test is _redistribute_codes' filter, applied HERE
+        instead of at decode time: the windowed decoder slices at exact
+        multiples of 7, so a non-audio token left in the list would shift every
+        following frame by one slot. Dropping it as it arrives keeps
+        `audio_tokens` a pure frame sequence — and _redistribute_codes still
+        validates each window's slots, so a genuinely malformed stream is caught
+        with the same TokenStreamMisaligned it always was.
+        """
+        if len(token_ids) < row.consumed:
+            raise TokenStreamMisaligned(
+                f'row {row.index}: vLLM returned {len(token_ids)} cumulative '
+                f'tokens after {row.consumed} were already consumed; the request '
+                'output went backwards')
+        eos = self.END_OF_AUDIO_TOKEN
+        for t in token_ids[row.consumed:]:
+            row.raw_tokens.append(t)
+            if t == eos:
+                row.eos_seen = True
+            elif not row.eos_seen and 128266 <= t < 128266 + 4096 * 7:
+                row.audio_tokens.append(t)
+        row.consumed = len(token_ids)
+
+    def _vllm_frame_decoder(self, row):
+        """The `decode_frames` callable WindowedFrameEmitter drives for `row`.
+
+        Frames [first, last) are tokens [first*7, last*7) of the row's filtered
+        audio-token list, decoded through the ordinary _tokens_to_audio — same
+        SNAC model, same OOM ladder, same misalignment check as a whole clip.
+        The closure reads `row.audio_tokens` LIVE, so the window is always cut
+        from whatever has arrived by the time the decode runs.
+        """
+        def _decode(first, last):
+            return self._tokens_to_audio(
+                row.audio_tokens[first * TOKENS_PER_FRAME:last * TOKENS_PER_FRAME])
+        return _decode
+
+    def _generate_batch_stream_vllm(self, texts, voices, stream_rows,
+                                    on_chunk, on_row, should_stop) -> None:
+        """Fast start on vLLM: drive LLMEngine.step() and emit per frame group.
+
+        WHY NOT LLM.generate(). The offline `LLM.generate()` runs its own loop
+        until nothing is unfinished and hands back finished RequestOutputs — by
+        construction there is no per-step hook in it. The engine underneath
+        (`self.engine.llm_engine`) is the same object generate() drives, with the
+        same continuous batching and the same scheduler; add_request/step is
+        simply the API that lets us look at the tokens as they land. Sampling is
+        UNCHANGED because it still comes from _vllm_sampling_params — which is
+        what keeps the per-request EOS boost AND the EOS floor applying to every
+        row, streamed or not.
+
+        WHY NO MODEL CALL HAPPENS INSIDE THE LOOP. _generate_audio_vllm_safe and
+        the resplit ladder call LLM.generate(), which would run ITS OWN
+        step-until-empty loop over the very engine we are streaming through -
+        swallowing our requests' outputs and dropping them on the floor. So a
+        non-streamed row that needs the model again (cap hit, or a truncation
+        verdict) is DEFERRED to after the loop, exactly as _mlx_generate_rows
+        defers its re-renders past bg.close() for the same class of reason. A
+        non-streamed row that needs nothing is delivered at retirement, so it
+        still arrives ahead of the slowest row of the batch.
+
+        A STOP DROPS THE DEFERRED RE-RENDERS TOO - including ones for rows whose
+        GENERATION had already completed. A deferred row is one whose first take
+        was rejected (cap hit, or too fast for its text); finishing it means
+        running the model again for tens of seconds, which is precisely the work
+        the stop exists to avoid, and the listener who pressed stop is not
+        waiting for it. Those rows therefore get no on_row, like every other
+        abandoned row, and the caller reports them as cancelled.
+
+        THE ENGINE IS SHARED AND MUST BE LEFT CLEAN. Every exit runs the finally
+        below, which aborts every request this batch still has in flight and
+        answers every row it never answered. Leaking one live request would be
+        permanent: the NEXT batch's step() would hand it back, hit the
+        unknown-request guard, and raise - for every batch after it, until the
+        worker is restarted.
+        """
+        from vllm import TokensPrompt
+        llm_engine = self.engine.llm_engine
+        # Request ids must be unique among everything in flight on this engine.
+        # A per-instance serial plus the row index is enough and stays readable
+        # in a vLLM log line.
+        self._stream_batch_serial += 1
+        serial = self._stream_batch_serial
+
+        rows = {}          # request_id -> _VllmStreamRow
+        deferred = []      # (row, reason) - needs the MODEL, so after the loop
+        answered = set()   # row indices that have had their on_row
+        stopped = False
+
+        def deliver(i, audio):
+            """on_row, at most once per row. The finally reconciles against it,
+            so a row can be answered on the fast path AND swept without the
+            caller ever seeing two items for one sentence."""
+            if i in answered:
+                return
+            answered.add(i)
+            on_row(i, audio)
+
+        try:
+            for i, text in enumerate(texts):
+                clean = text.strip()
+                # A None entry means "the loaded voice" - the caller's documented
+                # contract (the worker's _row_voice), not a fallback for a
+                # missing value.
+                voice = self.voice if (voices is None or voices[i] is None) else voices[i]
+                rid = f'bf-stream-{serial}-{i}'
+                row = _VllmStreamRow(i, clean, voice, rid, i in stream_rows)
+                if row.streamed:
+                    row.emitter = WindowedFrameEmitter(self._vllm_frame_decoder(row),
+                                                       label=f'row {i}')
+                # Registered BEFORE add_request, so an add_request that throws
+                # half way through the batch still leaves every row it did add
+                # in `rows` for the finally to abort. (A row that failed to be
+                # added is retired-and-unanswered, which the finally answers.)
+                rows[rid] = row
+                try:
+                    llm_engine.add_request(
+                        rid,
+                        TokensPrompt(prompt_token_ids=self._format_prompt_ids(clean, voice)),
+                        self._vllm_sampling_params(len(clean), voice=voice),
+                        lora_request=self._lora_request(voice))
+                except BaseException:
+                    row.retired = True    # nothing in flight for it to abort
+                    raise
+
+            while llm_engine.has_unfinished_requests():
+                # Once per decode step - a callback against a forward pass over
+                # the whole batch.
+                if should_stop is not None and should_stop():
+                    stopped = True
+                    break
+                for out in llm_engine.step():
+                    row = rows.get(out.request_id)
+                    if row is None:
+                        # Something else is using this engine concurrently, and
+                        # this loop has just consumed ITS output - which nothing
+                        # will deliver, because step() hands each output out
+                        # once. Fail loudly rather than drop someone else's
+                        # sentence.
+                        raise RuntimeError(
+                            f'Orpheus fast start: LLMEngine.step() returned request '
+                            f'{out.request_id!r}, which this batch did not add. The '
+                            'streaming loop must own the engine for the duration of '
+                            'a batch.')
+                    if row.retired:
+                        continue
+                    self._absorb_stream_tokens(row, out.outputs[0].token_ids)
+                    if row.streamed and not self._emit_vllm_stream(row, 'push', on_chunk):
+                        # The row is dead. Retire it HERE - an aborted request
+                        # never comes back through step() with finished=True, so
+                        # without this the caller would wait forever for a row
+                        # that will never arrive. (The `retired` guard above
+                        # swallows any output already in flight for it.)
+                        row.retired = True
+                        llm_engine.abort_request(row.request_id)
+                        deliver(row.index, None)
+                        continue
+                    if out.finished:
+                        self._retire_vllm_stream_row(row, on_chunk, deliver, deferred)
+
+            if stopped:
+                # The finally aborts what is still live; say what happened, and
+                # do NOT answer the abandoned rows (that is the contract).
+                live = [r.index for r in rows.values() if not r.retired]
+                print(f'[ORPHEUS][STREAM] vLLM batch abandoned on request '
+                      f'({len(live)} of {len(rows)} rows unrendered)',
+                      file=sys.stderr, flush=True)
+                return
+
+            # THE SWEEP. has_unfinished_requests() has gone false, so nothing of
+            # ours can produce another output - yet a row here has never been
+            # retired, which means step() never returned it finished. That
+            # should be impossible; if it happens, the row would otherwise hang
+            # the caller forever, so answer it as a failure and say so loudly.
+            for row in sorted(rows.values(), key=lambda r: r.index):
+                if row.retired:
+                    continue
+                print(f'[ORPHEUS][STREAM] row {row.index} never finished although '
+                      f'the engine reports nothing unfinished; reporting it as a '
+                      f'failure', file=sys.stderr, flush=True)
+                row.retired = True
+                deliver(row.index, None)
+
+            # Everything that needed the model, now that no request of ours is
+            # in flight. Sorted by row index, not retirement order, so the
+            # re-renders (and the rate ratchet one can raise) land in the order
+            # the serial path would have run them.
+            for row, reason in sorted(deferred, key=lambda d: d[0].index):
+                try:
+                    if reason == 'cap':
+                        # Hit the token cap without an end-of-speech: the clip
+                        # would be clipped. Same ladder the batch path uses today
+                        # - render whole first (it may finish cleanly at this
+                        # length), then the early-EOS backstop.
+                        audio = self._generate_audio_vllm_safe(row.clean, voice=row.voice)
+                        audio = self._guard_truncation(
+                            row.index, row.clean, audio,
+                            lambda c, rv=row.voice: self._generate_audio_vllm_safe(
+                                c, force_split=True, voice=rv),
+                            row.voice)
+                    else:
+                        # The verdict was already taken (and logged, and the
+                        # reject kept) at retirement by _needs_resplit - this is
+                        # only the re-render half of _guard_truncation, so
+                        # calling the whole guard again would double-log and
+                        # double-reject.
+                        audio = self._generate_audio_vllm_safe(
+                            row.clean, force_split=True, voice=row.voice)
+                        if reason == 'short':
+                            self._ratchet_after_resplit(row.clean, audio, row.voice)
+                    deliver(row.index, audio)
+                except Exception as deferred_err:
+                    print(f'[ORPHEUS][STREAM] deferred re-render failed for row '
+                          f'{row.index}: {deferred_err}', file=sys.stderr, flush=True)
+                    if is_fatal_cuda_error(deferred_err):
+                        # Poisoned context - every remaining row would fail
+                        # instantly. The finally still answers them.
+                        raise
+                    deliver(row.index, None)
+        finally:
+            # LEAVE THE ENGINE CLEAN, ALWAYS. Any exception at all - a callback
+            # raising, TokenStreamMisaligned, the fatal-CUDA re-raise, the
+            # unknown-request guard, add_request itself - would otherwise leave
+            # live requests in this shared LLMEngine, and the next batch's very
+            # first step() would return them, hit the unknown-request guard and
+            # raise. That is not a lost batch, it is a bricked worker.
+            # NOTHING IN HERE MAY THROW. This block runs while an exception is
+            # already in flight most of the time it matters, and a raise from a
+            # finally REPLACES that exception - the real first cause would be
+            # lost, and every orphan after the one that threw would go
+            # unanswered. So the abort and each individual deliver get their own
+            # try/except: report and carry on.
+            live = [rid for rid, r in rows.items() if not r.retired]
+            if live:
+                try:
+                    llm_engine.abort_request(live)
+                except Exception as abort_err:
+                    print(f'[ORPHEUS][STREAM] could not abort {len(live)} live '
+                          f'request(s): {abort_err}', file=sys.stderr, flush=True)
+                for rid in live:
+                    rows[rid].retired = True
+            if not stopped:
+                # On a STOP, unanswered rows stay unanswered by design. On any
+                # other exit they must be answered exactly once, or the caller
+                # waits forever for a row that no longer exists. On the normal
+                # path this loop finds nothing.
+                orphans = sorted(r.index for r in rows.values()
+                                 if r.index not in answered)
+                for i in orphans:
+                    try:
+                        print(f'[ORPHEUS][STREAM] row {i} left unanswered when the '
+                              f'batch ended; reporting it as a failure',
+                              file=sys.stderr, flush=True)
+                        deliver(i, None)
+                    except Exception as sweep_err:
+                        # A raising on_row is the caller's bug; it must not cost
+                        # the REST of the orphans their answer.
+                        print(f'[ORPHEUS][STREAM] on_row raised while failing row '
+                              f'{i}: {sweep_err}', file=sys.stderr, flush=True)
+
+    def _emit_vllm_stream(self, row, kind, on_chunk) -> bool:
+        """Run the emitter for `row` ('push' mid-row, 'flush' at the end), hand
+        every payload to on_chunk, and report whether it worked.
+
+        A decode failure fails the ROW and marks it so: there is no re-render to
+        fall back to (the audio is already playing) and emitting past a bad
+        window would splice the row's own audio out of order. Only the caller
+        knows what to do about it — abort the request, deliver the failure —
+        because only the caller is holding the engine and the callbacks.
+
+        The on_chunk loop is deliberately OUTSIDE the try: a callback that
+        raises is the caller's bug, and blaming it on the windowed decode would
+        send whoever reads the log to the wrong place.
+        """
+        try:
+            pairs = (row.emitter.flush(len(row.audio_tokens)) if kind == 'flush'
+                     else row.emitter.push(len(row.audio_tokens)))
+        except Exception as emit_err:
+            row.failed = True
+            print(f'[ORPHEUS][STREAM] row {row.index} windowed decode failed '
+                  f'({emit_err}); the row is reported as a failure and its '
+                  f'chunks are discarded', file=sys.stderr, flush=True)
+            return False
+        for seq, pcm in pairs:
+            row.chunks.append(pcm)
+            on_chunk(row.index, seq, pcm)
+        return True
+
+    def _retire_vllm_stream_row(self, row, on_chunk, deliver, deferred) -> None:
+        """One vLLM row whose tokens are final: deliver it, or defer the half
+        that needs the model.
+
+        `deliver` is the caller's exactly-once wrapper around on_row, not on_row
+        itself, so a row answered here can never be answered a second time by
+        the caller's end-of-batch sweep."""
+        row.retired = True
+        if row.streamed:
+            # A row that fails HERE has already been streamed in part, so `full`
+            # is None and the caller reports a failure — which is the client's
+            # signal to throw away the chunks it holds. (A row that failed
+            # mid-generation never reaches this method; the loop retires it on
+            # the spot.)
+            ok = self._emit_vllm_stream(row, 'flush', on_chunk)
+            full = np.concatenate(row.chunks) if (ok and row.chunks) else None
+            if not row.eos_seen:
+                print(f'[ORPHEUS][STREAM] row {row.index} stopped without an '
+                      f'end-of-speech token ({len(row.audio_tokens)} audio tokens); '
+                      'the streamed audio stands — nothing can retract audio that '
+                      'has already been played', file=sys.stderr, flush=True)
+            if full is not None:
+                # Verdict only. _needs_resplit still logs the detection and keeps
+                # the reject, which is how a fast/empty streamed read stays
+                # visible in the log and in the reject folder; what it does NOT
+                # get is the re-render.
+                verdict = self._needs_resplit(row.index, row.clean, full, row.voice)
+                if verdict is not None:
+                    print(f'[ORPHEUS][STREAM] row {row.index} truncation verdict '
+                          f'{verdict!r}: kept as streamed, no re-render',
+                          file=sys.stderr, flush=True)
+            deliver(row.index, full)
+            return
+        # Not streamed: today's ladder, one row at a time.
+        try:
+            if not row.eos_seen:
+                deferred.append((row, 'cap'))
+                return
+            tokens = row.raw_tokens[:row.raw_tokens.index(self.END_OF_AUDIO_TOKEN)]
+            audio = self._tokens_to_audio(tokens)
+        except Exception as decode_err:
+            print(f'[ORPHEUS][STREAM] row {row.index} decode failed: {decode_err}',
+                  file=sys.stderr, flush=True)
+            if is_fatal_cuda_error(decode_err):
+                raise
+            deliver(row.index, None)
+            return
+        reason = self._needs_resplit(row.index, row.clean, audio, row.voice)
+        if reason is not None:
+            deferred.append((row, reason))
+            return
+        deliver(row.index, audio)
+
     def _generate_tokens_transformers(self, prompt: str, max_tokens: int = None) -> list:
         """Generate audio tokens using transformers backend."""
         if max_tokens is None:
@@ -3190,56 +4202,66 @@ class Orpheus(TTSUtils, TTSRegistry, name='orpheus'):
 
         BEST-EFFORT BY DESIGN: this is diagnostics, not product. Any failure here is
         reported and swallowed — losing a post-mortem must never take down a book.
+
+        SERIALIZED (_reject_lock): a decoder thread and the main thread can both
+        be in here, and events.jsonl is one shared append-only file. See the
+        lock's own comment for why a lock rather than a hand-off.
         """
         try:
-            _rec_session = getattr(self, 'session', None) or {}
-            directory = self._reject_dir()
-            if not directory:
-                return
-            os.makedirs(directory, exist_ok=True)
-            stem = os.path.join(directory, f'{sentence_index:06d}_{reason}')
-            seconds = None
-            if audio_np is not None and len(audio_np) > 0:
-                wave = torch.from_numpy(np.asarray(audio_np)).float()
-                if wave.dim() == 1:
-                    wave = wave.unsqueeze(0)
-                torchaudio.save(stem + '.wav', wave, self.SAMPLE_RATE)
-                seconds = round(float(wave.shape[-1]) / self.SAMPLE_RATE, 3)
-            record = {
-                'sentence_index': sentence_index,
-                # 'short' = truncated, re-rendered split | 'empty' = no audio |
-                # 'cap' = never emitted EOS, hit the token ceiling |
-                # 'overrun' = short chunk spoke too long; the take SHIPPED anyway
-                'reason': reason,
-                'chars': len(clean),
-                'audio_seconds': seconds,
-                'chars_per_second': round(len(clean) / seconds, 2) if seconds else None,
-                # Null when the engine has no session (see _reject_dir): an
-                # honest hole in the diagnostics beats an exception that eats
-                # the whole record. Reachable via ORPHEUS_REJECT_DIR, which
-                # skips _reject_dir's own no-session return.
-                'voice': _rec_session.get('fine_tuned'),
-                'model_dir': _rec_session.get('orpheus_model_dir'),
-                # Adapter mode: model_dir is None and the voice lives in the adapter,
-                # so a post-mortem needs both refs to know what actually rendered this.
-                'adapter_dir': _rec_session.get('orpheus_adapter_dir'),
-                'base_dir': _rec_session.get('orpheus_base_dir'),
-                'max_audio_tokens': self.MAX_AUDIO_TOKENS,
-                'text': clean,
-            }
-            if detail:
-                record.update(detail)
-            import json as _json
-            with open(stem + '.json', 'w', encoding='utf-8') as handle:
-                _json.dump(record, handle, indent=1, ensure_ascii=False)
-            # One append-only file per run, so a post-mortem is a single read
-            # rather than a directory walk, and so the record survives even if
-            # the per-event wav could not be written.
-            with open(os.path.join(directory, 'events.jsonl'), 'a', encoding='utf-8') as handle:
-                handle.write(_json.dumps(record, ensure_ascii=False) + '\n')
-            self._emit_guard_event(record)
+            with self._reject_lock:
+                self._keep_reject_locked(sentence_index, clean, audio_np, reason, detail)
         except Exception as err:
             print(f'Orpheus: could not keep the rejected render for sentence {sentence_index} ({err})')
+
+    def _keep_reject_locked(self, sentence_index: int, clean: str, audio_np, reason: str, detail: dict = None):
+        """_keep_reject's body, called with _reject_lock held. Split out only so
+        the lock wraps every path including the early return."""
+        _rec_session = getattr(self, 'session', None) or {}
+        directory = self._reject_dir()
+        if not directory:
+            return
+        os.makedirs(directory, exist_ok=True)
+        stem = os.path.join(directory, f'{sentence_index:06d}_{reason}')
+        seconds = None
+        if audio_np is not None and len(audio_np) > 0:
+            wave = torch.from_numpy(np.asarray(audio_np)).float()
+            if wave.dim() == 1:
+                wave = wave.unsqueeze(0)
+            torchaudio.save(stem + '.wav', wave, self.SAMPLE_RATE)
+            seconds = round(float(wave.shape[-1]) / self.SAMPLE_RATE, 3)
+        record = {
+            'sentence_index': sentence_index,
+            # 'short' = truncated, re-rendered split | 'empty' = no audio |
+            # 'cap' = never emitted EOS, hit the token ceiling |
+            # 'overrun' = short chunk spoke too long; the take SHIPPED anyway
+            'reason': reason,
+            'chars': len(clean),
+            'audio_seconds': seconds,
+            'chars_per_second': round(len(clean) / seconds, 2) if seconds else None,
+            # Null when the engine has no session (see _reject_dir): an
+            # honest hole in the diagnostics beats an exception that eats
+            # the whole record. Reachable via ORPHEUS_REJECT_DIR, which
+            # skips _reject_dir's own no-session return.
+            'voice': _rec_session.get('fine_tuned'),
+            'model_dir': _rec_session.get('orpheus_model_dir'),
+            # Adapter mode: model_dir is None and the voice lives in the adapter,
+            # so a post-mortem needs both refs to know what actually rendered this.
+            'adapter_dir': _rec_session.get('orpheus_adapter_dir'),
+            'base_dir': _rec_session.get('orpheus_base_dir'),
+            'max_audio_tokens': self.MAX_AUDIO_TOKENS,
+            'text': clean,
+        }
+        if detail:
+            record.update(detail)
+        import json as _json
+        with open(stem + '.json', 'w', encoding='utf-8') as handle:
+            _json.dump(record, handle, indent=1, ensure_ascii=False)
+        # One append-only file per run, so a post-mortem is a single read
+        # rather than a directory walk, and so the record survives even if
+        # the per-event wav could not be written.
+        with open(os.path.join(directory, 'events.jsonl'), 'a', encoding='utf-8') as handle:
+            handle.write(_json.dumps(record, ensure_ascii=False) + '\n')
+        self._emit_guard_event(record)
 
     def _emit_guard_event(self, record: dict):
         """Print one parseable line for a guard fire. Best-effort like its caller.
